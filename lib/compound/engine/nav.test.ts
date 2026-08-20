@@ -26,12 +26,14 @@ describe("unitsForDeposit", () => {
   });
 
   it("floors, so the depositor never receives more units than paid for", () => {
-    // equity $1,000, 300 units -> NAV 3.3333...; $100 buys 30 units exactly.
-    const t: PoolTotals = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("300") };
-    const issued = unitsForDeposit(t, centsFromDecimal("100"));
-    expect(issued).toBe(30n * UNIT_SCALE);
-    // The exact figure is 30 units; confirm we never exceed the entitlement.
-    expect(issued * t.equityCents <= centsFromDecimal("100") * t.units).toBe(true);
+    // equity $7.00 across 3 units. $1.00 buys 4.285714285714... units —
+    // a genuine remainder, so floor and ceil differ by one and this test
+    // fails if the implementation ever switches to ceil.
+    const t: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
+    const issued = unitsForDeposit(t, 100n);
+    expect(issued).toBe(4285714285n);
+    // Never more units than the money paid for.
+    expect(issued * t.equityCents <= 100n * t.units).toBe(true);
   });
 
   it("rejects a non-positive deposit", () => {
@@ -65,10 +67,14 @@ describe("unitsToRedeem", () => {
     expect(unitsToRedeem(t, centsFromDecimal("250"))).toBe(unitsFromDecimal("125"));
   });
   it("ceils, so a holder never keeps units they were paid for", () => {
-    const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
-    // $3.33 of a $10 pool with 3 units -> 0.999 units, must round up.
-    const redeemed = unitsToRedeem(t, 333n);
-    expect(redeemed * t.equityCents >= 333n * t.units).toBe(true);
+    // Same fixture as the deposit floor test, so the two directions are
+    // directly comparable: exact value is 4285714285.714…, floor 4285714285,
+    // ceil 4285714286. Redemption must take the larger.
+    const t: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
+    const redeemed = unitsToRedeem(t, 100n);
+    expect(redeemed).toBe(4285714286n);
+    // Never leave a holder holding units the cash already paid for.
+    expect(redeemed * t.equityCents >= 100n * t.units).toBe(true);
   });
   it("redeems nothing for a zero payout", () => {
     const t: PoolTotals = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("500") };
@@ -78,9 +84,12 @@ describe("unitsToRedeem", () => {
 
 describe("unitsForFee", () => {
   it("floors, so the manager receives no rounding advantage", () => {
-    const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
-    const fu = unitsForFee(t, 333n);
-    expect(fu * t.equityCents <= 333n * t.units).toBe(true);
+    // Same fixture again. The manager is a holder like any other, so the
+    // fee converts to units at floor, not ceil.
+    const t: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
+    const fu = unitsForFee(t, 100n);
+    expect(fu).toBe(4285714285n);
+    expect(fu * t.equityCents <= 100n * t.units).toBe(true);
   });
 });
 
