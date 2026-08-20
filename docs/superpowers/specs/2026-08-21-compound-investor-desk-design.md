@@ -128,7 +128,8 @@ units_redeemed = ((mode = exit) ? value : max(0, profit)) / NAV
   `fee / NAV` units.
 - **Withdraw as cash** — equity reduces by the fee; no units issued.
 
-Both settle at constant NAV. Proof, writing `d = gross − fee`:
+Both settle at constant NAV. Proof over the rationals, writing `d = gross − fee`
+— see §3.5 invariant 3 for what integer rounding does to this in practice:
 
 ```
 retain: equity₁ = equity₀ − d          units₁ = units₀ − d/NAV₀
@@ -145,12 +146,31 @@ Asserted in property-based tests and in a nightly job.
 |---|---|---|
 | 1 | `Σ holder_units = units_issued` | **exactly** — units are integers that sum exactly |
 | 2 | `Σ holder_value = account_equity` | **exactly** — value is a pure function of units |
-| 3 | NAV is unchanged by any deposit, payout or fee settlement | exactly, per §3.4 |
+| 3 | A deposit, payout, exit or fee settlement **never decreases** NAV | see below — the exact-equality form is false under integer rounding |
 | 4 | `fee ≥ 0` | always |
 | 5 | Ledger is append-only; corrections are reversing entries | enforced by policy + no UPDATE grant |
 
 Invariants 1 and 2 are exact rather than "within tolerance" — a direct
 consequence of D7. Materialised balances would make them approximate.
+
+**Invariant 3 was originally stated as "NAV is unchanged", and that is wrong.**
+The algebra in §3.4 is exact over the rationals, but the engine works in
+integers: `valueOfUnits` floors, `unitsForDeposit` floors, `unitsToRedeem`
+ceils. Each of those leaves a sub-cent residual in the pool, which nudges NAV
+*upward*. Simulating 25,043 randomised transitions found exact NAV equality
+violated in 2.80% of them — and NAV decreasing in none.
+
+So the true invariant is monotonic, not static:
+
+> Only an equity reading may move NAV downward. Every other operation leaves
+> NAV equal or very slightly higher, by at most the rounding residual.
+
+This is not a weakening. It is the §4 rounding policy — *the residual accrues
+to the pool* — restated as something testable, and it asserts the property that
+actually matters: **value can never leak out of the pool.** A NAV decrease on a
+deposit or payout would mean a holder extracted more than they were owed, and
+that is what invariant 3 now forbids. Exact equality still holds, and is still
+asserted, wherever the divisions terminate.
 
 ### 3.6 Validation against live data
 
