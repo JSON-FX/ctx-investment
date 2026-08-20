@@ -1,0 +1,38 @@
+services:
+  ctx-investment:
+    container_name: ctx-investment
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://ctxinvestment.lan}
+    restart: unless-stopped
+    environment:
+      # Server-side secrets are read at runtime and never baked into the bundle.
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://ctxinvestment.lan}
+    labels:
+      - "traefik.enable=true"
+
+      # ─── Dev tier ─────────────────────────────────────────────
+      #   http://ctxinvestment.test
+      - "traefik.http.routers.ctxinvestment-dev.rule=Host(`ctxinvestment.test`)"
+      - "traefik.http.routers.ctxinvestment-dev.entrypoints=web"
+      - "traefik.http.routers.ctxinvestment-dev.service=ctxinvestment"
+
+      # ─── Local-prod tier ──────────────────────────────────────
+      #   https://ctxinvestment.lan
+      - "traefik.http.routers.ctxinvestment-prod.rule=Host(`ctxinvestment.lan`)"
+      - "traefik.http.routers.ctxinvestment-prod.entrypoints=websecure"
+      - "traefik.http.routers.ctxinvestment-prod.tls=true"
+      - "traefik.http.routers.ctxinvestment-prod.service=ctxinvestment"
+
+      # Single backing service — Next.js standalone server on port 3000.
+      - "traefik.http.services.ctxinvestment.loadbalancer.server.port=3000"
+    networks:
+      - dev-net
+
+networks:
+  dev-net:
+    external: true

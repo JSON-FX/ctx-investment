@@ -10,7 +10,9 @@ It replaces the spreadsheet that quietly breaks the moment a second investor
 joins at a different account size — with proper unit accounting, an append-only
 ledger, and a payout flow that computes the profit split correctly the first time.
 
-> **Status:** design approved, implementation not started.
+> **Status:** accounting engine complete and merged (125 tests). The desk
+> itself is not built yet — the app currently serves a deployment shell that
+> replays a fixture ledger through the engine.
 > Read [ARCHITECTURE.md](ARCHITECTURE.md) first.
 
 ---
@@ -50,7 +52,42 @@ same project.
 ## Stack
 
 Next.js 16 App Router · React 19 · Tailwind v4 · shadcn/ui · Supabase ·
-TypeScript · Jest + fast-check · Docker behind Traefik at `investment.lan`
+TypeScript · Jest + fast-check · Docker behind Traefik at `ctxinvestment.lan`
+
+## Running it
+
+Requires Docker, and the local Traefik on the external `dev-net` network that
+already fronts the sibling projects. `*.lan` resolves to 127.0.0.1 via
+`/etc/resolver/lan`, so no hosts-file entry is needed.
+
+```bash
+docker compose up -d --build
+open https://ctxinvestment.lan
+```
+
+| Tier | URL |
+|---|---|
+| Local prod | `https://ctxinvestment.lan` (TLS, self-signed) |
+| Dev | `http://ctxinvestment.test` |
+
+Locally, without Docker:
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Gates are `pnpm typecheck` and `pnpm test`. There is deliberately no ESLint —
+`eslint-config-next` is broken against ESLint 9 in the sibling project.
+
+## What the page shows today
+
+A deployment shell, not the desk. It replays a fictional 15-entry ledger
+through `fold()` and renders the resulting `PoolState` — NAV, the ownership
+rail, per-holder units, values, open P/L and accrued fee — then checks the
+invariants live and reports whether the sums are exact. It exists so that a
+running container proves two things at once: the deployment works, and the
+engine computes. Plan 3 replaces it with the real desk.
 
 ## Documentation
 

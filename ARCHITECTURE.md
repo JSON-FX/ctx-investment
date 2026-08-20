@@ -9,23 +9,23 @@ see [the design spec](docs/superpowers/specs/2026-08-21-compound-investor-desk-d
 ## 1. System context
 
 ```
-┌─────────────────┐        writes         ┌──────────────────────────┐
-│  CopyTraderX    │──────────────────────▶│  Supabase (Postgres)     │
-│  EA on MT5      │  snapshots, deals,    │                          │
-└─────────────────┘  orders, positions    │  ── CopyTraderX tables ──│
+┌────────────────────┐      writes        ┌───────────────────────────┐
+│  CopyTraderX       │───────────────────▶│  Supabase (Postgres)      │
+│  EA on MT5         │  snapshots, deals, │                           │
+└────────────────────┘  orders, positions │  ── CopyTraderX tables ── │
                                           │  account_snapshots_current│
-┌─────────────────┐        reads only     │  account_snapshots_daily  │
-│  copytraderx-   │◀─────────────────────▶│  deals · orders           │
-│  license        │                       │  positions · licenses     │
-└─────────────────┘                       │                           │
-                                          │  ── Compound tables ──────│
-┌─────────────────┐   reads CTX tables    │  compound_account         │
-│  ctx-investment │◀──────────────────────│  compound_holder          │
-│  (this repo)    │   read+write compound_│  compound_ledger_entry    │
-│  investment.lan │──────────────────────▶│  compound_capital_event_* │
-└─────────────────┘                       │  compound_reconcile_cursor│
+┌────────────────────┐    reads only      │  account_snapshots_daily  │
+│  copytraderx-      │◀───────────────────│  deals · orders           │
+│  license           │                    │  positions · licenses     │
+└────────────────────┘                    │                           │
+                                          │  ── Compound tables ───── │
+┌────────────────────┐  reads CTX tables  │  compound_account         │
+│  ctx-investment    │◀───────────────────│  compound_holder          │
+│  (this repo)       │  read+write        │  compound_ledger_entry    │
+│  ctxinvestment.lan │───────────────────▶│  compound_capital_event_* │
+└────────────────────┘   compound_*       │  compound_reconcile_cursor│
                                           │  compound_audit           │
-                                          └──────────────────────────┘
+                                          └───────────────────────────┘
 ```
 
 **Compound never writes to CopyTraderX tables.** It reads market truth and owns
@@ -247,8 +247,17 @@ output, behind the existing Traefik instance on the external `dev-net` network.
 
 | Tier | URL | Entrypoint |
 |---|---|---|
-| Dev | `http://investment.test` | `web` |
-| Local prod | `https://investment.lan` | `websecure` + TLS |
+| Dev | `http://ctxinvestment.test` | `web` |
+| Local prod | `https://ctxinvestment.lan` | `websecure` + TLS |
+
+`*.lan` resolves to 127.0.0.1 through `/etc/resolver/lan`, so no hosts-file
+entry is required for a new subdomain.
+
+**What is deployed today is a shell, not the desk.** `app/page.tsx` replays a
+fictional ledger from `lib/compound/demo/` through the engine and renders the
+resulting `PoolState`, including a live invariant check. It exists so a running
+container proves the deployment and the accounting core in one request. Plan 3
+replaces it.
 
 `NEXT_PUBLIC_*` variables are baked into the bundle at build time.
 `SUPABASE_SERVICE_ROLE_KEY` is read at runtime and never reaches the browser.
