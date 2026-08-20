@@ -33,3 +33,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Git worktrees for isolated plan execution.
+.worktrees/
