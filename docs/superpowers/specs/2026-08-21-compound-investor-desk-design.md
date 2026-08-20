@@ -200,6 +200,14 @@ accrues to the pool and is therefore shared pro-rata by all holders.
 All four are exact integer operations on `bigint`. No floating point appears
 anywhere in `engine/`.
 
+**Valuation is allocated, not floored.** The rule above governs operations that
+*move* value. Reporting a holder's value is different: flooring each holder
+independently loses up to one cent per holder, which would make invariant 2
+approximate. `allocateValues()` therefore uses largest-remainder allocation —
+floor everyone, then award the shortfall to the largest fractional entitlements,
+ties broken by holder order. That keeps `Σ holder_value = equity` exact while
+never letting a rounding artefact leave the pool.
+
 `equity_reading.nav` is not stored. Where a NAV figure must be displayed it is
 computed and rounded to 4dp at the presentation boundary only.
 
@@ -323,9 +331,8 @@ compound_ledger_entry
   occurred_on        date not null                         -- broker-server date
   recorded_at        timestamptz not null default now()    -- UTC
   type               text not null check (type in
-                       ('deposit','payout','exit','fee','equity_reading','adjustment'))
+                       ('deposit','payout','exit','equity_reading','adjustment'))
   amount_cents       bigint not null
-  payout_mode        text check (payout_mode in ('profit','exit'))
   fee_settlement     text check (fee_settlement in ('units','cash'))
   split_bps_applied  int
   note               text
@@ -371,6 +378,12 @@ second truth that can disagree with the engine after any change to it.
 
 `split_bps_applied` is the exception: the terms in force at the moment of a
 payout are an *input*, since a holder's split may change afterwards.
+
+Two types from the PRD's sketch are also absent. There is no `fee` entry — a fee
+is always settled inside the payout that crystallised it, and a separate applied
+entry would double-count; `fee_settlement` carries the units-or-cash choice.
+There is no `payout_mode` column either, because `type` is already `payout` or
+`exit` and the mode is derived from it.
 
 ### 6.2 Why `seq`, not `occurred_on`, defines replay order
 
