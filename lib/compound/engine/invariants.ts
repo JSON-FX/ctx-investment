@@ -75,8 +75,8 @@ export function checkInvariants(state: PoolState): InvariantViolation[] {
     }
   } else if (state.equityCents === 0n) {
     // A wiped-out pool: every holder's value is zero, which sums to zero
-    // equity, so the invariant holds trivially. allocateValues cannot be
-    // asked — it rejects non-positive equity — and there is nothing to check.
+    // equity, so the invariant holds trivially. allocateValues would agree —
+    // it returns all zeros here — but there is nothing to learn from asking.
   } else if (unitsBalance && violations.length === 0) {
     const values = allocateValues(
       { equityCents: state.equityCents, units: state.units },

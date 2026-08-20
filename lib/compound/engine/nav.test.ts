@@ -26,7 +26,8 @@ describe("unitsForDeposit", () => {
   });
 
   it("floors, so the depositor never receives more units than paid for", () => {
-    // equity $7.00 across 3 units. $1.00 buys 4.285714285714... units —
+    // equity $7.00 across 3 units, so NAV is $2.3333. $1.00 buys about
+    // 0.4285714286 units, which is 4285714285.714... as a UNIT_SCALE integer —
     // a genuine remainder, so floor and ceil differ by one and this test
     // fails if the implementation ever switches to ceil.
     const t: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
@@ -107,6 +108,49 @@ describe("navTimes1e4", () => {
   });
 });
 
+describe("a wiped-out pool — zero equity with units outstanding", () => {
+  // A margin-called account. checkInvariants treats this as a legitimate
+  // state, so every NAV-derived quantity has to have an answer for it:
+  // otherwise the desk cannot render the account and an investor cannot exit
+  // at $0.00. NAV here is genuinely zero, not undefined — units exist, they
+  // are simply worth nothing. assertSolvent still guards negative equity,
+  // which is corrupt state rather than a valuation of zero.
+  const WIPED: PoolTotals = { equityCents: 0n, units: unitsFromDecimal("3") };
+
+  it("values every holding at zero", () => {
+    expect(valueOfUnits(WIPED, unitsFromDecimal("1"))).toBe(0n);
+  });
+
+  // These two take a POSITIVE amount deliberately. A zero amount is answered
+  // by the existing short-circuit and so cannot distinguish the fix. quote()
+  // can never ask for either against a worthless pool — value is zero, so
+  // gross and fee are both zero — but the functions answer rather than throw,
+  // so no caller has to special-case a margin-called account.
+  it("redeems no units, because no units are worth anything", () => {
+    expect(unitsToRedeem(WIPED, 100n)).toBe(0n);
+  });
+
+  it("issues no fee units", () => {
+    expect(unitsForFee(WIPED, 100n)).toBe(0n);
+  });
+
+  it("reports NAV as 0.0000", () => {
+    expect(navTimes1e4(WIPED)).toBe(0n);
+  });
+
+  it("allocates zero to every holder", () => {
+    expect(allocateValues(WIPED, [
+      unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1"),
+    ])).toEqual([0n, 0n, 0n]);
+  });
+
+  it("still rejects negative equity, which is corrupt rather than worthless", () => {
+    const BROKEN: PoolTotals = { equityCents: -1n, units: unitsFromDecimal("3") };
+    expect(() => valueOfUnits(BROKEN, unitsFromDecimal("1"))).toThrow(RangeError);
+    expect(() => navTimes1e4(BROKEN)).toThrow(RangeError);
+  });
+});
+
 describe("allocateValues", () => {
   it("returns an empty array for no holders", () => {
     expect(allocateValues(EMPTY, [])).toEqual([]);
@@ -137,11 +181,17 @@ describe("allocateValues", () => {
     expect(out[0]! + out[1]!).toBe(100n);
   });
 
-  it("is deterministic when remainders tie", () => {
+  it("breaks a remainder tie by the lowest index, not by input order", () => {
+    // $10.00 across three equal holders: floors give 333 each, one cent short.
     const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
-    const a = allocateValues(t, [unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1")]);
-    const b = allocateValues(t, [unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1")]);
-    expect(a).toEqual(b);
+    const equal = [unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1")];
+    expect(allocateValues(t, equal)).toEqual([334n, 333n, 333n]);
+
+    // Two units first: its remainder is larger, so it takes the odd cent
+    // wherever it sits. Position decides ties; it does not decide winners.
+    const t2: PoolTotals = { equityCents: 100n, units: unitsFromDecimal("3") };
+    expect(allocateValues(t2, [unitsFromDecimal("2"), unitsFromDecimal("1")])).toEqual([67n, 33n]);
+    expect(allocateValues(t2, [unitsFromDecimal("1"), unitsFromDecimal("2")])).toEqual([33n, 67n]);
   });
 
   it("returns zeros for an empty pool", () => {

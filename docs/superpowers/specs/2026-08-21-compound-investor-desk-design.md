@@ -119,8 +119,15 @@ Default 60% investor / 40% manager, overridable per holder.
 ```
 fee            = max(0, profit) × manager_split
 investor_gets  = (mode = exit) ? value − fee : max(0, profit) − fee
-units_redeemed = ((mode = exit) ? value : max(0, profit)) / NAV
+units_redeemed = (mode = exit) ? holder_units : max(0, profit) / NAV
 ```
+
+On **exit** the holder surrenders their exact unit balance rather than a figure
+derived from `value`. Over the rationals the two agree. In integers they do not:
+`value` is floored to whole cents and `units_redeemed` is ceiled back, and that
+round trip can under-recover, stranding a fraction of a unit in a holder who has
+left. Redeeming `holder_units` closes the position exactly; the sub-cent
+residual stays in the pool, as §4 requires.
 
 ### 3.4 Fee settlement
 

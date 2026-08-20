@@ -13,7 +13,7 @@
  * deterministic.
  */
 import type { Cents, Units } from "./money";
-import { unitsForDeposit, unitsForFee, navTimes1e4, type PoolTotals } from "./nav";
+import { unitsForDeposit, unitsForFee, type PoolTotals } from "./nav";
 import { quote } from "./quote";
 
 export type LedgerEntryType =
@@ -135,24 +135,27 @@ export function fold(
       case "payout":
       case "exit": {
         const h = holderOf(e.holderId);
+        if (e.splitBpsApplied === null) {
+          throw new Error(
+            `${e.type} entry ${e.id} has no splitBpsApplied — the terms in force ` +
+              `at the time of a payout are an input, not a lookup. Replaying against ` +
+              `the holder's current split would make history depend on mutable state.`,
+          );
+        }
         // Every figure is taken against the PRE-payout totals. That is what
-        // keeps NAV constant across the operation.
+        // keeps NAV from decreasing across the operation.
         const totals: PoolTotals = { equityCents, units };
         const q = quote({
           totals,
           holderUnits: h.units,
           basisCents: h.basisCents,
-          splitBps: e.splitBpsApplied ?? h.splitBps,
+          splitBps: e.splitBpsApplied,
           isManager: h.isManager,
           mode: e.type === "exit" ? "exit" : "profit",
         });
 
-        // On exit the holder surrenders everything, so redeem their exact
-        // balance rather than a ceil()-derived figure that could leave dust.
-        const redeemed = e.type === "exit" ? h.units : q.unitsRedeemed;
-
-        h.units -= redeemed;
-        units -= redeemed;
+        h.units -= q.unitsRedeemed;
+        units -= q.unitsRedeemed;
         equityCents -= q.toHolderCents;
 
         if (q.feeCents > 0n) {
@@ -165,6 +168,10 @@ export function fold(
             manager.units += feeUnits;
             units += feeUnits;
             manager.basisCents += q.feeCents;
+            // A manager who had exited is back in the pool. Leaving them
+            // "closed" while holding units would contradict the rule that an
+            // exited holder holds nothing.
+            manager.status = "active";
           }
         }
 
@@ -178,13 +185,4 @@ export function fold(
   }
 
   return { equityCents, units, holders: [...holders.values()], lastReadingOn, seq };
-}
-
-/**
- * True when two sets of totals report the same NAV to four decimal places.
- * Deposits, payouts and fee settlements must all satisfy this; only an equity
- * reading may move NAV.
- */
-export function checkNavUnchanged(before: PoolTotals, after: PoolTotals): boolean {
-  return navTimes1e4(before) === navTimes1e4(after);
 }

@@ -129,6 +129,13 @@ describe("quote — validation", () => {
       expect(quote(input({ basisCents: centsFromDecimal(basis) })).feeCents >= 0n).toBe(true);
     }
   });
+  it("rejects a negative cost basis", () => {
+    // fold() cannot produce one, but quote() is a public entry point the
+    // receipt calls directly. A negative basis would inflate profit past the
+    // holding's value, letting feeCents exceed grossCents on exit and driving
+    // toHolderCents negative.
+    expect(() => quote(input({ basisCents: -1n }))).toThrow(RangeError);
+  });
 });
 
 describe("quote — units redeemed on an awkward NAV", () => {
@@ -153,5 +160,22 @@ describe("quote — units redeemed on an awkward NAV", () => {
     expect(q.toHolderCents).toBe(60n);
     // Exact value is 4285714285.714… — floor would give 4285714285n.
     expect(q.unitsRedeemed).toBe(4285714286n);
+  });
+
+  it("redeems the holder's exact balance on exit, not a value-derived figure", () => {
+    // The receipt and fold() must agree. Deriving units from value would
+    // under-recover here: valueOfUnits floors 2 units to $4.66, and ceiling
+    // that back gives 19_971_428_572 against a balance of 20_000_000_000 —
+    // stranding 0.0029 units in a holder who has left.
+    const q = quote({
+      totals: AWKWARD,
+      holderUnits: unitsFromDecimal("2"),
+      basisCents: 100n,
+      splitBps: 4000,
+      isManager: false,
+      mode: "exit",
+    });
+    expect(q.valueCents).toBe(466n);
+    expect(q.unitsRedeemed).toBe(unitsFromDecimal("2"));
   });
 });

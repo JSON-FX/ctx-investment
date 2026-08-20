@@ -47,7 +47,11 @@ const opArb: fc.Arbitrary<Op> = fc
     if (r.kind <= 5) {
       return { kind: "reading", equityCents: r.equityCents };
     }
-    const holderId = 1 + (r.holderId % (HOLDER_COUNT - 1));
+    // Any holder, the manager included, and uniformly: r.holderId is already
+    // a uniform 0..HOLDER_COUNT-1. Excluding holder 0 here kept the manager
+    // out of every extraction path, so a manager exit — and a retained fee
+    // landing on an exited manager — was never generated.
+    const holderId = r.holderId;
     return r.kind <= 7
       ? { kind: "payout", holderId, feeCash: r.feeCash }
       : { kind: "exit", holderId, feeCash: r.feeCash };
@@ -64,6 +68,18 @@ const foundingArb = fc.bigInt({ min: 10_000n, max: 1_000_000n }); // $100 .. $10
  * cannot legally apply at that point (e.g. a payout before the holder has
  * units) are dropped; replaying the prefix is what tells us whether an op is
  * legal.
+ *
+ * Known narrowings — "any legal sequence" is not quite the whole legal space:
+ *
+ *  - No `adjustment` entries. An adjustment is a manual correction carrying an
+ *    arbitrary signed amount, so it can legitimately move NAV in either
+ *    direction and does not belong under the NAV property below.
+ *  - No zero or negative equity readings, so the wiped-out and corrupt-state
+ *    paths never appear here. replay.test.ts and nav.test.ts cover those.
+ *  - No reversal entries; replay.test.ts covers voiding an entry and its
+ *    reversal.
+ *  - A holder's split never changes, so `splitBpsApplied` always equals the
+ *    holder's current terms and the two can never be seen to diverge.
  */
 function buildLedger(foundingCents: bigint, ops: readonly Op[]): LedgerEntry[] {
   const ledger: LedgerEntry[] = [];
@@ -153,6 +169,11 @@ describe("engine properties", () => {
           const entry = ledger[i - 1]!;
 
           if (entry.type === "equity_reading") continue;
+          // Adjustments are manual corrections and may legitimately move NAV
+          // in either direction, so they are not bound by this invariant.
+          // The generator does not currently emit them; the skip is here so
+          // that adding them later does not produce a false failure.
+          if (entry.type === "adjustment") continue;
           if (before.units === 0n || after.units === 0n) continue;
           if (before.equityCents <= 0n || after.equityCents <= 0n) continue;
 
@@ -223,11 +244,18 @@ describe("engine properties", () => {
   it("an exited holder holds no units and no basis", () => {
     fc.assert(
       fc.property(foundingArb, fc.array(opArb, { minLength: 1, maxLength: 25 }), (founding, ops) => {
-        const state: PoolState = fold(buildLedger(founding, ops), seeds());
-        for (const h of state.holders) {
-          if (h.status === "closed") {
-            expect(h.units).toBe(0n);
-            expect(h.basisCents).toBe(0n);
+        const ledger = buildLedger(founding, ops);
+        // Every prefix, not just the end of the ledger. A retained fee can
+        // credit units to a manager who has already exited, and a later
+        // deposit or exit tidies the state up again — so checking only the
+        // final state cannot see the transition that broke the rule.
+        for (let i = 1; i <= ledger.length; i += 1) {
+          const state: PoolState = fold(ledger.slice(0, i), seeds());
+          for (const h of state.holders) {
+            if (h.status === "closed") {
+              expect(h.units).toBe(0n);
+              expect(h.basisCents).toBe(0n);
+            }
           }
         }
         return true;

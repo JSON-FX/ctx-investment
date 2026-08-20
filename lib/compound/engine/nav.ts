@@ -20,6 +20,22 @@ export function isGenesis(t: PoolTotals): boolean {
   return t.units === 0n;
 }
 
+/**
+ * A margin-called account: equity has gone to zero with units still
+ * outstanding. NAV is 0.00 — the units exist and are worth nothing — so
+ * valuation, redemption, fee units and allocation all have a definite answer
+ * and none of them need to throw. checkInvariants treats this as a legitimate
+ * state, and if the engine refused to value it the desk could not render the
+ * account and a holder could not exit at $0.00.
+ *
+ * unitsForDeposit is the exception: buying in at a NAV of zero would issue
+ * infinitely many units, so it still refuses.
+ */
+function isWipedOut(t: PoolTotals): boolean {
+  return t.equityCents === 0n && t.units > 0n;
+}
+
+/** Negative equity is corrupt state, not a valuation of zero. */
 function assertSolvent(t: PoolTotals): void {
   if (t.equityCents <= 0n) {
     throw new RangeError(`cannot derive NAV against non-positive equity ${t.equityCents}`);
@@ -44,7 +60,7 @@ export function unitsForDeposit(t: PoolTotals, amountCents: Cents): Units {
 /** A holder's value. FLOOR — never overstate an entitlement. */
 export function valueOfUnits(t: PoolTotals, holderUnits: Units): Cents {
   if (holderUnits < 0n) throw new RangeError(`negative units ${holderUnits}`);
-  if (isGenesis(t)) return 0n;
+  if (isGenesis(t) || isWipedOut(t)) return 0n;
   assertSolvent(t);
   return mulDivFloor(holderUnits, t.equityCents, t.units);
 }
@@ -53,6 +69,9 @@ export function valueOfUnits(t: PoolTotals, holderUnits: Units): Cents {
 export function unitsToRedeem(t: PoolTotals, grossCents: Cents): Units {
   if (grossCents < 0n) throw new RangeError(`negative gross ${grossCents}`);
   if (isGenesis(t) || grossCents === 0n) return 0n;
+  // Nothing is worth anything, so nothing need be surrendered. quote() cannot
+  // reach here with a positive gross: value is zero, so gross is too.
+  if (isWipedOut(t)) return 0n;
   assertSolvent(t);
   return mulDivCeil(grossCents, t.units, t.equityCents);
 }
@@ -61,6 +80,9 @@ export function unitsToRedeem(t: PoolTotals, grossCents: Cents): Units {
 export function unitsForFee(t: PoolTotals, feeCents: Cents): Units {
   if (feeCents < 0n) throw new RangeError(`negative fee ${feeCents}`);
   if (isGenesis(t) || feeCents === 0n) return 0n;
+  // Units issued at a NAV of zero would be infinite; there is also no profit
+  // to charge against, so quote() cannot reach here with a positive fee.
+  if (isWipedOut(t)) return 0n;
   assertSolvent(t);
   return mulDivFloor(feeCents, t.units, t.equityCents);
 }
@@ -71,6 +93,7 @@ export function unitsForFee(t: PoolTotals, feeCents: Cents): Units {
  */
 export function navTimes1e4(t: PoolTotals): bigint {
   if (isGenesis(t)) return 10_000n;
+  if (isWipedOut(t)) return 0n;
   assertSolvent(t);
   return mulDivFloor(t.equityCents * UNIT_SCALE, 10_000n, t.units * 100n);
 }
@@ -93,7 +116,7 @@ export function allocateValues(t: PoolTotals, holderUnits: readonly Units[]): Ce
   if (total !== t.units) {
     throw new RangeError(`holder units ${total} do not sum to pool units ${t.units}`);
   }
-  if (isGenesis(t)) return holderUnits.map(() => 0n);
+  if (isGenesis(t) || isWipedOut(t)) return holderUnits.map(() => 0n);
   assertSolvent(t);
 
   const floors = holderUnits.map((u) => mulDivFloor(u, t.equityCents, t.units));

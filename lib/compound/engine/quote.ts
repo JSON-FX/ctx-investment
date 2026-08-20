@@ -4,7 +4,7 @@
  *
  *   fee            = max(0, profit) × manager_split
  *   holder_gets    = (mode = exit) ? value − fee : max(0, profit) − fee
- *   units_redeemed = ((mode = exit) ? value : max(0, profit)) / NAV
+ *   units_redeemed = (mode = exit) ? holder_units : max(0, profit) / NAV
  *
  * The performance fee crystallises only on withdrawal, never on a paper gain.
  * Because profit is measured against cost basis, a losing stretch must be
@@ -48,6 +48,9 @@ export interface Quote {
 export function quote(input: QuoteInput): Quote {
   const { totals, holderUnits, basisCents, isManager, mode } = input;
 
+  if (basisCents < 0n) {
+    throw new RangeError(`basisCents must be non-negative, got ${basisCents}`);
+  }
   if (!Number.isInteger(input.splitBps) || input.splitBps < 0 || input.splitBps > 10_000) {
     throw new RangeError(`splitBps must be an integer 0..10000, got ${input.splitBps}`);
   }
@@ -60,7 +63,12 @@ export function quote(input: QuoteInput): Quote {
   const feeCents = mulDivFloor(feeableCents, BigInt(splitBpsApplied), 10_000n);
   const grossCents = mode === "exit" ? valueCents : feeableCents;
   const toHolderCents = grossCents - feeCents;
-  const unitsRedeemed = unitsToRedeem(totals, grossCents);
+  // On exit the holder surrenders their exact balance. Deriving it from value
+  // would under-recover, because valueOfUnits floors to whole cents and
+  // unitsToRedeem ceils back — the round trip can strand units in a holder
+  // who has left.
+  const unitsRedeemed =
+    mode === "exit" ? holderUnits : unitsToRedeem(totals, grossCents);
 
   return {
     valueCents,

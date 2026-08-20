@@ -1,7 +1,8 @@
+import { checkInvariants } from "./invariants";
 import { centsFromDecimal, unitsFromDecimal } from "./money";
 import { navTimes1e4 } from "./nav";
 import {
-  fold, totalsOf, checkNavUnchanged,
+  fold, totalsOf,
   type HolderSeed, type LedgerEntry, type LedgerEntryType,
 } from "./replay";
 
@@ -81,14 +82,6 @@ describe("fold — deposits", () => {
       entry("deposit", "200", { holderId: 1 }),
     ], [MANAGER]);
     expect(s.holders[0]!.basisCents).toBe(centsFromDecimal("500"));
-  });
-
-  it("reactivates a closed holder", () => {
-    const s = fold([
-      entry("deposit", "300", { holderId: 1 }),
-      entry("deposit", "100", { holderId: 2 }),
-    ], [MANAGER, { ...INVESTOR }]);
-    expect(s.holders.find((h) => h.holderId === 2)!.status).toBe("active");
   });
 });
 
@@ -295,23 +288,11 @@ describe("fold — payout below the high-water mark", () => {
   });
 });
 
-describe("checkNavUnchanged", () => {
-  it("passes when NAV is preserved", () => {
-    const t = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("500") };
-    expect(checkNavUnchanged(t, t)).toBe(true);
-  });
-  it("fails when NAV moves", () => {
-    const a = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("500") };
-    const b = { equityCents: centsFromDecimal("2000"), units: unitsFromDecimal("500") };
-    expect(checkNavUnchanged(a, b)).toBe(false);
-  });
-});
-
 describe("fold — re-entry after an exit", () => {
-  // Task 6's "reactivates a closed holder" test could not fail, because
-  // nothing in that task's scope produces a closed holder. Exit does, so
-  // this is the first test that genuinely pins the closed -> active
-  // transition and the fresh cost basis a re-entering holder gets.
+  // Only an exit produces a closed holder, so this is the only test that can
+  // pin the closed -> active transition and the fresh cost basis a
+  // re-entering holder gets. An earlier version of this file asserted the
+  // same thing against a holder that was never closed, and could not fail.
   it("reactivates a holder who previously exited, with a fresh basis", () => {
     const s = fold([
       entry("deposit", "300", { holderId: 1 }),
@@ -324,6 +305,79 @@ describe("fold — re-entry after an exit", () => {
     expect(h.status).toBe("active");
     expect(h.basisCents).toBe(centsFromDecimal("150"));
     expect(h.units).toBe(unitsFromDecimal("150"));
+  });
+});
+
+describe("fold — a retained fee credited to a manager who has exited", () => {
+  // The manager can leave and still be owed a fee on an investor's later
+  // payout. Crediting units to a holder marked "closed" would break the
+  // engine's own rule that an exited holder holds nothing, so taking the fee
+  // reopens the position.
+  function ledger() {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1200"),   // NAV 2.0000
+      entry("exit", "0", { holderId: 1, feeSettlement: "cash", splitBpsApplied: 0 }),
+      entry("payout", "0", { holderId: 2, feeSettlement: "units", splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("reopens the manager rather than leaving them closed holding units", () => {
+    const mgr = fold(ledger(), [MANAGER, INVESTOR]).holders.find((h) => h.holderId === 1)!;
+    expect(mgr.status).toBe("active");
+    expect(mgr.units).toBe(unitsFromDecimal("60"));      // $120 fee at NAV 2.00
+    expect(mgr.basisCents).toBe(centsFromDecimal("120"));
+  });
+
+  it("leaves no invariant violated", () => {
+    expect(checkInvariants(fold(ledger(), [MANAGER, INVESTOR]))).toEqual([]);
+  });
+});
+
+describe("fold — a wiped-out account", () => {
+  // Equity goes to zero with units still outstanding: a margin call.
+  // checkInvariants calls this legitimate, so the engine must be able to
+  // value it and let a holder exit at $0.00 rather than trapping them behind
+  // a thrown error.
+  it("lets a holder exit a zero-equity pool without throwing", () => {
+    const s = fold([
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "0"),
+      entry("exit", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+    ], [MANAGER, INVESTOR]);
+
+    const h = s.holders.find((x) => x.holderId === 2)!;
+    expect(h.units).toBe(0n);
+    expect(h.basisCents).toBe(0n);
+    expect(h.status).toBe("closed");
+    expect(s.equityCents).toBe(0n);
+    expect(s.units).toBe(unitsFromDecimal("300")); // the manager's units remain
+    expect(checkInvariants(s)).toEqual([]);
+  });
+});
+
+describe("fold — a payout carries the terms it was made under", () => {
+  // splitBpsApplied is an input, not a lookup. Falling back to the holder's
+  // current split would let a later change to their terms silently rewrite
+  // what an already-settled payout was worth.
+  it("rejects a payout with no splitBpsApplied", () => {
+    expect(() => fold([
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1200"),
+      entry("payout", "0", { holderId: 2, feeSettlement: "units" }),
+    ], [MANAGER, INVESTOR])).toThrow(/no splitBpsApplied/);
+  });
+
+  it("rejects an exit with no splitBpsApplied", () => {
+    expect(() => fold([
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1200"),
+      entry("exit", "0", { holderId: 2, feeSettlement: "cash" }),
+    ], [MANAGER, INVESTOR])).toThrow(/no splitBpsApplied/);
   });
 });
 
