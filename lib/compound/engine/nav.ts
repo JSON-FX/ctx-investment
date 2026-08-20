@@ -74,3 +74,42 @@ export function navTimes1e4(t: PoolTotals): bigint {
   assertSolvent(t);
   return mulDivFloor(t.equityCents * UNIT_SCALE, 10_000n, t.units * 100n);
 }
+
+/**
+ * Split equity across holders so the parts sum to the whole exactly.
+ *
+ * Flooring each holder independently loses up to one cent per holder, which
+ * would make "Σ holder value = equity" approximate. Largest-remainder
+ * allocation distributes the shortfall to the holders with the largest
+ * fractional entitlement, which is both exact and the fairest tie-break.
+ *
+ * This is REPORTING only. It never moves value, so the conservative
+ * floor/ceil rule that governs issuance and redemption does not apply here.
+ */
+export function allocateValues(t: PoolTotals, holderUnits: readonly Units[]): Cents[] {
+  if (holderUnits.length === 0) return [];
+
+  const total = holderUnits.reduce((s, u) => s + u, 0n);
+  if (total !== t.units) {
+    throw new RangeError(`holder units ${total} do not sum to pool units ${t.units}`);
+  }
+  if (isGenesis(t)) return holderUnits.map(() => 0n);
+  assertSolvent(t);
+
+  const floors = holderUnits.map((u) => mulDivFloor(u, t.equityCents, t.units));
+  // Remainder numerator: (u * equity) mod units, kept exact as a bigint.
+  const remainders = holderUnits.map((u, i) => u * t.equityCents - floors[i]! * t.units);
+
+  let short = t.equityCents - floors.reduce((s, c) => s + c, 0n);
+
+  const order = remainders
+    .map((r, i) => [r, i] as const)
+    .sort((a, b) => (a[0] !== b[0] ? (a[0] > b[0] ? -1 : 1) : a[1] - b[1]));
+
+  const out = [...floors];
+  for (let k = 0; short > 0n && k < order.length; k += 1, short -= 1n) {
+    const idx = order[k]![1];
+    out[idx] = out[idx]! + 1n;
+  }
+  return out;
+}

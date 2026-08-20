@@ -1,7 +1,7 @@
 import { UNIT_SCALE, centsFromDecimal, unitsFromDecimal } from "./money";
 import {
   isGenesis, unitsForDeposit, valueOfUnits, unitsToRedeem, unitsForFee,
-  navTimes1e4, type PoolTotals,
+  navTimes1e4, allocateValues, type PoolTotals,
 } from "./nav";
 
 const EMPTY: PoolTotals = { equityCents: 0n, units: 0n };
@@ -104,5 +104,52 @@ describe("navTimes1e4", () => {
   it("truncates rather than rounding", () => {
     const t: PoolTotals = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("300") };
     expect(navTimes1e4(t)).toBe(33_333n); // 3.3333
+  });
+});
+
+describe("allocateValues", () => {
+  it("returns an empty array for no holders", () => {
+    expect(allocateValues(EMPTY, [])).toEqual([]);
+  });
+
+  it("gives one holder the whole equity", () => {
+    const t: PoolTotals = { equityCents: 100_000n, units: unitsFromDecimal("500") };
+    expect(allocateValues(t, [unitsFromDecimal("500")])).toEqual([100_000n]);
+  });
+
+  it("sums to equity exactly when floors would lose cents", () => {
+    // $10.00 across three equal holders: floor gives 333 each, losing 1 cent.
+    const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
+    const out = allocateValues(t, [
+      unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1"),
+    ]);
+    expect(out.reduce((s, c) => s + c, 0n)).toBe(1000n);
+    expect(out).toEqual([334n, 333n, 333n]);
+  });
+
+  it("awards the odd cent to the largest remainder, not the first holder", () => {
+    // equity $1.00, holder A has 1 unit, holder B has 2 units.
+    // Exact: A 33.33c, B 66.67c. Floors 33 + 66 = 99, one cent short.
+    // B has the larger remainder, so B gets it.
+    const t: PoolTotals = { equityCents: 100n, units: unitsFromDecimal("3") };
+    const out = allocateValues(t, [unitsFromDecimal("1"), unitsFromDecimal("2")]);
+    expect(out).toEqual([33n, 67n]);
+    expect(out[0]! + out[1]!).toBe(100n);
+  });
+
+  it("is deterministic when remainders tie", () => {
+    const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
+    const a = allocateValues(t, [unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1")]);
+    const b = allocateValues(t, [unitsFromDecimal("1"), unitsFromDecimal("1"), unitsFromDecimal("1")]);
+    expect(a).toEqual(b);
+  });
+
+  it("returns zeros for an empty pool", () => {
+    expect(allocateValues(EMPTY, [0n, 0n])).toEqual([0n, 0n]);
+  });
+
+  it("rejects holder units that do not sum to pool units", () => {
+    const t: PoolTotals = { equityCents: 1000n, units: unitsFromDecimal("3") };
+    expect(() => allocateValues(t, [unitsFromDecimal("1")])).toThrow(RangeError);
   });
 });
