@@ -45,6 +45,16 @@ export function checkInvariants(state: PoolState): InvariantViolation[] {
     }
   }
 
+  // Pool-level I4: negative equity is corrupt state, not merely unbalanced.
+  // This must be recorded before the I2 branch below, because allocateValues
+  // rejects non-positive equity and would throw instead of reporting.
+  if (state.equityCents < 0n) {
+    violations.push({
+      code: "I4_NEGATIVE_EQUITY",
+      detail: `account equity ${state.equityCents} is negative`,
+    });
+  }
+
   // I1 — Σ holder units = units issued.
   const sumUnits = state.holders.reduce((s, h) => s + h.units, 0n);
   const unitsBalance = sumUnits === state.units;
@@ -63,6 +73,10 @@ export function checkInvariants(state: PoolState): InvariantViolation[] {
         detail: `equity ${state.equityCents} with zero units issued`,
       });
     }
+  } else if (state.equityCents === 0n) {
+    // A wiped-out pool: every holder's value is zero, which sums to zero
+    // equity, so the invariant holds trivially. allocateValues cannot be
+    // asked — it rejects non-positive equity — and there is nothing to check.
   } else if (unitsBalance && violations.length === 0) {
     const values = allocateValues(
       { equityCents: state.equityCents, units: state.units },

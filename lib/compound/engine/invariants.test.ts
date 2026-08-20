@@ -82,6 +82,37 @@ describe("I4 — no negative quantities", () => {
     ] });
     expect(checkInvariants(s).map((x) => x.code)).toContain("I4_NEGATIVE_BASIS");
   });
+  it("reports a negative-units holder cleanly when the pool still balances", () => {
+    // The I2 guard is `unitsBalance && violations.length === 0`, not just
+    // `unitsBalance`. Weakening it to the latter passes every other test in
+    // this file but throws here, because allocateValues rejects a negative
+    // operand. This is the test that pins the difference.
+    const s = state({
+      units: unitsFromDecimal("200"),
+      holders: [
+        holder({ holderId: 1, units: -1n }),
+        holder({ holderId: 2, units: unitsFromDecimal("200") + 1n }),
+      ],
+    });
+    expect(() => checkInvariants(s)).not.toThrow();
+    expect(checkInvariants(s).map((v) => v.code)).toContain("I4_NEGATIVE_UNITS");
+  });
+});
+
+describe("I4 — pool-level equity", () => {
+  it("reports negative equity instead of throwing", () => {
+    const s = state({ equityCents: -100n });
+    expect(() => checkInvariants(s)).not.toThrow();
+    expect(checkInvariants(s).map((v) => v.code)).toContain("I4_NEGATIVE_EQUITY");
+  });
+
+  it("treats a wiped-out pool as valid rather than throwing", () => {
+    // Units outstanding against zero equity is a real state, not corruption:
+    // every holder's value is zero, which sums to zero equity.
+    const s = state({ equityCents: 0n });
+    expect(() => checkInvariants(s)).not.toThrow();
+    expect(checkInvariants(s)).toEqual([]);
+  });
 });
 
 describe("assertInvariants", () => {
@@ -91,5 +122,14 @@ describe("assertInvariants", () => {
   it("throws listing every violation", () => {
     expect(() => assertInvariants(state({ units: unitsFromDecimal("300") })))
       .toThrow(/I1_UNITS_SUM/);
+  });
+  it("names every violation, not just the first", () => {
+    const s = state({
+      units: unitsFromDecimal("300"),
+      holders: [holder({ holderId: 1, basisCents: -1n }), holder({ holderId: 2 })],
+    });
+    expect(checkInvariants(s).length).toBeGreaterThan(1);
+    expect(() => assertInvariants(s)).toThrow(/I4_NEGATIVE_BASIS/);
+    expect(() => assertInvariants(s)).toThrow(/I1_UNITS_SUM/);
   });
 });
