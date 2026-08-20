@@ -102,6 +102,17 @@ describe("quote — the manager", () => {
     expect(q.splitBpsApplied).toBe(0);
     expect(q.toHolderCents).toBe(centsFromDecimal("150"));
   });
+
+  it("still range-checks the manager's split rather than ignoring it", () => {
+    expect(() => quote(input({ isManager: true, splitBps: 10_001 }))).toThrow(RangeError);
+    expect(() => quote(input({ isManager: true, splitBps: -1 }))).toThrow(RangeError);
+  });
+
+  it("forces the applied split to zero even when a valid one is passed", () => {
+    const q = quote(input({ isManager: true, splitBps: 10_000 }));
+    expect(q.splitBpsApplied).toBe(0);
+    expect(q.feeCents).toBe(0n);
+  });
 });
 
 describe("quote — validation", () => {
@@ -117,5 +128,30 @@ describe("quote — validation", () => {
     for (const basis of ["0", "100", "250", "400", "10000"]) {
       expect(quote(input({ basisCents: centsFromDecimal(basis) })).feeCents >= 0n).toBe(true);
     }
+  });
+});
+
+describe("quote — units redeemed on an awkward NAV", () => {
+  // NAV here is 700/3 cents per unit, which does not divide UNIT_SCALE
+  // evenly. The shared POOL fixture has NAV $2.00 exactly, so its
+  // unitsRedeemed figures are identical under floor and ceil and cannot
+  // detect a reversed primitive. This fixture can.
+  const AWKWARD: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
+
+  it("ceils the units redeemed when the division leaves a remainder", () => {
+    const q = quote({
+      totals: AWKWARD,
+      holderUnits: unitsFromDecimal("3"),
+      basisCents: 600n,
+      splitBps: 4000,
+      isManager: false,
+      mode: "profit",
+    });
+    expect(q.valueCents).toBe(700n);
+    expect(q.profitCents).toBe(100n);
+    expect(q.feeCents).toBe(40n);
+    expect(q.toHolderCents).toBe(60n);
+    // Exact value is 4285714285.714… — floor would give 4285714285n.
+    expect(q.unitsRedeemed).toBe(4285714286n);
   });
 });

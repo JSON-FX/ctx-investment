@@ -20,7 +20,14 @@ export interface QuoteInput {
   totals: PoolTotals;
   holderUnits: Units;
   basisCents: Cents;
-  /** Manager's share of this holder's profit, in basis points. Ignored for the manager. */
+  /**
+   * Manager's share of this holder's profit, in basis points.
+   *
+   * Always range-checked, including for the manager: a split outside 0..10000
+   * means corrupt holder terms, and failing loudly beats silently ignoring it.
+   * Forced to 0 when isManager, because the manager never charges themselves —
+   * see splitBpsApplied for what was actually used.
+   */
   splitBps: number;
   isManager: boolean;
   mode: PayoutMode;
