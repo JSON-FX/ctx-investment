@@ -326,3 +326,27 @@ describe("fold — re-entry after an exit", () => {
     expect(h.units).toBe(unitsFromDecimal("150"));
   });
 });
+
+describe("fold — exit redeems the exact unit balance", () => {
+  // valueOfUnits floors to whole cents and unitsToRedeem ceils back to units,
+  // so the round trip can under-recover. Here quote() would redeem
+  // 19_980_000_000 units against a balance of 20_000_000_000, stranding
+  // 0.002 units in a holder who has supposedly left. Exit therefore redeems
+  // h.units directly. Every other exit fixture in this file uses round
+  // numbers where the two agree, so this is the only test that pins it.
+  it("leaves an exiting holder with exactly zero units when the round trip under-recovers", () => {
+    const s = fold([
+      entry("deposit", "1", { holderId: 1 }),
+      entry("deposit", "2", { holderId: 2 }),
+      entry("equity_reading", "10"),
+      entry("exit", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+    ], [MANAGER, INVESTOR]);
+
+    const h = s.holders.find((x) => x.holderId === 2)!;
+    expect(h.units).toBe(0n);
+    expect(h.status).toBe("closed");
+    expect(h.basisCents).toBe(0n);
+    // The manager keeps their single unit; the pool retains the residual.
+    expect(s.units).toBe(unitsFromDecimal("1"));
+  });
+});
