@@ -1,0 +1,35 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# This repository is public. Nothing here may carry credentials, the Supabase
+# project ref, MT5 account numbers, broker server names, real holder names, or
+# real balances. See the spec, §10 "Secrets discipline".
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local-only notes containing real account data. Never tracked.
+*.local.md
+docs/design/validation-real-data.local.md
+
+# ── Node / Next ──────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Test / tooling ───────────────────────────────────────────────────────────
+coverage/
+playwright-report/
+test-results/
+.superpowers/
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
