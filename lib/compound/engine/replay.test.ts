@@ -1,7 +1,7 @@
 import { centsFromDecimal, unitsFromDecimal } from "./money";
 import { navTimes1e4 } from "./nav";
 import {
-  fold, totalsOf,
+  fold, totalsOf, checkNavUnchanged,
   type HolderSeed, type LedgerEntry, type LedgerEntryType,
 } from "./replay";
 
@@ -159,5 +159,170 @@ describe("fold — validation", () => {
   it("rejects a deposit with no holder", () => {
     expect(() => fold([entry("deposit", "100")], [MANAGER]))
       .toThrow(/requires a holderId/);
+  });
+});
+
+describe("fold — profit payout, fee retained as units", () => {
+  // Manager founds with $300. Equity doubles to $600 -> NAV 2.0000.
+  // Investor deposits $300 -> 150 units. Equity $900, 450 units, NAV 2.0000.
+  // Equity read at $1,800 -> NAV 4.0000.
+  // Investor value 150 * 4 = $600, basis $300, profit $300.
+  // Fee 40% = $120. Investor receives $180. Units redeemed 300/4 = 75.
+  // Fee units 120/4 = 30 to the manager.
+  function ledger() {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("equity_reading", "600"),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1800"),
+      entry("payout", "0", { holderId: 2, feeSettlement: "units", splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("pays the holder their share of profit", () => {
+    const before = fold(ledger().slice(0, 4), [MANAGER, INVESTOR]);
+    const after = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(before.equityCents - after.equityCents).toBe(centsFromDecimal("180"));
+  });
+
+  it("redeems only the units the profit was worth", () => {
+    const s = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(s.holders.find((h) => h.holderId === 2)!.units).toBe(unitsFromDecimal("75"));
+  });
+
+  it("issues the fee to the manager as units at the pre-payout NAV", () => {
+    const s = fold(ledger(), [MANAGER, INVESTOR]);
+    const mgr = s.holders.find((h) => h.holderId === 1)!;
+    expect(mgr.units).toBe(unitsFromDecimal("330"));               // 300 + 30
+    expect(mgr.basisCents).toBe(centsFromDecimal("420"));          // 300 + 120
+  });
+
+  it("leaves NAV unchanged", () => {
+    const before = fold(ledger().slice(0, 4), [MANAGER, INVESTOR]);
+    const after = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(navTimes1e4(totalsOf(after))).toBe(navTimes1e4(totalsOf(before)));
+    expect(navTimes1e4(totalsOf(after))).toBe(40_000n);
+  });
+
+  it("leaves the holder's cost basis untouched", () => {
+    const s = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(s.holders.find((h) => h.holderId === 2)!.basisCents).toBe(centsFromDecimal("300"));
+  });
+});
+
+describe("fold — profit payout, fee taken as cash", () => {
+  function ledger() {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("equity_reading", "600"),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1800"),
+      entry("payout", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("removes the fee from equity and issues no units", () => {
+    const s = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(s.equityCents).toBe(centsFromDecimal("1500")); // 1800 - 180 - 120
+    expect(s.holders.find((h) => h.holderId === 1)!.units).toBe(unitsFromDecimal("300"));
+  });
+
+  it("leaves NAV unchanged", () => {
+    const s = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(navTimes1e4(totalsOf(s))).toBe(40_000n);
+  });
+});
+
+describe("fold — exit", () => {
+  function ledger(settlement: "units" | "cash") {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("equity_reading", "600"),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1800"),
+      entry("exit", "0", { holderId: 2, feeSettlement: settlement, splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("redeems every unit the holder owns", () => {
+    const s = fold(ledger("cash"), [MANAGER, INVESTOR]);
+    expect(s.holders.find((h) => h.holderId === 2)!.units).toBe(0n);
+  });
+
+  it("closes the holder and clears their basis", () => {
+    const h = fold(ledger("cash"), [MANAGER, INVESTOR]).holders.find((x) => x.holderId === 2)!;
+    expect(h.status).toBe("closed");
+    expect(h.basisCents).toBe(0n);
+  });
+
+  it("returns value less fee", () => {
+    // value $600, profit $300, fee $120, holder receives $480
+    const before = fold(ledger("cash").slice(0, 4), [MANAGER, INVESTOR]);
+    const after = fold(ledger("cash"), [MANAGER, INVESTOR]);
+    expect(before.equityCents - after.equityCents).toBe(centsFromDecimal("600"));
+  });
+
+  it("leaves NAV unchanged", () => {
+    expect(navTimes1e4(totalsOf(fold(ledger("units"), [MANAGER, INVESTOR])))).toBe(40_000n);
+    expect(navTimes1e4(totalsOf(fold(ledger("cash"), [MANAGER, INVESTOR])))).toBe(40_000n);
+  });
+});
+
+describe("fold — payout below the high-water mark", () => {
+  function ledger() {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "300"),   // halved; investor value $150 < basis $300
+      entry("payout", "0", { holderId: 2, feeSettlement: "units", splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("is a no-op in profit mode", () => {
+    const before = fold(ledger().slice(0, 3), [MANAGER, INVESTOR]);
+    const after = fold(ledger(), [MANAGER, INVESTOR]);
+    expect(after.equityCents).toBe(before.equityCents);
+    expect(after.units).toBe(before.units);
+  });
+
+  it("charges no fee on exit and returns current value", () => {
+    const l = ledger();
+    l[3] = entry("exit", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 });
+    const before = fold(l.slice(0, 3), [MANAGER, INVESTOR]);
+    const after = fold(l, [MANAGER, INVESTOR]);
+    expect(before.equityCents - after.equityCents).toBe(centsFromDecimal("150"));
+    expect(after.holders.find((h) => h.holderId === 1)!.basisCents).toBe(centsFromDecimal("300"));
+  });
+});
+
+describe("checkNavUnchanged", () => {
+  it("passes when NAV is preserved", () => {
+    const t = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("500") };
+    expect(checkNavUnchanged(t, t)).toBe(true);
+  });
+  it("fails when NAV moves", () => {
+    const a = { equityCents: centsFromDecimal("1000"), units: unitsFromDecimal("500") };
+    const b = { equityCents: centsFromDecimal("2000"), units: unitsFromDecimal("500") };
+    expect(checkNavUnchanged(a, b)).toBe(false);
+  });
+});
+
+describe("fold — re-entry after an exit", () => {
+  // Task 6's "reactivates a closed holder" test could not fail, because
+  // nothing in that task's scope produces a closed holder. Exit does, so
+  // this is the first test that genuinely pins the closed -> active
+  // transition and the fresh cost basis a re-entering holder gets.
+  it("reactivates a holder who previously exited, with a fresh basis", () => {
+    const s = fold([
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("exit", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+      entry("deposit", "150", { holderId: 2 }),
+    ], [MANAGER, INVESTOR]);
+
+    const h = s.holders.find((x) => x.holderId === 2)!;
+    expect(h.status).toBe("active");
+    expect(h.basisCents).toBe(centsFromDecimal("150"));
+    expect(h.units).toBe(unitsFromDecimal("150"));
   });
 });

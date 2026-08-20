@@ -13,7 +13,8 @@
  * deterministic.
  */
 import type { Cents, Units } from "./money";
-import { unitsForDeposit, type PoolTotals } from "./nav";
+import { unitsForDeposit, unitsForFee, navTimes1e4, type PoolTotals } from "./nav";
+import { quote } from "./quote";
 
 export type LedgerEntryType =
   | "deposit"
@@ -133,10 +134,57 @@ export function fold(
       }
       case "payout":
       case "exit": {
-        throw new Error(`${e.type} entries are not applied yet — see Task 7`);
+        const h = holderOf(e.holderId);
+        // Every figure is taken against the PRE-payout totals. That is what
+        // keeps NAV constant across the operation.
+        const totals: PoolTotals = { equityCents, units };
+        const q = quote({
+          totals,
+          holderUnits: h.units,
+          basisCents: h.basisCents,
+          splitBps: e.splitBpsApplied ?? h.splitBps,
+          isManager: h.isManager,
+          mode: e.type === "exit" ? "exit" : "profit",
+        });
+
+        // On exit the holder surrenders everything, so redeem their exact
+        // balance rather than a ceil()-derived figure that could leave dust.
+        const redeemed = e.type === "exit" ? h.units : q.unitsRedeemed;
+
+        h.units -= redeemed;
+        units -= redeemed;
+        equityCents -= q.toHolderCents;
+
+        if (q.feeCents > 0n) {
+          const manager = [...holders.values()].find((x) => x.isManager);
+          if (!manager) throw new Error("a fee crystallised but no manager holder was seeded");
+          if (e.feeSettlement === "cash") {
+            equityCents -= q.feeCents;
+          } else {
+            const feeUnits = unitsForFee(totals, q.feeCents);
+            manager.units += feeUnits;
+            units += feeUnits;
+            manager.basisCents += q.feeCents;
+          }
+        }
+
+        if (e.type === "exit") {
+          h.basisCents = 0n;
+          h.status = "closed";
+        }
+        break;
       }
     }
   }
 
   return { equityCents, units, holders: [...holders.values()], lastReadingOn, seq };
+}
+
+/**
+ * True when two sets of totals report the same NAV to four decimal places.
+ * Deposits, payouts and fee settlements must all satisfy this; only an equity
+ * reading may move NAV.
+ */
+export function checkNavUnchanged(before: PoolTotals, after: PoolTotals): boolean {
+  return navTimes1e4(before) === navTimes1e4(after);
 }
