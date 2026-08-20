@@ -1,0 +1,125 @@
+/* Design tokens from the spec, §8. Statement direction: paper ground, green
+   ownership ramp, amber reserved for the fee. */
+:root {
+  --paper: #e7eaef;
+  --card: #ffffff;
+  --ink: #0f1b2d;
+  --ink-2: #4a5768;
+  --ink-3: #8a96a6;
+  --rule: #d2d8e0;
+  --rule-soft: #e6eaef;
+
+  --gain: #0b6b45;
+  --loss: #a32a2b;
+
+  --own: #14532d;
+  --own-2: #d6e9de;
+
+  --fee: #f59e0b;
+  --fee-ink: #b45309;
+  --fee-bg: #fef6e4;
+
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --serif: "Instrument Serif", Georgia, serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  padding: 0 0 64px;
+}
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.pos { color: var(--gain); }
+.neg { color: var(--loss); }
+.fee { color: var(--fee-ink); }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+
+.mast {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 22px 0 18px; flex-wrap: wrap;
+}
+.mark { font-family: var(--serif); font-size: 27px; line-height: 1; }
+.sub {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .18em;
+  color: var(--ink-3); border-left: 1px solid var(--rule);
+  padding-left: 10px; margin-left: 10px;
+}
+.acct {
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-2);
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 6px 11px; display: flex; align-items: center; gap: 8px;
+}
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gain); }
+
+.panel {
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 20px; margin-bottom: 12px;
+}
+.eyebrow {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .16em;
+  color: var(--ink-3); font-weight: 600;
+}
+.erow {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap; margin-top: 8px;
+}
+.equity {
+  font-family: var(--mono); font-weight: 500;
+  font-size: clamp(32px, 6vw, 48px); letter-spacing: -.035em; line-height: 1;
+}
+.equity .cents { color: var(--ink-3); }
+.navbox { display: flex; gap: 24px; flex-wrap: wrap; padding-bottom: 5px; }
+.navbox .k {
+  display: block; font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: .14em; color: var(--ink-3); font-weight: 600; margin-bottom: 3px;
+}
+.navbox .v { display: block; font-family: var(--mono); font-size: 16px; }
+
+.rail {
+  display: flex; height: 32px; border: 1px solid var(--ink);
+  border-radius: 2px; overflow: hidden; margin-top: 18px;
+}
+.seg { border-right: 1px solid var(--ink); }
+.seg:last-child { border-right: none; }
+.leg { display: flex; gap: 18px; margin-top: 9px; font-size: 11.5px; color: var(--ink-2); flex-wrap: wrap; }
+.leg i { width: 9px; height: 9px; border: 1px solid var(--ink); display: inline-block; margin-right: 7px; }
+.leg b { font-family: var(--mono); font-weight: 500; color: var(--ink); }
+
+table { width: 100%; border-collapse: collapse; background: var(--card); }
+th {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .13em;
+  color: var(--ink-3); font-weight: 600; text-align: right;
+  padding: 10px 16px; border-bottom: 1px solid var(--rule); white-space: nowrap;
+}
+td {
+  padding: 12px 16px; border-bottom: 1px solid var(--rule-soft);
+  text-align: right; white-space: nowrap; font-size: 13px;
+}
+th:first-child, td:first-child { text-align: left; }
+tr.own td { background: var(--fee-bg); }
+tr.closed td { color: var(--ink-3); }
+tfoot td {
+  background: #fbfcfd; border-top: 1px solid var(--ink);
+  border-bottom: none; font-weight: 600;
+}
+.tag {
+  display: inline-block; font-size: 9px; text-transform: uppercase;
+  letter-spacing: .1em; font-weight: 600; padding: 2px 6px;
+  border: 1px solid var(--ink); background: var(--fee); color: var(--ink);
+  border-radius: 2px; margin-left: 6px;
+}
+.scroller { overflow-x: auto; }
+.foot { padding: 18px 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.6; }
+.ok { color: var(--gain); font-weight: 600; }
+.banner {
+  background: var(--fee-bg); border: 1px solid #e8c77a; border-radius: 3px;
+  padding: 11px 14px; font-size: 12.5px; color: var(--fee-ink); margin-bottom: 12px;
+}

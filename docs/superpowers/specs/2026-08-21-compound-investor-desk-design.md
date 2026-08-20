@@ -565,8 +565,8 @@ output, behind the existing Traefik on the external `dev-net` network.
 
 | Tier | URL | Entrypoint |
 |---|---|---|
-| Dev | `http://investment.test` | `web` |
-| Local prod | `https://investment.lan` | `websecure`, TLS |
+| Dev | `http://ctxinvestment.test` | `web` |
+| Local prod | `https://ctxinvestment.lan` | `websecure`, TLS |
 
 `NEXT_PUBLIC_*` variables are baked at build time; `SUPABASE_SERVICE_ROLE_KEY`
 is read at runtime and never reaches the browser.

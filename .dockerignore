@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.worktrees
+.superpowers
+docs
+*.local.md
+.env
+.env.*
+!.env.example
+coverage
