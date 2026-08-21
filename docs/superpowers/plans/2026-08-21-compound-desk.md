@@ -201,9 +201,35 @@ Four, and no more. No `user-event` — nothing in this plan has client-side inte
 
 - [ ] **Step 2: Rewrite `jest.config.mjs` as two projects**
 
-Plan 3 left `jest.config.mjs` ignoring `*.db.test.ts` and put the integration suite in `jest.db.config.mjs`. Preserve both facts. `lib/compound/ui/**` moves to a jsdom project; everything else in `lib/` stays on node.
+Three facts already in this file must survive the rewrite. **Read the current file before editing it, and carry all three forward.**
+
+1. **The timezone pin.** `jest.config.mjs` on `main` opens with `process.env.TZ = "Asia/Manila"` and a comment saying not to remove it. `reconcile/date-key.ts`'s `utcDateKey` exists to read the UTC calendar day rather than the local one, and a mutation to local-time reads is invisible on a runner whose local zone *is* UTC — which most CI runners are. Dropping the pin would silently disarm the whole date-key suite. **Keep it, keep the comment, and keep it at module scope so it runs before either project starts.**
+2. Plan 3 left this file ignoring `*.db.test.ts`, with the integration suite in `jest.db.config.mjs`.
+3. `moduleNameMapper` and the `ts-jest` transform are unchanged; the transform gains `jsx: "react-jsx"` so `.tsx` compiles.
+
+`lib/compound/ui/**` moves to a jsdom project; everything else in `lib/` stays on node.
 
 ```javascript
+// Pin the test runner's timezone to something other than UTC.
+//
+// reconcile/date-key.ts's utcDateKey exists specifically to read the UTC
+// calendar day rather than the local one — a wrong day invents or hides a
+// capital event (see the design spec, §5.3). If a future edit swapped in a
+// local-time read (e.g. `getFullYear`/`getMonth`/`getDate` instead of
+// `toISOString`), the existing boundary-case tests would only catch it on a
+// runner whose local TZ differs from UTC. Most CI runners default to UTC, so
+// on one of those the mutation would be silently invisible — the whole test
+// file passes even though the function is now wrong. Asia/Manila is fixed at
+// UTC+08:00 with no DST transitions (confirmed: the Philippines has not
+// observed DST since 1954), so this is stable year-round and never
+// coincides with UTC, which is what makes the assertion discriminate
+// everywhere, not just on whichever machine happens to run it.
+//
+// Do not "simplify" this back to UTC or remove it — that reintroduces the
+// exact blind spot this comment describes. It stays at module scope so it is
+// set before either project below is constructed.
+process.env.TZ = "Asia/Manila";
+
 /** @type {import('jest').Config} */
 const shared = {
   preset: "ts-jest",
@@ -680,6 +706,14 @@ pnpm typecheck && pnpm test
 
 Expected: two projects report, `unit` runs the engine and reconcile suites unchanged, `ui` runs `tokens.test.ts` and it passes.
 
+Then confirm the timezone pin survived:
+
+```bash
+node -e 'import("./jest.config.mjs").then(() => console.log(process.env.TZ))'
+```
+
+Expected: `Asia/Manila`. If it prints `undefined`, the pin was dropped in the rewrite and `lib/compound/reconcile/date-key.test.ts` is now passing for the wrong reason on a UTC runner.
+
 - [ ] **Step 8: Prove the tests bite**
 
 Do all four, one at a time, reverting each:
@@ -688,8 +722,9 @@ Do all four, one at a time, reverting each:
 2. Add `color: var(--fee);` to `.chip.is-fee` → the amber `color` test fails and names the line.
 3. Change `.eyebrow`'s colour back to `var(--ink-3)` → D-L's test fails.
 4. Delete the `@media (prefers-reduced-motion: reduce)` block → the reduced-motion test fails.
+5. Delete `process.env.TZ = "Asia/Manila"` → **nothing goes red on this machine**, because the developer machine is already on Asia/Manila. That is the point of naming it: the pin's absence is invisible exactly where you would look for it. Verify it the other way instead — `TZ=UTC pnpm test` with the pin deleted, and confirm `date-key.test.ts` still passes, which is what proves the pin was doing work.
 
-If any of the four leaves the suite green, the test is not reading what it claims to read. Fix it before continuing.
+If any of the first four leaves the suite green, the test is not reading what it claims to read. Fix it before continuing.
 
 ---
 
