@@ -33,7 +33,11 @@ describe("journal purity", () => {
   it("has source files to check", () => {
     // Mutation caught: the guard silently passing because it is pointed at an
     // empty directory. This is the assertion plan 1 learned to write first.
-    expect(sourceFiles().length).toBeGreaterThan(0);
+    // Ratchet: 1 (int.ts) at Task 1, 2 (+ history.ts) at Task 2. Raise this
+    // bound whenever a task adds a top-level source file to this directory,
+    // so a scan that silently stops finding a file fails loudly instead of
+    // passing on a smaller-than-expected set.
+    expect(sourceFiles().length).toBeGreaterThan(1);
   });
 
   it.each(sourceFiles())("%s stays pure", (file) => {
