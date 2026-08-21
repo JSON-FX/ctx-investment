@@ -6832,3 +6832,917 @@ MSG
 
 > **Phase A checkpoint.** Stop here if this is being executed as two plans. What exists: sign-in, the account list, account creation, the account shell, the desk, the ledger and the holder statement, all rendering real figures from the real database, with nothing that writes. That is a coherent, mergeable product.
 
+---
+
+# Phase B — the money flows
+
+Five sheets, each of which shows complete arithmetic before it commits, and the writers behind them. Every sheet follows decision D-C — enter, read the receipt, confirm — and every receipt is produced by folding the proposed entry (D-D), so a preview cannot disagree with what the commit writes.
+
+---
+
+### Task 11: The action seam, refreshing readings, and posting one by hand
+
+The plumbing every sheet in Phase B reuses, proved out on the flow that needs no new SQL.
+
+**The freshness contract.** A receipt is rendered against a pool at a known `seq`. Between rendering and confirming, something else may have written to the ledger — the reconciler, another tab, a second window. Confirming a receipt against a pool that has moved would commit arithmetic the manager never saw. Every sheet therefore carries the `Fingerprint` from `previewEntry` through hidden fields, and every commit re-folds and refuses when it does not match.
+
+**The reconciler is the primary way readings advance.** A manual reading is the exception, and it is fenced: it may only be dated after the last snapshot CopyTraderX has, and only when the reconciler has nothing left to post. Without that fence a manual reading dated today moves the cursor past days nobody has reconciled, and any capital event in them is absorbed into NAV — the exact loss §5.3 exists to prevent, arriving through the one door the interlock does not watch.
+
+> **Decision D-O: `toleranceCents` is `0n`.** Spec §6.3 verified that with dedup applied, summed closed-trade P/L reconciles against the balance series to a residual of **exactly zero** across the whole period. A non-zero tolerance is a capital event small enough to hide, permanently. If zero produces false candidates in practice, the manager sees a review item and classifies it "not a capital event" — a visible, cheap, safe failure, where the alternative is a silent, expensive one.
+
+**Files:**
+- Create: `lib/compound/present/errors.ts`
+- Create: `lib/compound/present/fingerprint.ts`
+- Create: `lib/compound/load/reconcile.ts`
+- Create: `app/a/[id]/actions/actions.ts`
+- Create: `app/a/[id]/actions/reading/page.tsx`
+- Create: `lib/compound/ui/reading-sheet.tsx`
+- Modify: `lib/compound/ui/desk.tsx` — split `actions` from holder actions
+- Modify: `app/a/[id]/page.tsx` — pass the action bar
+- Test: `lib/compound/present/errors.test.ts`
+- Test: `lib/compound/present/fingerprint.test.ts`
+- Test: `lib/compound/ui/reading-sheet.test.tsx`
+
+**Interfaces:**
+- Consumes: `planReadings`, `ReadingPlan`, `DroppedDeal` from `@/lib/compound/reconcile/interlock`; `commitReadingPlan` from `@/lib/compound/db/commit-plan`; `getDailySnapshots`, `getClosedDeals` from `@/lib/compound/db/copytraderx`; `previewEntry`, `fingerprintOf` from `@/lib/compound/present/derive`
+- Produces:
+  - `explainCommitError(e: unknown): string`
+  - `fingerprintToFields(f: Fingerprint): Record<string, string>`
+  - `fingerprintFromFields(get: (k: string) => string | null): Fingerprint | null`
+  - `fingerprintMismatch(shown: Fingerprint, current: Fingerprint): string | null`
+  - `type ReconcileOutcome`
+  - `planFor(account: ResolvedAccount): Promise<ReconcileOutcome>`
+  - `refreshReadings(accountId: number): Promise<void>` — server action
+  - `postReading(formData: FormData): Promise<void>` — server action
+  - `ReadingSheet` component
+
+- [ ] **Step 1: Create `lib/compound/present/errors.ts`**
+
+```typescript
+/**
+ * Turning a refusal into a sentence a manager can act on.
+ *
+ * Every writer in this product raises a custom SQLSTATE rather than letting a
+ * constraint name reach a screen. A refusal that says "23514" tells the reader
+ * nothing; a refusal that says which rule fired and what to do about it is the
+ * difference between a safety mechanism and an obstacle.
+ *
+ * Codes are allocated in blocks so a stray one is obviously unhandled:
+ *   CX0xx  the reading writer        (plan 3)
+ *   CX1xx  accounts and holders      (this plan)
+ *   CX2xx  capital and payouts       (this plan)
+ */
+const MESSAGES: Record<string, string> = {
+  CX001: "That account no longer exists.",
+  CX002:
+    "There is an unclassified capital event on or before that date. Classify it in " +
+    "Review first — NAV must not cross a capital event nobody has explained.",
+  CX003:
+    "A reading has already been posted for that date or later. Readings only move " +
+    "forward, and a correction is a reversing entry rather than an overwrite.",
+  CX004:
+    "The reading dates and the new cursor position disagree. Nothing was written. " +
+    "Reload and try again.",
+  CX005: "Those readings are not in ascending date order.",
+  CX101: "That MT5 account already has a Compound account.",
+  CX102: "That account already has a manager. There can only be one.",
+  CX201:
+    "That holder has no units to pay out. Add capital first, or check you picked " +
+    "the right holder.",
+  CX202:
+    "That payout is below the holder's high-water mark, so there is no profit to " +
+    "withdraw. A full exit is still available.",
+  CX203: "That capital event has already been classified.",
+  CX204:
+    "The account moved while this was open, so the figures you read are no longer " +
+    "the figures that would be written. Nothing was committed. Close this and reopen it.",
+};
+
+export function explainCommitError(e: unknown): string {
+  const code = typeof e === "object" && e !== null && "code" in e
+    ? String((e as { code: unknown }).code)
+    : null;
+  if (code !== null && code in MESSAGES) return MESSAGES[code]!;
+  if (e instanceof RangeError) return e.message;
+  if (e instanceof Error) return e.message;
+  return "Something went wrong and nothing was committed.";
+}
+
+/** True for Next's redirect/notFound control-flow throws, which must be re-thrown. */
+export function isNextControlFlow(e: unknown): boolean {
+  return typeof e === "object" && e !== null && "digest" in e &&
+    typeof (e as { digest: unknown }).digest === "string" &&
+    /^(NEXT_REDIRECT|NEXT_NOT_FOUND)/.test((e as { digest: string }).digest);
+}
+```
+
+- [ ] **Step 2: Create `lib/compound/present/fingerprint.ts`**
+
+```typescript
+/**
+ * The freshness contract.
+ *
+ * A receipt is arithmetic against a pool at a known seq. Between rendering it
+ * and confirming it, the reconciler may have posted readings, or a second tab
+ * may have committed a deposit. Confirming then would write arithmetic the
+ * manager never read — the figures would be right for a pool that no longer
+ * exists.
+ *
+ * The fingerprint travels through hidden form fields as DECIMAL STRINGS. A
+ * bigint does not survive JSON and a form field is text either way; parsing it
+ * back with BigInt() is exact where Number() is not.
+ */
+import type { Fingerprint } from "./derive";
+
+export function fingerprintToFields(f: Fingerprint): Record<string, string> {
+  return {
+    fpAccountId: String(f.accountId),
+    fpSeq: String(f.seq),
+    fpEquityCents: f.equityCents,
+    fpUnits: f.units,
+  };
+}
+
+const DECIMAL = /^-?[0-9]+$/;
+
+export function fingerprintFromFields(
+  get: (key: string) => string | null,
+): Fingerprint | null {
+  const accountId = get("fpAccountId");
+  const seq = get("fpSeq");
+  const equityCents = get("fpEquityCents");
+  const units = get("fpUnits");
+  if (accountId === null || seq === null || equityCents === null || units === null) return null;
+  if (![accountId, seq, equityCents, units].every((v) => DECIMAL.test(v))) return null;
+  return {
+    accountId: Number(accountId),
+    seq: Number(seq),
+    equityCents,
+    units,
+  };
+}
+
+/**
+ * Null when the receipt is still good; otherwise the sentence to show.
+ *
+ * All four fields are compared, not just seq. seq alone would miss the case
+ * that matters most on a busy account: an entry written and then reversed
+ * leaves seq higher and the pool identical, while a reversal of an OLD entry
+ * leaves the pool different at a seq the reader might still recognise.
+ */
+export function fingerprintMismatch(
+  shown: Fingerprint,
+  current: Fingerprint,
+): string | null {
+  if (shown.accountId !== current.accountId) {
+    return "That receipt belongs to a different account.";
+  }
+  if (
+    shown.seq === current.seq &&
+    shown.equityCents === current.equityCents &&
+    shown.units === current.units
+  ) {
+    return null;
+  }
+  return (
+    `The account moved while this was open — it was at entry ${shown.seq} when these ` +
+    `figures were worked out and it is at entry ${current.seq} now. Nothing was ` +
+    `committed. Close this and reopen it to see the current figures.`
+  );
+}
+```
+
+- [ ] **Step 3: Create `lib/compound/load/reconcile.ts`**
+
+```typescript
+/**
+ * Running the reconciler for an account.
+ *
+ * Three outcomes a caller must handle differently, and one that is easy to get
+ * wrong:
+ *
+ *   not-configured  the broker offset is null. dedupeDeals throws below 1, and
+ *                   reconciling undeduplicated inflates the explained figure
+ *                   and can hide a real capital event. Refuse, visibly.
+ *   error           planReadings threw a RangeError. This is a DATA DEFECT, not
+ *                   a state to render as a halt banner: two snapshots share a
+ *                   trade date, or the window starts after the cursor. A halt
+ *                   banner would say "a capital event needs classifying", which
+ *                   is not what happened, and the manager would go looking for
+ *                   one that does not exist.
+ *   plan            idle, advance or halt. Every variant carries droppedDeals.
+ */
+import { cache } from "react";
+import { withDb } from "@/lib/compound/db/client";
+import { getReconcileCursor } from "@/lib/compound/db/compound";
+import { getClosedDeals, getDailySnapshots } from "@/lib/compound/db/copytraderx";
+import { planReadings, type ReadingPlan } from "@/lib/compound/reconcile/interlock";
+import type { ResolvedAccount } from "./account";
+
+/** Spec 6.3: with dedup applied the residual is exactly zero. Decision D-O. */
+export const TOLERANCE_CENTS = 0n;
+
+export type ReconcileOutcome =
+  | { kind: "not-configured" }
+  | { kind: "error"; message: string }
+  | { kind: "plan"; plan: ReadingPlan; lastSnapshotDate: string | null };
+
+export const planFor = cache(async (account: ResolvedAccount): Promise<ReconcileOutcome> => {
+  if (account.brokerOffsetHours === null) return { kind: "not-configured" };
+
+  const [cursor, snapshots, deals] = await withDb(async (c) => {
+    const cur = await getReconcileCursor(c, account.id);
+    // The window must INCLUDE the cursor date: the first day's balance move is
+    // reconciled against the balance at the cursor, and planReadings throws if
+    // that row is missing. `WHERE trade_date > cursor` is the natural query and
+    // the wrong one.
+    const from = cur.lastReadingDate ?? undefined;
+    return [
+      cur,
+      await getDailySnapshots(c, account.mt5Account, { from }),
+      await getClosedDeals(c, account.mt5Account, { from }),
+    ] as const;
+  });
+
+  try {
+    return {
+      kind: "plan",
+      plan: planReadings({
+        snapshots,
+        deals,
+        cursor,
+        brokerOffsetHours: account.brokerOffsetHours,
+        toleranceCents: TOLERANCE_CENTS,
+      }),
+      lastSnapshotDate: snapshots.length === 0
+        ? null
+        : snapshots.reduce((m, s) => (s.tradeDate > m ? s.tradeDate : m), snapshots[0]!.tradeDate),
+    };
+  } catch (e) {
+    if (e instanceof RangeError) return { kind: "error", message: e.message };
+    throw e;
+  }
+});
+```
+
+- [ ] **Step 4: Create `app/a/[id]/actions/actions.ts`**
+
+```typescript
+"use server";
+
+/**
+ * The server actions behind Phase B's sheets.
+ *
+ * Every one of them: resolve the account through the same gate a page uses,
+ * re-derive the current state, check the fingerprint the receipt carried, then
+ * write. The re-derivation is the point — a commit never trusts a number that
+ * came back from the browser, only the inputs the manager typed.
+ */
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { withDb, withDbTransaction } from "@/lib/compound/db/client";
+import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadPoolState } from "@/lib/compound/load/ledger";
+import { requireManager } from "@/lib/compound/load/session";
+import { planFor } from "@/lib/compound/load/reconcile";
+import { fingerprintOf } from "@/lib/compound/present/derive";
+import { explainCommitError, isNextControlFlow } from "@/lib/compound/present/errors";
+import { fingerprintFromFields, fingerprintMismatch } from "@/lib/compound/present/fingerprint";
+import { deskHref, readingHref } from "@/lib/compound/ui/routes";
+
+/** Re-derive, compare, and hand back the sentence to show — or null to proceed. */
+async function staleness(accountId: number, formData: FormData): Promise<string | null> {
+  const shown = fingerprintFromFields((k) => {
+    const v = formData.get(k);
+    return typeof v === "string" ? v : null;
+  });
+  if (shown === null) return "That form was incomplete. Nothing was committed.";
+  const current = fingerprintOf(accountId, await loadPoolState(accountId));
+  return fingerprintMismatch(shown, current);
+}
+
+export async function refreshReadings(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const back = deskHref(account.id);
+
+  const outcome = await planFor(account);
+  if (outcome.kind === "not-configured") {
+    redirect(`${back}?error=${encodeURIComponent(
+      "The broker UTC offset is not set for this account. Reconciliation stays off " +
+      "until it is: without the duplicate-deal guard an inflated explained figure " +
+      "can hide a real capital event.",
+    )}`);
+  }
+  if (outcome.kind === "error") {
+    redirect(`${back}?error=${encodeURIComponent(outcome.message)}`);
+  }
+
+  try {
+    const result = await withDbTransaction((c) =>
+      commitReadingPlan(c, { accountId: account.id, plan: outcome.plan, actorUserId: user.id }),
+    );
+    revalidatePath(back, "layout");
+    redirect(`${back}?posted=${result.readingsInserted}${
+      result.candidateId === null ? "" : `&halted=1`
+    }`);
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+
+export async function postReading(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const back = readingHref(account.id);
+
+  const stale = await staleness(account.id, formData);
+  if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
+
+  const occurredOn = String(formData.get("occurredOn"));
+  let equityCents: bigint;
+  try {
+    equityCents = centsFromDecimal(String(formData.get("equity")));
+  } catch {
+    redirect(`${back}?error=${encodeURIComponent("That is not an amount. Use digits and at most two decimal places.")}`);
+    return;
+  }
+  if (equityCents <= 0n) {
+    redirect(`${back}?error=${encodeURIComponent("Equity must be positive. An account at zero needs an adjustment entry, not a reading.")}`);
+  }
+
+  try {
+    await withDbTransaction((c) =>
+      commitReadingPlan(c, {
+        accountId: account.id,
+        plan: {
+          kind: "advance",
+          readings: [{ occurredOn, equityCents }],
+          newCursorDate: occurredOn,
+          // A hand-posted reading deduplicated nothing. The field is required
+          // on every variant so this has to be said rather than assumed.
+          droppedDeals: [],
+        },
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(deskHref(account.id));
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+```
+
+- [ ] **Step 5: Create `lib/compound/ui/reading-sheet.tsx`**
+
+```tsx
+/**
+ * Posting an equity reading by hand.
+ *
+ * Fenced, deliberately. A reading moves the reconcile cursor, and a cursor that
+ * jumps past days nobody reconciled absorbs any capital event in them into NAV.
+ * That is the loss section 5.3 exists to prevent, arriving through the one door
+ * the interlock does not watch. So: only when the reconciler has nothing left
+ * to post, and only dated after the last snapshot CopyTraderX has.
+ *
+ * The receipt shows every holder's value before and after, because that is what
+ * a reading actually does — it does not move cash and it does not move units,
+ * it revalues everyone at once.
+ */
+import type { Cents } from "@/lib/compound/engine/money";
+import type { Preview } from "@/lib/compound/present/derive";
+import { formatDate, formatMoney, formatNav } from "@/lib/compound/present/format";
+import { fingerprintToFields } from "@/lib/compound/present/fingerprint";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import { DeltaMoney, Money } from "./primitives";
+import { Receipt, ReceiptLine, ReceiptTotal } from "./receipt";
+import { Field, FieldError, Sheet, SheetActions } from "./sheet";
+
+export type ReadingGate =
+  | { kind: "ready"; earliestDate: string }
+  | { kind: "not-configured" }
+  | { kind: "error"; message: string }
+  | { kind: "unposted"; count: number; through: string }
+  | { kind: "halted"; candidateDate: string; reviewHref: string };
+
+export function ReadingSheet({
+  accountId, gate, currency, names, preview, form, error, backHref, commitAction,
+}: {
+  accountId: number;
+  gate: ReadingGate;
+  currency: string;
+  names: Record<number, string>;
+  /** Absent on step one. */
+  preview: Preview | null;
+  form: { occurredOn?: string; equity?: string };
+  error?: string;
+  backHref: string;
+  commitAction: (formData: FormData) => Promise<void>;
+}) {
+  if (gate.kind !== "ready") {
+    return (
+      <Sheet title="Post an equity reading" backHref={backHref}>
+        <div className="banner-halt" role="status">
+          <strong>Not yet.</strong>
+          <p style={{ margin: "6th 0 0" }}>
+            {gate.kind === "not-configured"
+              ? "The broker UTC offset is not set for this account, so nothing has been reconciled. Set it on the account before posting readings by hand."
+              : gate.kind === "error"
+              ? gate.message
+              : gate.kind === "unposted"
+              ? `CopyTraderX has ${gate.count} ${gate.count === 1 ? "day" : "days"} up to ${formatDate(gate.through)} that are not posted yet. Refresh readings first: a hand-posted reading moves the cursor past them, and any capital event in those days would be absorbed into NAV without anyone seeing it.`
+              : `An unexplained balance move on ${formatDate(gate.candidateDate)} is waiting to be classified. NAV must not cross it.`}
+          </p>
+          {gate.kind === "halted" ? (
+            <p style={{ margin: "6px 0 0" }}><a href={gate.reviewHref}>Review it</a></p>
+          ) : null}
+        </div>
+      </Sheet>
+    );
+  }
+
+  if (preview === null) {
+    return (
+      <Sheet
+        title="Post an equity reading"
+        lede="A reading is what the account was worth on a given day. It moves NAV, and it is the only thing that does."
+        backHref={backHref}
+      >
+        {error ? <FieldError>{error}</FieldError> : null}
+        <form method="get">
+          <input type="hidden" name="step" value="confirm" />
+          <Field
+            name="occurredOn"
+            label="Date"
+            hint={`Broker-server date. Must be after ${formatDate(gate.earliestDate)}, the last day already posted.`}
+          >
+            <input
+              id="occurredOn" name="occurredOn" type="date" required
+              min={gate.earliestDate} defaultValue={form.occurredOn}
+            />
+          </Field>
+          <Field name="equity" label={`Account equity, ${currency}`} hint="Equity, not balance. A holder's value includes their share of open positions.">
+            <input id="equity" name="equity" inputMode="decimal" required defaultValue={form.equity} />
+          </Field>
+          <SheetActions>
+            <button className="btn btn-primary" type="submit">Review</button>
+          </SheetActions>
+        </form>
+      </Sheet>
+    );
+  }
+
+  const fields = fingerprintToFields(preview.fingerprint);
+  const change = (i: number): Cents => preview.valuesAfter[i]! - preview.valuesBefore[i]!;
+
+  return (
+    <Sheet title="Post an equity reading" backHref={backHref} backLabel="Back">
+      {error ? <FieldError>{error}</FieldError> : null}
+      <Receipt label="Equity reading">
+        <ReceiptLine label="Date">
+          <span className="num">{formatDate(form.occurredOn ?? "")}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Account equity" hint="Before, then after this reading.">
+          <span className="num">
+            {formatMoney(preview.before.equityCents, { currency })} →{" "}
+            {formatMoney(preview.after.equityCents, { currency })}
+          </span>
+        </ReceiptLine>
+        <ReceiptLine label="NAV per unit" hint="Units do not change. A reading revalues them.">
+          <span className="num">
+            {formatNav(totalsOf(preview.before))} → {formatNav(totalsOf(preview.after))}
+          </span>
+        </ReceiptLine>
+        {preview.after.holders.map((h, i) => (
+          <ReceiptLine
+            key={h.holderId}
+            label={names[h.holderId] ?? `Holder #${h.holderId}`}
+            hint={`${formatMoney(preview.valuesBefore[i]!, { currency })} → ${formatMoney(preview.valuesAfter[i]!, { currency })}`}
+          >
+            <DeltaMoney cents={change(i)} currency={currency} />
+          </ReceiptLine>
+        ))}
+        <ReceiptTotal label="Total change in value" hint="Sums to the change in equity, exactly.">
+          <DeltaMoney
+            cents={preview.after.equityCents - preview.before.equityCents}
+            currency={currency}
+          />
+        </ReceiptTotal>
+      </Receipt>
+
+      <form action={commitAction}>
+        <input type="hidden" name="accountId" value={accountId} />
+        <input type="hidden" name="occurredOn" value={form.occurredOn ?? ""} />
+        <input type="hidden" name="equity" value={form.equity ?? ""} />
+        {Object.entries(fields).map(([k, v]) => (
+          <input key={k} type="hidden" name={k} value={v} />
+        ))}
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Post this reading</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+> **Typo to fix on sight:** `margin: "6th 0 0"` in the gate block is not a CSS length. It should be `"6px 0 0"`. It is left visible here rather than silently corrected because a broken inline style renders without erroring, which is exactly the class of defect that survives a review.
+
+- [ ] **Step 6: Create `app/a/[id]/actions/reading/page.tsx`**
+
+```tsx
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadHolderNames, loadLedger, loadSeeds } from "@/lib/compound/load/ledger";
+import { planFor } from "@/lib/compound/load/reconcile";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { ReadingSheet, type ReadingGate } from "@/lib/compound/ui/reading-sheet";
+import { deskHref, reviewHref } from "@/lib/compound/ui/routes";
+import { postReading } from "../actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function ReadingPage({
+  params, searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ step?: string; occurredOn?: string; equity?: string; error?: string }>;
+}) {
+  const account = await requireAccount((await params).id);
+  const q = await searchParams;
+
+  const [outcome, entries, seeds, names] = await Promise.all([
+    planFor(account),
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    loadHolderNames(account.id),
+  ]);
+
+  let gate: ReadingGate;
+  if (outcome.kind === "not-configured") gate = { kind: "not-configured" };
+  else if (outcome.kind === "error") gate = { kind: "error", message: outcome.message };
+  else if (outcome.plan.kind === "halt") {
+    gate = {
+      kind: "halted",
+      candidateDate: outcome.plan.candidate.tradeDate,
+      reviewHref: reviewHref(account.id),
+    };
+  } else if (outcome.plan.kind === "advance") {
+    gate = {
+      kind: "unposted",
+      count: outcome.plan.readings.length,
+      through: outcome.plan.newCursorDate,
+    };
+  } else {
+    gate = { kind: "ready", earliestDate: outcome.lastSnapshotDate ?? account.inceptionDate };
+  }
+
+  let preview = null;
+  if (q.step === "confirm" && q.occurredOn && q.equity && gate.kind === "ready") {
+    try {
+      preview = previewEntry({
+        accountId: account.id,
+        entries,
+        seeds,
+        proposed: {
+          holderId: null,
+          occurredOn: q.occurredOn,
+          type: "equity_reading",
+          amountCents: centsFromDecimal(q.equity),
+          feeSettlement: null,
+          splitBpsApplied: null,
+        },
+      });
+    } catch {
+      preview = null;
+    }
+  }
+
+  return (
+    <ReadingSheet
+      accountId={account.id}
+      gate={gate}
+      currency={account.currency}
+      names={names}
+      preview={preview}
+      form={{ occurredOn: q.occurredOn, equity: q.equity }}
+      error={q.error}
+      backHref={deskHref(account.id)}
+      commitAction={postReading}
+    />
+  );
+}
+```
+
+- [ ] **Step 7: Add the action bar to the desk**
+
+In `lib/compound/ui/desk.tsx`, split the two concerns that Task 8 tied together:
+
+```tsx
+  actions?: React.ReactNode;
+  /** Task 13 turns this on. Separate from `actions` so the desk can carry a
+   *  reading button before a payout sheet exists to link to. */
+  holderActions?: boolean;
+```
+
+and change the table call to `showActions={holderActions ?? false}`.
+
+In `app/a/[id]/page.tsx`, pass the bar:
+
+```tsx
+      actions={
+        <>
+          <form action={refreshReadings}>
+            <input type="hidden" name="accountId" value={account.id} />
+            <button className="btn" type="submit">Refresh readings</button>
+          </form>
+          <a className="btn" href={readingHref(account.id)}>Post a reading by hand</a>
+        </>
+      }
+```
+
+- [ ] **Step 8: Write `lib/compound/present/errors.test.ts` and `fingerprint.test.ts`**
+
+```typescript
+// lib/compound/present/errors.test.ts
+import { explainCommitError, isNextControlFlow } from "./errors";
+
+describe("explainCommitError", () => {
+  it("explains the interlock refusal in terms of what to do", () => {
+    const msg = explainCommitError({ code: "CX002", message: "compound: reading crosses candidate" });
+    expect(msg).toContain("unclassified capital event");
+    expect(msg).toContain("Classify it in Review first");
+    expect(msg).not.toContain("CX002");
+  });
+
+  it("explains a stale cursor without saying 'cursor'", () => {
+    expect(explainCommitError({ code: "CX003" })).toContain("Readings only move forward");
+  });
+
+  it.each(["CX001", "CX002", "CX003", "CX004", "CX005", "CX101", "CX102", "CX201", "CX202", "CX203", "CX204"])(
+    "has a sentence for %s",
+    (code) => {
+      const msg = explainCommitError({ code });
+      expect(msg.length).toBeGreaterThan(20);
+      expect(msg).not.toContain(code);
+    },
+  );
+
+  it("passes a RangeError through, because the reconciler's own text is already the explanation", () => {
+    const e = new RangeError("duplicate snapshot for tradeDate 2026-08-12 in the reading window");
+    expect(explainCommitError(e)).toBe(e.message);
+  });
+
+  it("does not swallow an unrecognised code into a generic sentence with no signal", () => {
+    // A code nobody handled must still surface the driver's own message, or a
+    // new writer's refusal becomes invisible the day it is added.
+    expect(explainCommitError(Object.assign(new Error("relation does not exist"), { code: "42P01" })))
+      .toBe("relation does not exist");
+  });
+
+  it("has something to say about a value that is not an error at all", () => {
+    expect(explainCommitError("boom")).toBe("Something went wrong and nothing was committed.");
+  });
+});
+
+describe("isNextControlFlow", () => {
+  it("recognises a redirect throw, which must never be reported as a failure", () => {
+    expect(isNextControlFlow({ digest: "NEXT_REDIRECT;replace;/a/7;307;" })).toBe(true);
+    expect(isNextControlFlow({ digest: "NEXT_NOT_FOUND" })).toBe(true);
+  });
+
+  it("does not mistake a real error for one", () => {
+    expect(isNextControlFlow(new Error("nope"))).toBe(false);
+    expect(isNextControlFlow({ digest: 42 })).toBe(false);
+    expect(isNextControlFlow({ code: "CX002" })).toBe(false);
+  });
+});
+```
+
+```typescript
+// lib/compound/present/fingerprint.test.ts
+import { fold } from "@/lib/compound/engine/replay";
+import { LEDGER, SEEDS } from "./fixture";
+import { fingerprintOf } from "./derive";
+import { fingerprintFromFields, fingerprintMismatch, fingerprintToFields } from "./fingerprint";
+
+const F = fingerprintOf(7, fold(LEDGER, SEEDS));
+
+describe("round trip", () => {
+  it("survives the form, exactly, past Number.MAX_SAFE_INTEGER", () => {
+    const big = { accountId: 7, seq: 6, equityCents: "9007199254740993", units: "402224547963043" };
+    const fields = fingerprintToFields(big);
+    const back = fingerprintFromFields((k) => fields[k] ?? null);
+    expect(back).toEqual(big);
+    // The value a Number round trip would have produced, for contrast.
+    expect(Number(big.equityCents)).toBe(9_007_199_254_740_992);
+  });
+
+  it("carries every field as a string", () => {
+    const fields = fingerprintToFields(F);
+    expect(Object.values(fields).every((v) => typeof v === "string")).toBe(true);
+  });
+
+  it("refuses a missing field rather than defaulting it", () => {
+    expect(fingerprintFromFields(() => null)).toBeNull();
+    const fields = fingerprintToFields(F);
+    expect(fingerprintFromFields((k) => (k === "fpUnits" ? null : fields[k] ?? null))).toBeNull();
+  });
+
+  it("refuses a field that is not a decimal integer", () => {
+    const fields = { ...fingerprintToFields(F), fpEquityCents: "5574391.00" };
+    expect(fingerprintFromFields((k) => fields[k] ?? null)).toBeNull();
+  });
+});
+
+describe("fingerprintMismatch", () => {
+  it("passes an unchanged pool", () => {
+    expect(fingerprintMismatch(F, { ...F })).toBeNull();
+  });
+
+  it("refuses a different account outright", () => {
+    expect(fingerprintMismatch(F, { ...F, accountId: 8 }))
+      .toBe("That receipt belongs to a different account.");
+  });
+
+  it("refuses a moved seq, naming both positions", () => {
+    const msg = fingerprintMismatch(F, { ...F, seq: 7 });
+    expect(msg).toContain("was at entry 6");
+    expect(msg).toContain("is at entry 7 now");
+    expect(msg).toContain("Nothing was committed");
+  });
+
+  it("refuses equity that moved while seq did not", () => {
+    // The case seq alone misses: a reversal of an old entry leaves the pool
+    // different at a seq the reader might still recognise.
+    expect(fingerprintMismatch(F, { ...F, equityCents: "5574390" })).not.toBeNull();
+  });
+
+  it("refuses units that moved while seq and equity did not", () => {
+    expect(fingerprintMismatch(F, { ...F, units: "402224547963044" })).not.toBeNull();
+  });
+});
+```
+
+- [ ] **Step 9: Write `lib/compound/ui/reading-sheet.test.tsx`**
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { HOLDER_NAMES, LEDGER, SEEDS } from "@/lib/compound/present/fixture";
+import { ReadingSheet, type ReadingGate } from "./reading-sheet";
+
+const PREVIEW = previewEntry({
+  accountId: 7, entries: LEDGER, seeds: SEEDS,
+  proposed: {
+    holderId: null, occurredOn: "2026-08-18", type: "equity_reading",
+    amountCents: centsFromDecimal("57120.44"), feeSettlement: null, splitBpsApplied: null,
+  },
+});
+
+const READY: ReadingGate = { kind: "ready", earliestDate: "2026-08-14" };
+const noop = async () => {};
+
+function renderSheet(over: Partial<Parameters<typeof ReadingSheet>[0]> = {}) {
+  return render(
+    <ReadingSheet
+      accountId={7}
+      gate={over.gate ?? READY}
+      currency="USD"
+      names={HOLDER_NAMES}
+      preview={over.preview === undefined ? PREVIEW : over.preview}
+      form={over.form ?? { occurredOn: "2026-08-18", equity: "57120.44" }}
+      error={over.error}
+      backHref="/a/7"
+      commitAction={noop}
+    />,
+  );
+}
+
+describe("ReadingSheet — the receipt", () => {
+  beforeEach(() => renderSheet());
+
+  it("shows equity before and after", () => {
+    expect(screen.getByLabelText("Account equity").textContent)
+      .toBe("$55,743.91 → $57,120.44");
+  });
+
+  it("shows NAV before and after", () => {
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.4201");
+  });
+
+  it("shows every holder's change, signed", () => {
+    expect(screen.getByLabelText("J. Marsh").textContent).toBe("+$855.57");
+    expect(screen.getByLabelText("Ada Lovelace").textContent).toBe("+$311.90");
+    expect(screen.getByLabelText("Grace Hopper").textContent).toBe("+$209.06");
+  });
+
+  it("totals the holder changes to the change in equity, exactly", () => {
+    const parts = ["J. Marsh", "Ada Lovelace", "Grace Hopper"]
+      .map((n) => BigInt(screen.getByLabelText(n).textContent!.replace(/\D/g, "")));
+    expect(parts.reduce((a, b) => a + b, 0n)).toBe(137_653n);
+    expect(screen.getByLabelText("Total change in value").textContent).toBe("+$1,376.53");
+  });
+
+  it("carries the fingerprint into the commit form as decimal strings", () => {
+    const value = (n: string) =>
+      document.querySelector<HTMLInputElement>(`input[name="${n}"]`)!.value;
+    expect(value("fpAccountId")).toBe("7");
+    expect(value("fpSeq")).toBe("6");
+    expect(value("fpEquityCents")).toBe("5574391");
+    expect(value("fpUnits")).toBe("402224547963043");
+  });
+
+  it("says a reading does not move units", () => {
+    expect(screen.getByText(/Units do not change/)).toBeInTheDocument();
+  });
+});
+
+describe("ReadingSheet — the fence", () => {
+  it("refuses while the reconciler has days left to post, and says why", () => {
+    renderSheet({ gate: { kind: "unposted", count: 4, through: "2026-08-14" }, preview: null });
+    expect(screen.getByText(/CopyTraderX has 4 days up to 14 Aug 2026 that are not posted/))
+      .toBeInTheDocument();
+    expect(screen.getByText(/absorbed into NAV without anyone seeing it/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Post this reading/ })).toBeNull();
+  });
+
+  it("refuses while a capital event is unclassified, and links to it", () => {
+    renderSheet({
+      gate: { kind: "halted", candidateDate: "2026-08-12", reviewHref: "/a/7/review" },
+      preview: null,
+    });
+    expect(screen.getByText(/unexplained balance move on 12 Aug 2026/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review it" })).toHaveAttribute("href", "/a/7/review");
+  });
+
+  it("refuses when the broker offset is not configured", () => {
+    renderSheet({ gate: { kind: "not-configured" }, preview: null });
+    expect(screen.getByText(/broker UTC offset is not set/)).toBeInTheDocument();
+  });
+
+  it("shows a reconciler data defect as an error, not as a halt to be classified", () => {
+    // A duplicate trade date is an upstream defect. Rendering it as "classify
+    // this capital event" sends the manager looking for one that is not there.
+    renderSheet({
+      gate: { kind: "error", message: "duplicate snapshot for tradeDate 2026-08-12 in the reading window" },
+      preview: null,
+    });
+    expect(screen.getByText(/duplicate snapshot for tradeDate 2026-08-12/)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Review it" })).toBeNull();
+  });
+});
+
+describe("ReadingSheet — step one", () => {
+  it("will not let a date on or before the last posted day be picked", () => {
+    renderSheet({ preview: null });
+    expect(screen.getByLabelText("Date")).toHaveAttribute("min", "2026-08-14");
+  });
+
+  it("asks for equity and says why it is not balance", () => {
+    renderSheet({ preview: null });
+    expect(screen.getByText(/Equity, not balance/)).toBeInTheDocument();
+  });
+
+  it("shows a refusal from a previous attempt", () => {
+    renderSheet({ preview: null, error: "There is an unclassified capital event." });
+    expect(screen.getByRole("alert").textContent).toContain("unclassified capital event");
+    expect(screen.getByRole("alert").textContent).toContain("Nothing was committed");
+  });
+});
+```
+
+- [ ] **Step 10: Run the gates and prove three probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `fingerprintMismatch`, compare only `seq`. Expect the equity-moved and units-moved tests to fail. Those two exist because comparing `seq` alone is the obvious implementation and it misses the reversal case.
+2. In `reading-sheet.tsx`, render the gate's `unposted` case as `ready`. Expect three fence tests to fail. That gate is the only thing stopping a hand-posted reading walking the cursor over an unreconciled capital event.
+3. In `planFor`, change the snapshot window to `{ from: cursor.lastReadingDate + 1 day }`. `planReadings` throws its window RangeError, `planFor` returns `kind: "error"`, and the desk shows it. Confirm the message names the cursor — if instead the run silently advances, the window query is wrong in the other direction and that is the more dangerous bug.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the action seam, refreshing readings, and posting one by hand
+
+Every receipt carries a fingerprint of the pool it was worked out against, and
+every commit re-folds and refuses when it no longer matches. A hand-posted
+reading is fenced behind the reconciler: it moves the cursor, and a cursor that
+jumps unreconciled days absorbs any capital event in them into NAV.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
