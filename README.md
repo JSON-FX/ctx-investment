@@ -134,7 +134,8 @@ worktree's default, but likely a *different* worktree's stack — unless you
 export them in the shell before running the command:
 
 ```bash
-export COMPOUND_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:<your-db-port>/postgres"
+# Substitute your own worktree's db port (see supabase/config.toml there).
+export COMPOUND_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:55013/postgres"
 export COMPOUND_TEST_DATABASE_URL="$COMPOUND_DATABASE_URL"
 pnpm test:db
 ```
