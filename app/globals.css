@@ -366,6 +366,8 @@ table.cal td[aria-current="true"] { box-shadow: inset 0 0 0 2px var(--ink); }
   table.cal td { height: 62px; }
   .cal-pnl { font-size: 11px; }
   .cal-count { display: none; }
+}
+
 /* Task 12 — the performance route. Two new families, agreement A9: .curve
    for the equity and trading-P/L line charts, .hist for the P/L
    distribution. No new :root custom property (agreement A8) — every var()
