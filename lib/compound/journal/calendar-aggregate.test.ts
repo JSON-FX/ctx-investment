@@ -1,9 +1,11 @@
 import {
   aggregateCalendar,
+  dayIntensity,
   dayOfWeekUtc,
   daysFromEpoch,
   daysInMonth,
   isLeapYear,
+  latestMonth,
   monthGrid,
   monthSummary,
   parseMonth,
@@ -213,5 +215,75 @@ describe("monthGrid", () => {
     expect(flat).toContain("2026-05-09");
     const days = aggregateCalendar(fixtureHistory().deals);
     expect(flat.filter((d) => days.has(d))).toHaveLength(5);
+  });
+});
+
+describe("latestMonth", () => {
+  // Mutation caught: returning the FIRST key, which on a Map is insertion
+  // order — the order deals happened to arrive in, not chronological. The
+  // fixture's RAW_DEALS array is scrambled (see its header, property 4), so
+  // aggregateCalendar's Map insertion order is 05-06, 05-08, 05-04, 05-07 —
+  // never 05-05, which is what a first-key bug would return here.
+  it("returns the latest month that has a trade", () => {
+    expect(latestMonth(aggregateCalendar(fixtureHistory().deals), "2020-01")).toBe("2026-05");
+  });
+
+  it("falls back when nothing has traded", () => {
+    expect(latestMonth(new Map(), "2026-01")).toBe("2026-01");
+  });
+
+  // Mutation caught: comparing month keys numerically or comparing full date
+  // keys instead of the sliced YYYY-MM prefix, either of which would still
+  // pass the single-month fixture above but fail once two months are present.
+  it("picks the later of two months, not the day with the later date key", () => {
+    const days = new Map(aggregateCalendar(fixtureHistory().deals));
+    // Plant a single trade in 2025-12 — chronologically earlier, but its
+    // date-key string sorts before "2026-05-31" while its month "2025-12"
+    // must still lose to "2026-05".
+    days.set("2025-12-31", {
+      date: "2025-12-31",
+      netCents: 1n,
+      grossCents: 1n,
+      tradeCount: 1,
+      wins: 1,
+      losses: 0,
+      flat: 0,
+    });
+    expect(latestMonth(days, "2020-01")).toBe("2026-05");
+  });
+});
+
+describe("dayIntensity", () => {
+  const days = aggregateCalendar(fixtureHistory().deals);
+  const tier = dayIntensity(days, "2026-05");
+
+  // Magnitudes in the fixture month, sorted: 451, 644, 769, 1522, 2821.
+  // Upper quartile index floor(5*3/4)=3 -> 1522. Median index 2 -> 769.
+  // Mutation caught: a threshold computed with a float index or with
+  // Math.round, which picks 2821 and leaves only one strong day.
+  it("tiers days against the month's own distribution", () => {
+    expect(tier(days.get("2026-05-05")!)).toBe(2); // 2821
+    expect(tier(days.get("2026-05-06")!)).toBe(2); // 1522
+    expect(tier(days.get("2026-05-04")!)).toBe(1); // 769
+    expect(tier(days.get("2026-05-07")!)).toBe(0); // 644
+    expect(tier(days.get("2026-05-08")!)).toBe(0); // 451
+  });
+
+  // Mutation caught: comparing signed values, which would tier a large loss
+  // as ordinary because it is the smallest number.
+  it("tiers on magnitude, so a large loss is as strong as a large gain", () => {
+    expect(tier(days.get("2026-05-06")!)).toBe(2);
+    expect(days.get("2026-05-06")!.netCents).toBeLessThan(0n);
+  });
+
+  it("returns zero for a month with no trading", () => {
+    expect(dayIntensity(days, "2026-06")(days.get("2026-05-05")!)).toBe(0);
+  });
+
+  // Mutation caught: an empty magnitudes array reaching the sort/index logic
+  // instead of the early return, which would throw or read `undefined` as a
+  // threshold and make every day compare `>= undefined` (always false).
+  it("does not throw for a month with no trading", () => {
+    expect(() => dayIntensity(days, "2026-06")(days.get("2026-05-05")!)).not.toThrow();
   });
 });
