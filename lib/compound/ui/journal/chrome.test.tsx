@@ -16,7 +16,6 @@ import {
   paginate,
   parseTableState,
   splitSort,
-  toggleSort,
   type TableSpec,
 } from "@/lib/compound/journal/table-state";
 import { TRADE_SPEC } from "@/lib/compound/journal/trade-filters";
@@ -62,18 +61,25 @@ describe("SortHeader", () => {
   /**
    * The round-trip proof this task's dispatch asked for: every column each
    * REAL table spec in this codebase declares — not an invented fixture —
-   * emits, via toggleSort, a sort value that Task 8's parseTableState
-   * accepts unchanged, from any starting sort. This is the actual allowlist
-   * these pages will run against in Task 10/11, not a stand-in for it.
+   * round-trips through Task 8's parseTableState unchanged, from any
+   * starting sort. This is the actual allowlist these pages will run
+   * against in Task 10/11, not a stand-in for it.
    *
-   * Scope, stated plainly: this proves toggleSort's `${column}_asc` /
-   * `${column}_desc` shape matches what each spec's `sorts` array already
-   * lists, for every column each spec lists today. It cannot prove that a
-   * future <SortHeader column="…"> call site in Task 10/11 will name a
-   * column the same way its spec does — that binding does not exist until
-   * those pages are written. What "a click lands on the default silently"
-   * looks like when that binding is wrong is demonstrated in this task's
-   * report under the break-and-confirm-red probe.
+   * Renders <SortHeader> itself and reads the sort value out of the
+   * rendered href, rather than calling toggleSort directly. The first draft
+   * of this test called toggleSort directly and passed even with a mutant
+   * SortHeader that corrupted the href after computing it correctly — see
+   * the task report's probe section. Going through the component is what
+   * makes this a proof about SortHeader, not about toggleSort in isolation.
+   *
+   * Scope, stated plainly: this proves that for every column each spec
+   * lists today, <SortHeader column={that column}> emits an href whose sort
+   * value survives parseTableState unchanged. It cannot prove that a future
+   * Task 10/11 call site will pass the same column names its spec uses —
+   * that binding does not exist until those pages are written. What "a
+   * click lands on the default silently" looks like when that binding is
+   * wrong is demonstrated in this task's report under the break-and-
+   * confirm-red probe.
    */
   describe.each<[string, TableSpec]>([
     ["TRADE_SPEC", TRADE_SPEC],
@@ -84,7 +90,14 @@ describe("SortHeader", () => {
 
     it.each(columns)("column %s", (column) => {
       for (const startingSort of [spec.defaultSort, `${column}_asc`, `${column}_desc`]) {
-        const emitted = toggleSort(startingSort, column);
+        const { container } = render(
+          <table><thead><tr>
+            <SortHeader label={column} column={column} sort={startingSort} prefix="t" basePath={BASE} params={{}} />
+          </tr></thead></table>,
+        );
+        const href = container.querySelector("a")!.getAttribute("href")!;
+        const emitted = new URL(href, "http://x").searchParams.get("t.sort")!;
+
         expect(spec.sorts).toContain(emitted); // shape the allowlist admits
         const parsed = parseTableState({ "t.sort": emitted }, spec, "t").sort;
         expect(parsed).toBe(emitted); // survives the validator unchanged
