@@ -5,11 +5,13 @@
  * Two rules, both load-bearing:
  *
  *   1. Money is converted to integer cents IN SQL, using numeric arithmetic,
- *      and returned as int8. Verified: truncating 10000.05 dollars to cents
- *      with JavaScript's own floating-point math comes out one cent short of
- *      the correct 1000005; Postgres numeric arithmetic gets it exact (see
- *      client.db.test.ts). Nothing in db/ scales a money value in
- *      JavaScript — see purity.test.ts, which scans for exactly that.
+ *      and returned as int8. Verified: Math.trunc(10000.05 * 100) comes out
+ *      one cent short of the correct 1000005; Postgres numeric arithmetic
+ *      gets it exact (see client.db.test.ts). Nothing in db/ scales a money
+ *      value in JavaScript — see purity.test.ts, which scans for exactly
+ *      that (comments included, not just code — this sentence is itself the
+ *      regression test: it cites the literal expression and the guard still
+ *      passes).
  *
  *   2. Dates and timestamps are rendered to text IN SQL. pg parses a `date`
  *      into a JavaScript Date at LOCAL midnight, so slicing its ISO string
