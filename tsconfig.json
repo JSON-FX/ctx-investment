@@ -37,6 +37,7 @@
   },
   "include": [
     "lib/**/*.ts",
+    "lib/**/*.tsx",
     "app/**/*.ts",
     "app/**/*.tsx",
     "*.ts",
