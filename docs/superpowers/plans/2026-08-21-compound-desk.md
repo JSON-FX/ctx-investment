@@ -4092,3 +4092,660 @@ Then, one at a time, reverting each:
 1. Delete the `account.managerUserId !== managerUserId` check in `resolveOwnedAccount`. Expect the "refuses another manager's account" test to fail. If it still passes, the fixture has only one account and the test is worthless — fix the fixture, not the assertion.
 2. Change the id pattern to `/^\d+$/`. Expect the `"0"` and `"01"` cases to fail. (`"7abc"` still fails, because `Number("7abc")` is `NaN` and no account has that id — which is why the test lists several bad forms rather than one.)
 
+---
+
+### Task 6: `/` — the account list, and creating the first account
+
+The route spec §7 calls "account list, or redirect when there is one", plus the flow that makes an empty database usable.
+
+**Account creation is in scope (decision D-I) and it creates the manager's holder in the same transaction.** `fold` throws `"a fee crystallised but no manager holder was seeded"` if there is none, and plan 3's P8 adds a one-manager-per-account partial unique index. An account without its manager holder is not a partly-built account; it is a broken one.
+
+**Files:**
+- Create: `supabase/migrations/<generated>_compound_create_account.sql`
+- Create: `lib/compound/db/write-account.ts`
+- Create: `lib/compound/ui/account-list.tsx`
+- Modify: `app/page.tsx` — replaces the deployment shell
+- Create: `app/accounts/new/page.tsx`
+- Test: `lib/compound/db/write-account.db.test.ts`
+- Test: `lib/compound/ui/account-list.test.tsx`
+
+**Interfaces:**
+- Consumes: `listManagerAccounts`, `requireManager` from `@/lib/compound/load/*`; `withDb` from `@/lib/compound/db/client`; `getDailySnapshots`, `getLiveSnapshot`, `getAccountOwnerUserId` from `@/lib/compound/db/copytraderx`
+- Produces:
+  - `public.compound_create_account(...) returns jsonb`
+  - `interface CreateAccountInput { mt5Account; label; broker; currency; defaultSplitBps; inceptionDate; managerUserId; managerName; brokerOffsetHours }`
+  - `createAccount(c: Queryable, input: CreateAccountInput): Promise<{ accountId: number; managerHolderId: number }>`
+  - `AccountList` component
+
+- [ ] **Step 1: Generate the migration**
+
+```bash
+supabase migration new compound_create_account
+```
+
+```sql
+-- ============================================================================
+-- Create an account and its manager holder, together or not at all.
+-- ============================================================================
+--
+-- replay.ts resolves the fee-receiving manager with find(h => h.isManager). An
+-- account with no manager holder cannot settle a fee and fold() throws when one
+-- crystallises — at render time, on a screen, long after the account was made.
+-- Creating the two rows in one function makes that state unreachable.
+--
+-- The manager's split_bps is 0. quote() forces splitBpsApplied to 0 when
+-- isManager because the manager never charges themselves; storing 0 says the
+-- same thing in the row rather than leaving a number that is never applied.
+--
+-- SECURITY INVOKER, matching compound_commit_reading_plan. A definer function
+-- owned by postgres would carry the owner's implicit privileges and could
+-- UPDATE compound_ledger_entry, undoing the append-only guarantee.
+--
+-- Custom SQLSTATEs:
+--   CX101  that MT5 account already has a Compound account
+-- ============================================================================
+
+create or replace function public.compound_create_account(
+  p_mt5_account        bigint,
+  p_label              text,
+  p_broker             text,
+  p_currency           text,
+  p_default_split_bps  int,
+  p_inception_date     date,
+  p_manager_user_id    uuid,
+  p_manager_name       text,
+  p_broker_offset_hours int
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_account_id bigint;
+  v_holder_id  bigint;
+begin
+  if exists (select 1 from public.compound_account a where a.mt5_account = p_mt5_account) then
+    raise exception 'compound: MT5 account % already has a Compound account', p_mt5_account
+      using errcode = 'CX101';
+  end if;
+
+  insert into public.compound_account
+    (mt5_account, label, broker, currency, default_split_bps,
+     inception_date, manager_user_id, broker_offset_hours)
+  values
+    (p_mt5_account, p_label, nullif(p_broker, ''), p_currency, p_default_split_bps,
+     p_inception_date, p_manager_user_id, p_broker_offset_hours)
+  returning id into v_account_id;
+
+  insert into public.compound_holder
+    (account_id, name, user_id, is_manager, split_bps, joined_at, status)
+  values
+    (v_account_id, p_manager_name, p_manager_user_id, true, 0, p_inception_date, 'active')
+  returning id into v_holder_id;
+
+  insert into public.compound_audit (actor, action, entity, entity_id, account_id, prior_state)
+  values (p_manager_user_id, 'create_account', 'compound_account', v_account_id, v_account_id, null);
+
+  return jsonb_build_object('account_id', v_account_id, 'manager_holder_id', v_holder_id);
+end;
+$$;
+```
+
+- [ ] **Step 2: Create `lib/compound/db/write-account.ts`**
+
+```typescript
+/**
+ * The account writer. One call, one transaction, two rows.
+ */
+import type { Queryable } from "./types";
+import { toId } from "./sql";
+
+export interface CreateAccountInput {
+  mt5Account: number;
+  label: string;
+  broker: string | null;
+  currency: string;
+  defaultSplitBps: number;
+  /** YYYY-MM-DD. */
+  inceptionDate: string;
+  managerUserId: string;
+  managerName: string;
+  /** Null means not configured; reconciliation refuses while it is. */
+  brokerOffsetHours: number | null;
+}
+
+export async function createAccount(
+  c: Queryable,
+  input: CreateAccountInput,
+): Promise<{ accountId: number; managerHolderId: number }> {
+  if (!Number.isInteger(input.defaultSplitBps) ||
+      input.defaultSplitBps < 0 || input.defaultSplitBps > 10_000) {
+    throw new RangeError(`defaultSplitBps must be an integer 0..10000, got ${input.defaultSplitBps}`);
+  }
+  const { rows } = await c.query<{ result: { account_id: string; manager_holder_id: string } }>(
+    `select public.compound_create_account($1,$2,$3,$4,$5,$6::date,$7::uuid,$8,$9) as result`,
+    [
+      input.mt5Account, input.label, input.broker ?? "", input.currency,
+      input.defaultSplitBps, input.inceptionDate, input.managerUserId,
+      input.managerName, input.brokerOffsetHours,
+    ],
+  );
+  const r = rows[0]!.result;
+  return {
+    accountId: toId(r.account_id, "compound_create_account.account_id"),
+    managerHolderId: toId(r.manager_holder_id, "compound_create_account.manager_holder_id"),
+  };
+}
+```
+
+- [ ] **Step 3: Create `lib/compound/ui/account-list.tsx`**
+
+```tsx
+/**
+ * The account list. Deliberately thin: it lists accounts, it does not value
+ * them. Valuing every account on this page means replaying every ledger in the
+ * database to render a screen the manager passes through in half a second.
+ *
+ * The MT5 account number is MASKED to its last four digits. The repository is
+ * public and screenshots of this page will end up in issues; the full number is
+ * on the desk, one click away, where the context is already private.
+ */
+import type { ResolvedAccount } from "@/lib/compound/load/account";
+import { formatDate, formatSplit } from "@/lib/compound/present/format";
+import { Chip, EmptyState, Panel } from "./primitives";
+import { deskHref } from "./routes";
+
+export function maskMt5(account: number): string {
+  const s = String(account);
+  return s.length <= 4 ? s : `••••${s.slice(-4)}`;
+}
+
+export function AccountList({ accounts }: { accounts: ResolvedAccount[] }) {
+  if (accounts.length === 0) {
+    return (
+      <Panel>
+        <EmptyState title="No accounts yet">
+          Compound reads an MT5 account that CopyTraderX is already pushing.
+          Add one to start.
+        </EmptyState>
+        <p style={{ textAlign: "center", margin: 0 }}>
+          <a className="btn btn-primary" href="/accounts/new">Add an account</a>
+        </p>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel flush>
+      <div className="scroller">
+        <table>
+          <caption className="eyebrow">Accounts</caption>
+          <thead>
+            <tr>
+              <th scope="col">Account</th>
+              <th scope="col">MT5</th>
+              <th scope="col">Broker</th>
+              <th scope="col">Currency</th>
+              <th scope="col">Default split</th>
+              <th scope="col">Inception</th>
+              <th scope="col">Reconciliation</th>
+            </tr>
+          </thead>
+          <tbody>
+            {accounts.map((a) => (
+              <tr key={a.id}>
+                <th scope="row" style={{ fontWeight: 400 }}>
+                  <a href={deskHref(a.id)}>{a.label}</a>
+                </th>
+                <td className="num">{maskMt5(a.mt5Account)}</td>
+                <td>{a.broker ?? "—"}</td>
+                <td className="num">{a.currency}</td>
+                <td className="num">{formatSplit(a.defaultSplitBps)}</td>
+                <td className="num">{formatDate(a.inceptionDate)}</td>
+                <td>
+                  {a.brokerOffsetHours === null
+                    ? <Chip tone="fee">Broker offset not set</Chip>
+                    : <span className="num">UTC{a.brokerOffsetHours >= 0 ? "+" : ""}{a.brokerOffsetHours}</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+```
+
+- [ ] **Step 4: Replace `app/page.tsx`**
+
+The deployment shell goes here. Everything it demonstrated — the engine computes, the container runs — is now demonstrated by the desk itself, against real data.
+
+```tsx
+/**
+ * Spec section 7: "account list, or redirect when there is only one".
+ *
+ * The redirect is unconditional on a single account, including for a manager
+ * who has just created it. Under D1 there is one operator with one account,
+ * and a list of one is a click they should not have to make.
+ */
+import { redirect } from "next/navigation";
+import { listManagerAccounts } from "@/lib/compound/load/account";
+import { AccountList } from "@/lib/compound/ui/account-list";
+import { deskHref } from "@/lib/compound/ui/routes";
+
+export const dynamic = "force-dynamic";
+
+export default async function Page() {
+  const accounts = await listManagerAccounts();
+  if (accounts.length === 1) redirect(deskHref(accounts[0]!.id));
+
+  return (
+    <div className="wrap">
+      <header className="mast">
+        <div>
+          <span className="mark">Compound</span>
+          <span className="sub">Investor Desk</span>
+        </div>
+        {accounts.length > 0 ? (
+          <a className="btn" href="/accounts/new">Add an account</a>
+        ) : null}
+      </header>
+      <AccountList accounts={accounts} />
+    </div>
+  );
+}
+```
+
+- [ ] **Step 5: Create `app/accounts/new/page.tsx`**
+
+Two steps, per D-C: enter, then confirm against what CopyTraderX actually has for that MT5 account.
+
+```tsx
+/**
+ * Creating an account. Two steps, like every other flow in this product.
+ *
+ * Step two does one thing beyond echoing the form back: it says what
+ * CopyTraderX has for that MT5 account. A typo in an eight-digit account number
+ * produces an account that reads a table with nothing in it, and the desk then
+ * shows a correct-looking empty statement forever. Naming the snapshot count
+ * before commit turns a silent typo into a visible one.
+ *
+ * It is a WARNING and not a refusal. A brand-new account may legitimately have
+ * pushed nothing yet.
+ */
+import { redirect } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { getAccountOwnerUserId, getDailySnapshots, getLiveSnapshot } from "@/lib/compound/db/copytraderx";
+import { createAccount } from "@/lib/compound/db/write-account";
+import { requireManager } from "@/lib/compound/load/session";
+import { formatMoney, formatSplit, formatUtcStamp } from "@/lib/compound/present/format";
+import { Notice } from "@/lib/compound/ui/banner";
+import { Receipt, ReceiptLine } from "@/lib/compound/ui/receipt";
+import { Field, FieldError, Sheet, SheetActions } from "@/lib/compound/ui/sheet";
+import { deskHref } from "@/lib/compound/ui/routes";
+import { maskMt5 } from "@/lib/compound/ui/account-list";
+
+export const dynamic = "force-dynamic";
+
+interface Params {
+  step?: string; mt5?: string; label?: string; broker?: string; currency?: string;
+  split?: string; inception?: string; managerName?: string; offset?: string; error?: string;
+}
+
+async function commit(formData: FormData) {
+  "use server";
+  const user = await requireManager();
+  const offsetRaw = String(formData.get("offset") ?? "").trim();
+  try {
+    const { accountId } = await withDb((c) =>
+      createAccount(c, {
+        mt5Account: Number(formData.get("mt5")),
+        label: String(formData.get("label")),
+        broker: String(formData.get("broker") ?? "") || null,
+        currency: String(formData.get("currency") ?? "USD"),
+        defaultSplitBps: Math.round(Number(formData.get("split")) * 100),
+        inceptionDate: String(formData.get("inception")),
+        managerUserId: user.id,
+        managerName: String(formData.get("managerName")),
+        brokerOffsetHours: offsetRaw === "" ? null : Number(offsetRaw),
+      }),
+    );
+    redirect(deskHref(accountId));
+  } catch (e) {
+    if (e instanceof Error && "digest" in e) throw e;   // a redirect, not a failure
+    const code = (e as { code?: string }).code;
+    const message =
+      code === "CX101"
+        ? "That MT5 account already has a Compound account."
+        : (e as Error).message;
+    redirect(`/accounts/new?error=${encodeURIComponent(message)}`);
+  }
+}
+
+export default async function NewAccountPage({
+  searchParams,
+}: { searchParams: Promise<Params> }) {
+  const p = await searchParams;
+
+  if (p.step !== "confirm") {
+    return (
+      <Sheet title="Add an account" backHref="/" lede="Compound reads an MT5 account CopyTraderX is already pushing. It never writes to it and never places a trade.">
+        {p.error ? <FieldError>{p.error}</FieldError> : null}
+        <form method="get">
+          <input type="hidden" name="step" value="confirm" />
+          <Field name="label" label="Account name">
+            <input id="label" name="label" required defaultValue={p.label} />
+          </Field>
+          <Field name="mt5" label="MT5 account number">
+            <input id="mt5" name="mt5" inputMode="numeric" pattern="[0-9]+" required defaultValue={p.mt5} />
+          </Field>
+          <Field name="managerName" label="Your name, as it appears on statements">
+            <input id="managerName" name="managerName" required defaultValue={p.managerName} />
+          </Field>
+          <Field name="broker" label="Broker" hint="Optional.">
+            <input id="broker" name="broker" defaultValue={p.broker} />
+          </Field>
+          <Field name="currency" label="Currency">
+            <input id="currency" name="currency" defaultValue={p.currency ?? "USD"} required />
+          </Field>
+          <Field name="split" label="Default manager split, percent" hint="60 / 40 is written as 40 here. Each investor can override it.">
+            <input id="split" name="split" inputMode="decimal" defaultValue={p.split ?? "40"} required />
+          </Field>
+          <Field name="inception" label="Inception date">
+            <input id="inception" name="inception" type="date" required defaultValue={p.inception} />
+          </Field>
+          <Field
+            name="offset"
+            label="Broker server UTC offset, hours"
+            hint="Leave blank if you do not know it. Reconciliation stays switched off until it is set, because the duplicate-deal guard needs it and running it at a zero offset does nothing."
+          >
+            <input id="offset" name="offset" inputMode="numeric" defaultValue={p.offset} />
+          </Field>
+          <SheetActions>
+            <button className="btn btn-primary" type="submit">Review</button>
+          </SheetActions>
+        </form>
+      </Sheet>
+    );
+  }
+
+  const mt5 = Number(p.mt5);
+  const [snapshots, live, ownerUserId] = await withDb(async (c) => [
+    await getDailySnapshots(c, mt5),
+    await getLiveSnapshot(c, mt5),
+    await getAccountOwnerUserId(c, mt5),
+  ] as const);
+
+  return (
+    <Sheet title="Add an account" backHref="/accounts/new" backLabel="Back">
+      {snapshots.length === 0 ? (
+        <Notice>
+          <strong>CopyTraderX has no daily snapshots for {maskMt5(mt5)}.</strong> Check the
+          account number. If it is right, the EA has not pushed yet and the desk will be
+          empty until it does.
+        </Notice>
+      ) : null}
+      {ownerUserId === null ? (
+        <Notice>
+          <strong>No licence is registered against {maskMt5(mt5)}.</strong> That is not a
+          blocker, but it usually means the account number is wrong.
+        </Notice>
+      ) : null}
+
+      <Receipt label="Account to be created">
+        <ReceiptLine label="Account name">{p.label}</ReceiptLine>
+        <ReceiptLine label="MT5 account">
+          <span className="num">{maskMt5(mt5)}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Broker">{p.broker || "—"}</ReceiptLine>
+        <ReceiptLine label="Currency"><span className="num">{p.currency}</span></ReceiptLine>
+        <ReceiptLine
+          label="Default split"
+          hint="Investor keeps the first figure; you keep the second."
+        >
+          <span className="num">{formatSplit(Math.round(Number(p.split) * 100))}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Inception"><span className="num">{p.inception}</span></ReceiptLine>
+        <ReceiptLine
+          label="Broker UTC offset"
+          hint={p.offset ? undefined : "Not set — reconciliation stays off."}
+        >
+          <span className="num">{p.offset ? `UTC${Number(p.offset) >= 0 ? "+" : ""}${p.offset}` : "—"}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Daily snapshots CopyTraderX has">
+          <span className="num">{snapshots.length}</span>
+        </ReceiptLine>
+        {live === null ? null : (
+          <ReceiptLine label="Live equity" hint={`pushed ${formatUtcStamp(live.pushedAt)}`}>
+            <span className="num">{formatMoney(live.equityCents, { currency: p.currency })}</span>
+          </ReceiptLine>
+        )}
+        <ReceiptLine label="Manager holder" hint="Created with the account. You cannot have an account without one.">
+          {p.managerName}
+        </ReceiptLine>
+      </Receipt>
+
+      <form action={commit}>
+        {(["mt5", "label", "broker", "currency", "split", "inception", "managerName", "offset"] as const)
+          .map((k) => <input key={k} type="hidden" name={k} value={p[k] ?? ""} />)}
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Create account</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 6: Write `lib/compound/db/write-account.db.test.ts`**
+
+```typescript
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { getAccountById } from "@/lib/compound/db/compound";
+import { listHolders } from "@/lib/compound/db/holders";
+import { createAccount } from "@/lib/compound/db/write-account";
+import { MANAGER_USER_ID, OTHER_MANAGER_USER_ID } from "@/lib/compound/db/test-harness";
+
+function input(over: Partial<Parameters<typeof createAccount>[1]> = {}) {
+  return {
+    mt5Account: 90_000_777,
+    label: "Test account",
+    broker: "Fictional Markets",
+    currency: "USD",
+    defaultSplitBps: 4000,
+    inceptionDate: "2026-03-02",
+    managerUserId: MANAGER_USER_ID,
+    managerName: "J. Marsh",
+    brokerOffsetHours: 3,
+    ...over,
+  };
+}
+const rollback = (e: Error) => { if (e.message !== "rollback") throw e; };
+
+describe("createAccount", () => {
+  it("creates the account and its manager holder together", async () => {
+    await withDbTransaction(async (c) => {
+      const { accountId, managerHolderId } = await createAccount(c, input());
+      const account = await getAccountById(c, accountId);
+      expect(account!.mt5Account).toBe(90_000_777);
+      expect(account!.brokerOffsetHours).toBe(3);
+
+      const holders = await listHolders(c, accountId);
+      expect(holders).toHaveLength(1);
+      expect(holders[0]!.id).toBe(managerHolderId);
+      expect(holders[0]!.isManager).toBe(true);
+      expect(holders[0]!.splitBps).toBe(0);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("stores a null offset when none is given, rather than zero", async () => {
+    await withDbTransaction(async (c) => {
+      const { accountId } = await createAccount(c, input({ brokerOffsetHours: null }));
+      expect((await getAccountById(c, accountId))!.brokerOffsetHours).toBeNull();
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a second account on the same MT5 number, with CX101", async () => {
+    await withDbTransaction(async (c) => {
+      await createAccount(c, input());
+      await expect(createAccount(c, input({ managerUserId: OTHER_MANAGER_USER_ID })))
+        .rejects.toThrow(/already has a Compound account/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("leaves no orphan account behind when the holder insert fails", async () => {
+    await withDbTransaction(async (c) => {
+      // A name past the column's limit fails the SECOND insert. If the function
+      // were two client calls the account row would survive; as one function
+      // body it does not. Counting before and after is what proves it.
+      const before = await c.query<{ n: string }>(
+        `select count(*) as n from public.compound_account where mt5_account = $1`,
+        [90_000_778],
+      );
+      await expect(
+        createAccount(c, input({ mt5Account: 90_000_778, managerName: "x".repeat(100_000) })),
+      ).rejects.toThrow();
+      const after = await c.query<{ n: string }>(
+        `select count(*) as n from public.compound_account where mt5_account = $1`,
+        [90_000_778],
+      );
+      expect(after.rows[0]!.n).toBe(before.rows[0]!.n);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a split outside 0..10000 before it reaches SQL", async () => {
+    await withDbTransaction(async (c) => {
+      await expect(createAccount(c, input({ defaultSplitBps: 10_001 })))
+        .rejects.toThrow(/defaultSplitBps must be an integer/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("writes an audit row naming the actor", async () => {
+    await withDbTransaction(async (c) => {
+      const { accountId } = await createAccount(c, input());
+      const { rows } = await c.query<{ actor: string; action: string; entity_id: string }>(
+        `select actor, action, entity_id from public.compound_audit
+          where entity = 'compound_account' and entity_id = $1`,
+        [accountId],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.actor).toBe(MANAGER_USER_ID);
+      expect(rows[0]!.action).toBe("create_account");
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+```
+
+> **The orphan test depends on `compound_holder.name` having a length limit.** If plan 3 typed it as bare `text`, a 100,000-character name inserts fine and the test passes for the wrong reason. Check the DDL first. If there is no limit, force the second insert to fail another way — a `null` manager name against the `not null` — and say in a comment which constraint the test is leaning on. **Do not leave an atomicity test whose failure fires before the first insert.** That is plan 3's own warning, and it applies here.
+
+- [ ] **Step 7: Write `lib/compound/ui/account-list.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { ResolvedAccount } from "@/lib/compound/load/account";
+import { AccountList, maskMt5 } from "./account-list";
+
+const ACCOUNTS: ResolvedAccount[] = [
+  {
+    id: 7, mt5Account: 90_000_001, label: "Pooled — live", broker: "Fictional Markets",
+    currency: "USD", defaultSplitBps: 4000, inceptionDate: "2026-03-02",
+    managerUserId: "00000000-0000-0000-0000-000000000001", brokerOffsetHours: 3,
+  },
+  {
+    id: 8, mt5Account: 90_000_002, label: "Pooled — second", broker: null,
+    currency: "EUR", defaultSplitBps: 3700, inceptionDate: "2026-06-01",
+    managerUserId: "00000000-0000-0000-0000-000000000001", brokerOffsetHours: null,
+  },
+];
+
+describe("maskMt5", () => {
+  it("shows only the last four digits", () => {
+    expect(maskMt5(90_000_001)).toBe("••••0001");
+  });
+
+  it("leaves a short number alone rather than masking it to nothing", () => {
+    expect(maskMt5(42)).toBe("42");
+  });
+});
+
+describe("AccountList", () => {
+  beforeEach(() => render(<AccountList accounts={ACCOUNTS} />));
+
+  it("links each account to its desk", () => {
+    expect(screen.getByRole("link", { name: "Pooled — live" })).toHaveAttribute("href", "/a/7");
+    expect(screen.getByRole("link", { name: "Pooled — second" })).toHaveAttribute("href", "/a/8");
+  });
+
+  it("never renders a full MT5 account number", () => {
+    expect(screen.queryByText(/90000001/)).toBeNull();
+    expect(screen.getByText("••••0001")).toBeInTheDocument();
+  });
+
+  it("shows each account's own default split", () => {
+    const row = screen.getByRole("row", { name: /Pooled — second/ });
+    expect(within(row).getByText("63 / 37")).toBeInTheDocument();
+  });
+
+  it("flags an account whose broker offset is not configured", () => {
+    expect(within(screen.getByRole("row", { name: /Pooled — second/ }))
+      .getByText("Broker offset not set")).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /Pooled — live/ }))
+      .queryByText("Broker offset not set")).toBeNull();
+  });
+
+  it("shows a configured offset with its sign", () => {
+    expect(within(screen.getByRole("row", { name: /Pooled — live/ }))
+      .getByText("UTC+3")).toBeInTheDocument();
+  });
+
+  it("renders a dash where a broker is unknown, not the word null", () => {
+    const row = screen.getByRole("row", { name: /Pooled — second/ });
+    expect(within(row).getByText("—")).toBeInTheDocument();
+    expect(row.textContent).not.toContain("null");
+  });
+});
+
+describe("AccountList — empty", () => {
+  it("offers the way out instead of an empty table", () => {
+    render(<AccountList accounts={[]} />);
+    expect(screen.getByText("No accounts yet")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Add an account" }))
+      .toHaveAttribute("href", "/accounts/new");
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 8: Run the gates and prove two probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `compound_create_account`, delete the `compound_holder` insert. Expect the first `write-account.db.test.ts` case to fail on `toHaveLength(1)`. This is the only test that stops an account being created without the holder `fold` needs.
+2. In `maskMt5`, return `String(account)`. Expect "never renders a full MT5 account number" to fail. That assertion exists because the repository is public and this page appears in screenshots.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): account list, account creation, and the manager holder that comes with it
+
+Replaces the deployment shell at app/page.tsx. compound_create_account writes
+the account and its manager holder in one function body, because replay.ts
+cannot settle a fee without one and an account missing it fails at render time.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
