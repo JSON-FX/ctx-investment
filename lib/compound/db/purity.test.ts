@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { stripComments } from "@/lib/compound/testing/strip-comments";
 
 const DB_DIR = join(__dirname);
 
@@ -52,9 +53,16 @@ describe("db purity", () => {
     expect(files.length).toBeGreaterThanOrEqual(9);
   });
 
+  // Comments are stripped before matching (see strip-comments.ts): a doc
+  // comment quoting the very expression this guard forbids — sql.ts cites
+  // Math.trunc(10000.05 * 100) as the reason the rule exists — must not trip
+  // the rule it is explaining. stripComments is shared with journal/ and
+  // present/'s purity guards rather than reimplemented here; its own test
+  // suite (lib/compound/testing/strip-comments.test.ts) covers the string,
+  // regex, and template-literal edge cases this file used to test locally.
   it("never scales money in JavaScript, and never imports the UI stack", () => {
     for (const file of files) {
-      const src = readFileSync(file, "utf8");
+      const src = stripComments(readFileSync(file, "utf8"));
       for (const [label, pattern] of FORBIDDEN) {
         expect({ file, label, matched: pattern.test(src) }).toEqual({
           file,
