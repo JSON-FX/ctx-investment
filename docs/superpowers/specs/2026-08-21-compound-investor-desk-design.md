@@ -50,7 +50,7 @@ choice, because the rationale is what to re-examine if circumstances change.
 | D1 | Single-tenant, one manager | "confirm: multi-tenant SaaS" (§1) | Halves the build. Validate the accounting model on a real quarter before building tenancy. |
 | D2 | Same Supabase project, `compound_`-prefixed tables | — | No sync layer means no staleness. The MT5 data is already there. |
 | D3 | Automated equity readings with a capital-event review queue | manual entry, Phase 1 (§10) | The data already arrives. Deposits are *detectable*, so the PRD's most expensive bug can be prevented structurally rather than warned about. |
-| D4 | Existing Supabase Auth, add an `investor` role | — | One user directory. Manager signs in with an existing account. |
+| D4 | Existing Supabase Auth. Investor access is **data, not a role** | — | One user directory. `public.users.role` is `check (role in ('admin','user'))` — adding a third value means altering a constraint on a production table the EA depends on. Linkage via `compound_holder.user_id` avoids that entirely. |
 | D5 | Multi-account from day one | A4 is P2 (§6.1) | An `account_id` foreign key is cheap now and painful to retrofit. Starts with the manager's live account as the only one. |
 | D6 | Copy `lib/journal/`, rebuild the components | — | The pure functions are stable and tested. The components are exactly what should look different. |
 | D7 | **Event-sourced accounting** | materialised `holder.units` + `cost_basis` (§8) | See below. |
@@ -535,23 +535,42 @@ shift width between renders.
 
 Reuses the existing Supabase Auth directory.
 
-The existing directory has two roles, `admin` and `user`. Compound adds one.
+The existing directory has exactly two roles, and Compound adds none.
 
-| Role | Sees |
-|---|---|
-| `admin` | everything, all accounts. **The manager is an admin** — single-tenant, single operator (D1) |
-| `user` | unchanged; no Compound access |
-| `investor` | own holder record only — **new, and unused until v2** |
+| Principal | Sees | How it is established |
+|---|---|---|
+| `admin` | everything, all accounts. **The manager is an admin** — single-tenant, single operator (D1) | existing `role` claim |
+| `user` | unchanged; no Compound access | existing `role` claim |
+| An investor | their own holder record only — **v2, not built yet** | `compound_holder.user_id = auth.uid()`, not a role |
 
-Manager identity is modelled as data, not as a role:
-`compound_account.manager_user_id`. That keeps D5's multi-account path open
-without a role per manager, and means D1 can be relaxed later without a role
-migration.
+**Why no `investor` role.** `public.users.role` carries
+`check (role in ('admin', 'user'))`, and no migration has ever widened it.
+Introducing a third value would mean altering a CHECK constraint on a table the
+EA and the licence system depend on — exactly the class of change §10 forbids.
+It is also unnecessary. Identity here is already modelled as data rather than as
+a claim: `compound_account.manager_user_id` says who manages an account, and
+`compound_holder.user_id` says who a holder is. An RLS policy can ask "is this
+holder linked to the requesting user" without any new role existing.
 
-RLS on every `compound_*` table from day one, keyed on
-`compound_account.manager_user_id`. `compound_ledger_entry` grants INSERT and
-SELECT only; no UPDATE or DELETE to any role, which is what makes invariant 5
-structural rather than a convention.
+This corrects an earlier draft of D4, which said Compound would add an
+`investor` role. That was written without checking the constraint.
+
+RLS on every `compound_*` table from day one, using the project's established
+idiom rather than a new one:
+
+```sql
+-- admin check, as used by every existing policy
+using ((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin')
+-- owner check
+using (user_id = auth.uid())
+```
+
+Note that `raw_app_meta_data ->> 'role'` works in direct SQL but **not** inside a
+policy evaluating a request — there the JWT must be read, as above.
+
+`compound_ledger_entry` grants `INSERT` and `SELECT` only; no `UPDATE`, no
+`DELETE`, to any role. That is what makes invariant 5 structural rather than a
+convention.
 
 Compound stores no trading credentials. It reads MT5 data that the EA already
 pushed and can place no trades.
