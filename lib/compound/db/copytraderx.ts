@@ -18,6 +18,7 @@
  * absence.
  */
 import type { Cents } from "@/lib/compound/engine/money";
+import type { OpenPosition, OrderRow } from "@/lib/compound/journal/rows";
 import type { ClosedDeal, DailySnapshot } from "@/lib/compound/reconcile/types";
 import type { Queryable } from "./types";
 import {
@@ -30,6 +31,10 @@ import {
   toSide,
   utcIsoExpr,
 } from "./sql";
+
+// Re-exported so a caller can import either shape from the reader it uses,
+// without a second import from journal/rows.
+export type { OpenPosition, OrderRow };
 
 export interface DateRange {
   /** YYYY-MM-DD, inclusive. */
@@ -120,6 +125,119 @@ export async function getClosedDeals(
     profitCents: toCents(r.profit_cents, "deals.profit"),
     swapCents: toCents(r.swap_cents, "deals.swap"),
     commissionCents: toCents(r.commission_cents, "deals.commission"),
+  }));
+}
+
+export async function getOpenPositions(
+  c: Queryable,
+  mt5Account: number,
+): Promise<OpenPosition[]> {
+  const { rows } = await c.query<{
+    ticket: string;
+    symbol: string;
+    side: string;
+    volume_milli_lots: number;
+    open_price: string;
+    current_price: string;
+    sl: string | null;
+    tp: string | null;
+    profit_cents: string;
+    swap_cents: string;
+    commission_cents: string;
+    open_time: string;
+    comment: string | null;
+  }>(
+    `select ticket,
+            symbol,
+            side,
+            ${milliLotsExpr("volume")} as volume_milli_lots,
+            open_price::text  as open_price,
+            current_price::text as current_price,
+            sl::text as sl,
+            tp::text as tp,
+            ${centsExpr("profit")} as profit_cents,
+            ${centsExpr("swap")} as swap_cents,
+            ${centsExpr("commission")} as commission_cents,
+            ${utcIsoExpr("open_time")} as open_time,
+            comment
+       from public.positions
+      where mt5_account = $1
+      order by open_time asc, ticket asc`,
+    [mt5Account],
+  );
+
+  return rows.map((r) => ({
+    ticket: toId(r.ticket, "positions.ticket"),
+    symbol: r.symbol,
+    side: toSide(r.side, "positions.side"),
+    volumeMilliLots: r.volume_milli_lots,
+    openPrice: r.open_price,
+    currentPrice: r.current_price,
+    slPrice: r.sl,
+    tpPrice: r.tp,
+    profitCents: toCents(r.profit_cents, "positions.profit"),
+    swapCents: toCents(r.swap_cents, "positions.swap"),
+    commissionCents: toCents(r.commission_cents, "positions.commission"),
+    openTime: r.open_time,
+    comment: r.comment,
+  }));
+}
+
+export async function getOrders(
+  c: Queryable,
+  mt5Account: number,
+  range: DateRange = {},
+): Promise<OrderRow[]> {
+  const { rows } = await c.query<{
+    ticket: string;
+    symbol: string;
+    type: string;
+    state: string;
+    volume_initial_milli_lots: number;
+    volume_current_milli_lots: number;
+    price_open: string | null;
+    price_current: string | null;
+    sl: string | null;
+    tp: string | null;
+    time_setup: string;
+    time_done: string | null;
+    comment: string | null;
+  }>(
+    `select ticket,
+            symbol,
+            type,
+            state,
+            ${milliLotsExpr("volume_initial")} as volume_initial_milli_lots,
+            ${milliLotsExpr("volume_current")} as volume_current_milli_lots,
+            price_open::text    as price_open,
+            price_current::text as price_current,
+            sl::text as sl,
+            tp::text as tp,
+            ${utcIsoExpr("time_setup")} as time_setup,
+            ${utcIsoExpr("time_done")} as time_done,
+            comment
+       from public.orders
+      where mt5_account = $1
+        and ($2::date is null or (time_setup at time zone 'UTC')::date >= $2::date)
+        and ($3::date is null or (time_setup at time zone 'UTC')::date <= $3::date)
+      order by time_setup desc, ticket desc`,
+    [mt5Account, range.from ?? null, range.to ?? null],
+  );
+
+  return rows.map((r) => ({
+    ticket: toId(r.ticket, "orders.ticket"),
+    symbol: r.symbol,
+    type: r.type,
+    state: r.state,
+    volumeInitialMilliLots: r.volume_initial_milli_lots,
+    volumeCurrentMilliLots: r.volume_current_milli_lots,
+    priceOpen: r.price_open,
+    priceCurrent: r.price_current,
+    slPrice: r.sl,
+    tpPrice: r.tp,
+    timeSetup: r.time_setup,
+    timeDone: r.time_done,
+    comment: r.comment,
   }));
 }
 
