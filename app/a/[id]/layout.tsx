@@ -15,14 +15,35 @@
  * telling the truth in one place and implying its opposite in another.
  */
 import type { ReactNode } from "react";
+import { redirect } from "next/navigation";
 import { listManagerAccounts, requireAccount } from "@/lib/compound/load/account";
 import { loadInterlock } from "@/lib/compound/load/interlock";
+import { SIGN_IN_PATH } from "@/lib/compound/load/session";
+import { authClient } from "@/lib/compound/load/supabase";
 import { InterlockBanner } from "@/lib/compound/ui/banner";
 import { Masthead } from "@/lib/compound/ui/masthead";
 import { reviewHref } from "@/lib/compound/ui/routes";
 import { SubNav } from "./subnav";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * Clears the session, then lands on sign-in. Matches sign-in/page.tsx's own
+ * signIn action: an inline "use server" function on the page/layout that
+ * needs it, rather than a shared action file — this is the only place in
+ * the product that signs anyone out.
+ *
+ * SIGN_IN_PATH (session.ts), not a literal "/sign-in" here: the same
+ * constant requireManager redirects an unauthenticated request to, so this
+ * action and the gate the next request hits are provably pointed at the
+ * same place rather than two strings that happen to agree today.
+ */
+async function signOut() {
+  "use server";
+  const supabase = await authClient();
+  await supabase.auth.signOut();
+  redirect(SIGN_IN_PATH);
+}
 
 export default async function AccountLayout({
   children, params,
@@ -36,7 +57,7 @@ export default async function AccountLayout({
 
   return (
     <div className="wrap">
-      <Masthead current={account} accounts={accounts} />
+      <Masthead current={account} accounts={accounts} signOutAction={signOut} />
       <SubNav accountId={account.id} pendingCount={interlock.pendingCount} />
       {interlock.pendingCandidateDate === null ? null : (
         <InterlockBanner
