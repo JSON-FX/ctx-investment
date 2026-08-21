@@ -1,11 +1,32 @@
-/* Design tokens from the spec, §8. Statement direction: paper ground, green
-   ownership ramp, amber reserved for the fee. */
+/* Design tokens, spec section 8.1. Statement direction: paper ground, green
+   ownership ramp, amber reserved for the fee.
+
+   Two tokens deviate from the literal spec text, both enforced by
+   lib/compound/ui/tokens.test.ts, which reads this file rather than a copy
+   of these numbers — see that file's header comment for the full account:
+
+     - --ink-3 ships at #5f6b7c (5.41:1 on --card), not the spec's #8a96a6
+       (3.00:1 on --card, below section 8.4's 4.5:1 text floor). --ink-3 is
+       now a real third text tier, usable on --card backgrounds. It stays
+       below 4.5:1 on --paper (4.49:1), so it is --card-only until that
+       changes — nothing in this file puts --ink-3 text on --paper.
+     - --rule stays at the spec's #d2d8e0. It is a distinct, pre-existing,
+       heavily used token (every border below), not a free name for
+       --ink-3's old value. It is currently below the 3:1 non-text floor
+       (WCAG 1.4.11) on both grounds — tracked by the tests, not silently
+       accepted, but not changed by this task. See the Task 1 report.
+
+   Two rules this file obeys, both enforced the same way:
+     - `color: var(--fee)` never appears. Amber is 2.15:1 on white. Fee TEXT is
+       --fee-ink at 5.02:1. Amber fills, chips and marks; it never sets type.
+     - `color: var(--rule)` and `color: var(--rule-soft)` never appear. They
+       are non-text-only: rules, dividers, borders. */
 :root {
   --paper: #e7eaef;
   --card: #ffffff;
   --ink: #0f1b2d;
   --ink-2: #4a5768;
-  --ink-3: #8a96a6;
+  --ink-3: #5f6b7c;
   --rule: #d2d8e0;
   --rule-soft: #e6eaef;
 
@@ -35,38 +56,83 @@ body {
   -webkit-font-smoothing: antialiased;
   padding: 0 0 64px;
 }
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Every figure in the product. Section 8.3. */
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .pos { color: var(--gain); }
 .neg { color: var(--loss); }
 .fee { color: var(--fee-ink); }
+.muted { color: var(--ink-2); }
 
-.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+.hairline { border: 0; border-top: 1px solid var(--rule); margin: 16px 0; }
 
+/* Masthead, switcher, sub-nav */
 .mast {
   display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; padding: 22px 0 18px; flex-wrap: wrap;
+  gap: 16px; padding: 22px 0 14px; flex-wrap: wrap;
 }
 .mark { font-family: var(--serif); font-size: 27px; line-height: 1; }
 .sub {
   font-size: 10px; text-transform: uppercase; letter-spacing: .18em;
-  color: var(--ink-3); border-left: 1px solid var(--rule);
+  color: var(--ink-2); border-left: 1px solid var(--rule);
   padding-left: 10px; margin-left: 10px;
 }
-.acct {
-  font-family: var(--mono); font-size: 11.5px; color: var(--ink-2);
-  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
-  padding: 6px 11px; display: flex; align-items: center; gap: 8px;
+.switcher { position: relative; font-family: var(--mono); font-size: 12px; }
+.switcher > summary {
+  list-style: none; cursor: pointer; background: var(--card);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 7px 12px;
+  color: var(--ink); display: flex; align-items: center; gap: 8px;
 }
-.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gain); }
+.switcher > summary::-webkit-details-marker { display: none; }
+.switcher > div {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+  min-width: 260px; background: var(--card); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 4px;
+}
+.switcher a {
+  display: block; padding: 8px 10px; color: var(--ink);
+  text-decoration: none; border-radius: 2px;
+}
+.switcher a:hover, .switcher a[aria-current="true"] { background: var(--paper); }
 
+.subnav {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--rule);
+  margin-bottom: 14px; overflow-x: auto;
+}
+.subnav a {
+  padding: 9px 14px; font-size: 12.5px; color: var(--ink-2);
+  text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap;
+}
+.subnav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
+
+/* Panels */
 .panel {
   background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
   padding: 20px; margin-bottom: 12px;
 }
+.panel.flush { padding: 0; overflow: hidden; }
 .eyebrow {
   font-size: 10px; text-transform: uppercase; letter-spacing: .16em;
-  color: var(--ink-3); font-weight: 600;
+  color: var(--ink-2); font-weight: 600;
 }
+
+/* Statement head */
 .erow {
   display: flex; align-items: flex-end; justify-content: space-between;
   gap: 24px; flex-wrap: wrap; margin-top: 8px;
@@ -75,28 +141,47 @@ body {
   font-family: var(--mono); font-weight: 500;
   font-size: clamp(32px, 6vw, 48px); letter-spacing: -.035em; line-height: 1;
 }
-.equity .cents { color: var(--ink-3); }
-.navbox { display: flex; gap: 24px; flex-wrap: wrap; padding-bottom: 5px; }
-.navbox .k {
-  display: block; font-size: 9.5px; text-transform: uppercase;
-  letter-spacing: .14em; color: var(--ink-3); font-weight: 600; margin-bottom: 3px;
-}
-.navbox .v { display: block; font-family: var(--mono); font-size: 16px; }
+.equity .cents { color: var(--ink-2); }
 
+/* KPI strip */
+.kpi {
+  display: grid; gap: 1px; background: var(--rule-soft);
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  border: 1px solid var(--rule); border-radius: 3px; overflow: hidden;
+  margin-bottom: 12px;
+}
+.kpi-item { background: var(--card); padding: 14px 16px; }
+.kpi-item .k {
+  display: block; font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: .14em; color: var(--ink-2); font-weight: 600; margin-bottom: 4px;
+}
+.kpi-item .v { display: block; font-family: var(--mono); font-size: 18px; }
+.kpi-item.is-fee { background: var(--fee-bg); }
+.kpi-item.is-fee .v { color: var(--fee-ink); }
+
+/* Ownership rail. Green means the pool, divided. Never gain, never "yours". */
 .rail {
   display: flex; height: 32px; border: 1px solid var(--ink);
   border-radius: 2px; overflow: hidden; margin-top: 18px;
 }
 .seg { border-right: 1px solid var(--ink); }
 .seg:last-child { border-right: none; }
+.seg.hatched {
+  background-image: repeating-linear-gradient(
+    45deg, rgba(15, 27, 45, .22) 0 3px, transparent 3px 7px
+  );
+}
 .leg { display: flex; gap: 18px; margin-top: 9px; font-size: 11.5px; color: var(--ink-2); flex-wrap: wrap; }
 .leg i { width: 9px; height: 9px; border: 1px solid var(--ink); display: inline-block; margin-right: 7px; }
 .leg b { font-family: var(--mono); font-weight: 500; color: var(--ink); }
 
+/* Tables */
+.scroller { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; background: var(--card); }
+caption { text-align: left; padding: 14px 16px 0; }
 th {
   font-size: 9.5px; text-transform: uppercase; letter-spacing: .13em;
-  color: var(--ink-3); font-weight: 600; text-align: right;
+  color: var(--ink-2); font-weight: 600; text-align: right;
   padding: 10px 16px; border-bottom: 1px solid var(--rule); white-space: nowrap;
 }
 td {
@@ -105,21 +190,93 @@ td {
 }
 th:first-child, td:first-child { text-align: left; }
 tr.own td { background: var(--fee-bg); }
-tr.closed td { color: var(--ink-3); }
-tfoot td {
-  background: #fbfcfd; border-top: 1px solid var(--ink);
-  border-bottom: none; font-weight: 600;
-}
-.tag {
+tr.closed td { color: var(--ink-2); }
+tr.voided td { color: var(--ink-2); text-decoration: line-through; }
+tfoot td { background: #fbfcfd; border-top: 1px solid var(--ink); border-bottom: none; font-weight: 600; }
+
+.tag, .chip {
   display: inline-block; font-size: 9px; text-transform: uppercase;
   letter-spacing: .1em; font-weight: 600; padding: 2px 6px;
-  border: 1px solid var(--ink); background: var(--fee); color: var(--ink);
-  border-radius: 2px; margin-left: 6px;
+  border: 1px solid var(--ink); border-radius: 2px; margin-left: 6px;
+  color: var(--ink);
 }
-.scroller { overflow-x: auto; }
-.foot { padding: 18px 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.6; }
-.ok { color: var(--gain); font-weight: 600; }
+.tag { background: var(--fee); }
+.chip { background: transparent; border-color: var(--rule); color: var(--ink-2); }
+.chip.is-live { border-color: var(--gain); color: var(--gain); }
+.chip.is-fee { background: var(--fee-bg); border-color: var(--fee-ink); color: var(--fee-ink); }
+
+/* Banners */
 .banner {
   background: var(--fee-bg); border: 1px solid #e8c77a; border-radius: 3px;
   padding: 11px 14px; font-size: 12.5px; color: var(--fee-ink); margin-bottom: 12px;
 }
+.banner-halt {
+  background: var(--card); border: 1px solid var(--loss); border-left-width: 4px;
+  border-radius: 3px; padding: 12px 15px; margin-bottom: 12px; color: var(--ink);
+}
+.banner-halt strong { color: var(--loss); }
+
+/* Sheets — the money flows. Routes, not overlays (decision D-B). */
+.sheet-scrim { background: var(--paper); min-height: 100vh; padding: 28px 20px 64px; }
+.sheet {
+  max-width: 640px; margin: 0 auto; background: var(--card);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 24px;
+}
+.sheet h1 { font-family: var(--serif); font-size: 28px; font-weight: 400; margin: 0 0 4px; }
+.sheet .lede { color: var(--ink-2); font-size: 13px; margin: 0 0 18px; }
+
+/* Receipts — the arithmetic, before it commits. */
+.receipt { border-top: 1px solid var(--ink); margin-top: 16px; }
+.receipt-line {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--rule-soft);
+}
+.receipt-line .l { font-size: 13px; color: var(--ink); }
+.receipt-line .l small { display: block; color: var(--ink-2); font-size: 11px; }
+.receipt-line .r { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 14px; }
+.receipt-line.is-fee { background: var(--fee-bg); padding-left: 10px; padding-right: 10px; }
+.receipt-line.is-fee .r { color: var(--fee-ink); }
+.receipt-total { border-top: 1px solid var(--ink); border-bottom: none; padding-top: 14px; }
+.receipt-total .l { font-weight: 600; }
+.receipt-total .r { font-size: 24px; }
+.split-note { font-size: 11.5px; color: var(--ink-2); margin-top: 10px; line-height: 1.6; }
+
+/* Review queue */
+.queue { display: grid; gap: 12px; }
+.queue-item {
+  background: var(--card); border: 1px solid var(--rule);
+  border-left: 4px solid var(--fee); border-radius: 3px; padding: 18px 20px;
+}
+
+/* Forms */
+.field { display: block; margin-bottom: 14px; }
+.field > span {
+  display: block; font-size: 10px; text-transform: uppercase; letter-spacing: .14em;
+  color: var(--ink-2); font-weight: 600; margin-bottom: 5px;
+}
+.field input, .field select, .field textarea {
+  width: 100%; font-family: var(--mono); font-size: 14px; color: var(--ink);
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 9px 11px;
+}
+.field-error {
+  border-left: 4px solid var(--loss); background: var(--card);
+  border: 1px solid var(--loss); border-left-width: 4px; border-radius: 3px;
+  padding: 11px 14px; margin-bottom: 14px; font-size: 12.5px;
+}
+.field-error strong { color: var(--loss); }
+
+.btn {
+  display: inline-block; font-family: var(--sans); font-size: 13px; font-weight: 500;
+  padding: 9px 16px; border: 1px solid var(--ink); border-radius: 3px;
+  background: var(--card); color: var(--ink); cursor: pointer; text-decoration: none;
+}
+.btn[aria-disabled="true"], .btn:disabled {
+  border-color: var(--rule); color: var(--ink-2); cursor: not-allowed; background: var(--paper);
+}
+.btn-primary { background: var(--ink); color: var(--card); }
+.btn-danger { border-color: var(--loss); color: var(--loss); }
+.actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
+
+.foot { padding: 18px 0; font-size: 11.5px; color: var(--ink-2); line-height: 1.6; }
+.ok { color: var(--gain); font-weight: 600; }
