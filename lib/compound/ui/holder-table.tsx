@@ -9,6 +9,16 @@
  * Real table semantics throughout: scope="col" on headers, scope="row" on the
  * holder name. That is how a screen reader associates $12,630.61 with "Ada
  * Lovelace, Value now", and it is how the tests find it too.
+ *
+ * The footer's P/L reads `figures.investorProfitCents` — present/derive.ts's
+ * own precomputed field — rather than subtracting basis from value locally.
+ * An earlier draft of this file did the subtraction here instead; the two
+ * are numerically identical for bigints (sum of differences equals
+ * difference of sums exactly, with no rounding step to disagree over), so no
+ * test would ever have caught it as a wrong number, but it is still the
+ * "figure computed in two places" shape this kit is specifically not
+ * supposed to contain. deskFigures already carries the answer; this
+ * component's job is to render it, not re-derive it.
  */
 import type { DeskFigures } from "@/lib/compound/present/derive";
 import { formatSplit, formatUnitsDp } from "@/lib/compound/present/format";
@@ -23,7 +33,6 @@ export function HolderTable({
   currency: string;
   showActions?: boolean;
 }) {
-  const investorProfit = figures.investorValueCents - figures.investorBasisCents;
   return (
     <div className="scroller">
       <table>
@@ -76,7 +85,7 @@ export function HolderTable({
             <td />
             <td />
             <td><Money cents={figures.investorValueCents} currency={currency} /></td>
-            <td><DeltaMoney cents={investorProfit} currency={currency} /></td>
+            <td><DeltaMoney cents={figures.investorProfitCents} currency={currency} /></td>
             <td />
             <td><FeeMoney cents={figures.feeIfAllExitCents} currency={currency} /></td>
             {showActions ? <td /> : null}
