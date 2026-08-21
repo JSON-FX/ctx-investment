@@ -80,6 +80,38 @@ pnpm dev
 Gates are `pnpm typecheck` and `pnpm test`. There is deliberately no ESLint —
 `eslint-config-next` is broken against ESLint 9 in the sibling project.
 
+## Local Supabase (dev stack)
+
+`compound_*` tables will live in the same CopyTraderX Supabase project this
+app reads market data from — a production project an Expert Advisor uses to
+validate trading licences. Migrations are written and proven against a
+local instance first; this repo never connects to, queries, or modifies the
+remote project from automation.
+
+```bash
+supabase start    # first run pulls images, can take a few minutes
+supabase status    # ports, API URL, anon/service-role keys
+supabase db reset  # re-apply every migration + supabase/seed.sql from scratch
+supabase stop      # tear the stack down
+```
+
+The local stack binds to `127.0.0.1:54621` (API/REST), `:54622` (Postgres),
+`:54623` (Studio) — offset from Supabase's `54321` defaults because other
+local Supabase projects on this machine already occupy the `54320s` and
+`54520s` ranges. See `supabase/config.toml` for the full port list.
+
+`supabase/migrations/` currently holds one migration: local fixture
+stand-ins for the five CopyTraderX/copytraderx-license-owned tables
+Compound reads (`users`, `account_snapshots_daily`,
+`account_snapshots_current`, `deals`, `licenses`), including the two
+triggers that mirror `users`/`auth.users` role in production. These are
+**not** Compound's tables and this migration must never be applied to the
+live project — see the warning comment at the top of the file.
+`supabase/seed.sql` fills them with one fictional MT5 account, two
+fictional users (a manager and an investor), and a scripted scenario — a
+clean run of days, one unexplained balance jump, one duplicate-deal pair,
+one weekend gap — shaped for testing `lib/compound/reconcile/`.
+
 ## What the page shows today
 
 A deployment shell, not the desk. It replays a fictional 15-entry ledger
