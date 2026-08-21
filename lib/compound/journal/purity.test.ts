@@ -253,14 +253,15 @@ describe("journal purity", () => {
     // Ratchet: 1 (int.ts) at Task 1, 2 (+ history.ts) at Task 2, 3
     // (+ trade-stats.ts) at Task 3, 5 (+ calendar-aggregate.ts, streaks.ts) at
     // Task 4, 7 (+ trade-equity.ts, histogram.ts) at Task 5, 8
-    // (+ equity-series.ts) at Task 6, 9 (+ rows.ts) at Task 7. Raise this
-    // bound whenever a task adds a top-level source file to this directory,
-    // so a scan that silently stops finding a file fails loudly instead of
-    // passing on a smaller-than-expected set.
-    expect(sourceFiles().length).toBeGreaterThan(8);
+    // (+ equity-series.ts) at Task 6, 9 (+ rows.ts) at Task 7, 13
+    // (+ order-display.ts, order-filters.ts, table-state.ts, trade-filters.ts)
+    // at Task 8. Raise this bound whenever a task adds a top-level source
+    // file to this directory, so a scan that silently stops finding a file
+    // fails loudly instead of passing on a smaller-than-expected set.
+    expect(sourceFiles().length).toBeGreaterThan(12);
   });
 
-  it("guards every module Phase A is supposed to have built", () => {
+  it("guards every module this directory is supposed to have built so far", () => {
     // Mutation caught: a module dropped from the directory, or the guard being
     // pointed somewhere it no longer sees them. The engine build's lesson: a
     // guard with nothing to guard passes silently.
@@ -270,9 +271,13 @@ describe("journal purity", () => {
       "histogram.ts",
       "history.ts",
       "int.ts",
+      "order-display.ts",
+      "order-filters.ts",
       "rows.ts",
       "streaks.ts",
+      "table-state.ts",
       "trade-equity.ts",
+      "trade-filters.ts",
       "trade-stats.ts",
     ]);
   });
