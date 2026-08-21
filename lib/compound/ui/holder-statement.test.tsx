@@ -158,15 +158,31 @@ describe("HolderStatement — exactly at the mark", () => {
 describe("HolderStatement — the history", () => {
   beforeEach(() => renderFor());
 
-  it("shows every entry, marking the ones that are not Ada's", () => {
+  it("starts at her deposit, marking the entries that are not hers", () => {
     const rows = screen.getAllByRole("row").filter((r) => within(r).queryAllByRole("cell").length > 0);
-    expect(rows).toHaveLength(6);
-    expect(rows.filter((r) => r.textContent?.includes("account-wide"))).toHaveLength(5);
+    expect(rows).toHaveLength(4);
+    expect(rows.filter((r) => r.textContent?.includes("account-wide"))).toHaveLength(3);
+  });
+
+  it("shows nothing from before she held anything", () => {
+    // The fixture has account activity predating Ada's 4 May deposit. Those
+    // steps render as zero units, zero basis and zero value for her — rows
+    // that say "nothing happened to you" and imply she was present for a
+    // period she had no stake in. Her statement begins where she does.
+    const rows = screen.getAllByRole("row").filter((r) => within(r).queryAllByRole("cell").length > 0);
+    const first = rows[0]!;
+    expect(first.textContent).toMatch(/4 May 2026/);
+    expect(first.textContent).toMatch(/Deposit/);
+    // And no row anywhere reports her holding nothing.
+    for (const r of rows) {
+      const cells = within(r).getAllByRole("cell").map((c) => c.textContent);
+      expect(cells[2]).not.toBe("0.0000");   // units held after
+    }
   });
 
   it("explains a value change she had no part in", () => {
     const revalue = screen.getAllByRole("row", { name: /Account revalued/ });
-    expect(revalue.length).toBe(3);
+    expect(revalue.length).toBe(2);
     // 30 Jun 2026: her units do not move, her value does.
     const row = screen.getByRole("row", { name: /30 Jun 2026/ });
     const cells = within(row).getAllByRole("cell").map((c) => c.textContent);

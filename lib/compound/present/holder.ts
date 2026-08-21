@@ -113,7 +113,25 @@ export function holderStatement(
   const holderIn = (state: PoolState): HolderState | undefined =>
     state.holders.find((h) => h.holderId === holderId);
 
-  return steps.map((s) => {
+  // A statement starts where the holder does. Every step before their first
+  // involvement renders as zero units, zero basis and zero value — dozens of
+  // rows saying "nothing happened to you", which is noise on a document handed
+  // to an investor and actively misleading: it implies they were present for a
+  // period they had no stake in.
+  //
+  // "First involvement" is the earlier of their first own entry (the deposit
+  // that bought their units) and the first step that leaves them holding any.
+  // Those coincide today, since units come only from ledger entries, but
+  // checking both means a future entry type that grants units without being
+  // holderId-owned still starts the statement in the right place.
+  const startsAt = steps.findIndex(
+    (s) => s.entry.holderId === holderId || (holderIn(s.after)?.units ?? 0n) > 0n,
+  );
+  // No involvement at all: a holder created but not yet funded. An empty
+  // statement is the honest rendering — not a run of zeroes.
+  if (startsAt === -1) return [];
+
+  return steps.slice(startsAt).map((s) => {
     const before = holderIn(s.before);
     const after = holderIn(s.after);
     return {

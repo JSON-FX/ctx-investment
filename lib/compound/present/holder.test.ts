@@ -127,40 +127,48 @@ describe("holderPosition — refusals", () => {
 describe("holderStatement", () => {
   const rows = holderStatement(ledgerSteps(LEDGER, SEEDS), ADA_ID);
 
-  it("includes every entry, not only Ada's own", () => {
-    expect(rows).toHaveLength(6);
+  it("includes every entry from her deposit on, not only her own", () => {
+    // Four steps, not six: the two before her deposit are not her history.
+    expect(rows).toHaveLength(4);
     expect(rows.filter((r) => r.own).map((r) => r.seq)).toEqual([3]);
   });
 
-  it("shows Ada holding nothing before her deposit", () => {
-    expect(rows[0]!.unitsAfter).toBe(0n);
-    expect(rows[0]!.valueAfter).toBe(0n);
+  it("starts at her deposit rather than a run of zeroes", () => {
+    // The fixture has account activity at seq 1 and 2, before Ada existed as a
+    // holder. Rendering those gives her rows of zero units, zero basis and zero
+    // value — noise on a document handed to an investor, and misleading: it
+    // implies she was present for a period she had no stake in.
+    expect(rows[0]!.seq).toBe(3);
+    expect(rows[0]!.own).toBe(true);
+    expect(rows[0]!.type).toBe("deposit");
+    // Nowhere in her statement does she hold nothing.
+    expect(rows.every((r) => r.unitsAfter > 0n)).toBe(true);
   });
 
   it("issues her units on her deposit and sets her capital in", () => {
-    expect(rows[2]!.unitsDelta).toBeGreaterThan(0n);
-    expect(rows[2]!.basisAfter).toBe(c("10000.00"));
-    expect(rows[2]!.valueAfter).toBe(c("10000.00"));
+    expect(rows[0]!.unitsDelta).toBeGreaterThan(0n);
+    expect(rows[0]!.basisAfter).toBe(c("10000.00"));
+    expect(rows[0]!.valueAfter).toBe(c("10000.00"));
   });
 
   it("moves her value on a reading she had no part in", () => {
     // This is why readings are on a holder's statement at all: without seq 4
     // her value jumps between her own entries with nothing to explain it.
-    expect(rows[3]!.own).toBe(false);
-    expect(rows[3]!.unitsDelta).toBe(0n);
-    expect(rows[3]!.valueDelta).toBeGreaterThan(0n);
+    expect(rows[1]!.own).toBe(false);
+    expect(rows[1]!.unitsDelta).toBe(0n);
+    expect(rows[1]!.valueDelta).toBeGreaterThan(0n);
   });
 
   it("ends on the figure her statement head shows", () => {
-    expect(rows[5]!.valueAfter).toBe(c("12630.61"));
-    expect(rows[5]!.unitsAfter).toBe(holderPosition(STATE, ADA_ID).holder.units);
+    expect(rows[3]!.valueAfter).toBe(c("12630.61"));
+    expect(rows[3]!.unitsAfter).toBe(holderPosition(STATE, ADA_ID).holder.units);
   });
 
   it("leaves her value unmoved by another holder's deposit", () => {
     // Grace joins at seq 5. Ada's units do not change and neither does her
     // value: a deposit issues units at the prevailing NAV, which is what makes
     // staggered entry safe.
-    expect(rows[4]!.unitsDelta).toBe(0n);
-    expect(rows[4]!.valueDelta).toBe(0n);
+    expect(rows[2]!.unitsDelta).toBe(0n);
+    expect(rows[2]!.valueDelta).toBe(0n);
   });
 });
