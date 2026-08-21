@@ -42,7 +42,7 @@ const BASE = {
 describe("planReadings — nothing to do", () => {
   it("is idle with no snapshots", () => {
     expect(planReadings({ ...BASE, snapshots: [], deals: [], cursor: { lastReadingDate: null } }))
-      .toEqual({ kind: "idle" });
+      .toEqual({ kind: "idle", droppedDeals: [] });
   });
 
   it("is idle when the cursor is already at the last snapshot", () => {
@@ -51,7 +51,7 @@ describe("planReadings — nothing to do", () => {
       snapshots: [snap("2026-05-02", 100n), snap("2026-05-03", 100n)],
       deals: [],
       cursor: { lastReadingDate: "2026-05-03" },
-    })).toEqual({ kind: "idle" });
+    })).toEqual({ kind: "idle", droppedDeals: [] });
   });
 });
 
@@ -223,6 +223,87 @@ describe("planReadings — dedupe is applied", () => {
   });
 });
 
+describe("planReadings — dropped deals are surfaced, not thrown away (I2)", () => {
+  // dedupe.ts's own module doc: dropping a genuine trade "destroys real P/L
+  // silently." interlock.ts used to do exactly that to dedupeDeals' own
+  // `dropped` list — `const { kept } = dedupeDeals(...)` — so a suppressed
+  // deal was invisible to every caller of planReadings. There was no way for
+  // a run to be audited: nothing downstream could learn a deal was dropped,
+  // let alone which ticket it was judged a duplicate of.
+  function genuineAndTwin(closeTime: string, netCents: bigint, twinTicket: number) {
+    const genuine = closed(closeTime, netCents);
+    const twin: ClosedDeal = {
+      ...genuine,
+      ticket: twinTicket,
+      openTime: new Date(Date.parse(genuine.openTime) + 3 * 3_600_000).toISOString(),
+      closeTime: new Date(Date.parse(genuine.closeTime) + 3 * 3_600_000).toISOString(),
+    };
+    return { genuine, twin };
+  }
+
+  it("names the dropped deal and what it duplicates, on an advancing run", () => {
+    const { genuine, twin } = genuineAndTwin("2026-05-03T08:31:00Z", 1_000n, 9_000);
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [snap("2026-05-02", 100_000n), snap("2026-05-03", 101_000n)],
+      deals: [genuine, twin],
+      cursor: { lastReadingDate: null },
+    });
+    expect(plan.droppedDeals).toEqual([
+      { deal: twin, duplicateOfTicket: genuine.ticket },
+    ]);
+  });
+
+  it("is empty when nothing was dropped", () => {
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [snap("2026-05-02", 100_000n), snap("2026-05-03", 101_000n)],
+      deals: [closed("2026-05-03T08:31:00Z", 1_000n)],
+      cursor: { lastReadingDate: null },
+    });
+    expect(plan.droppedDeals).toEqual([]);
+  });
+
+  it("is still reported on a halted run", () => {
+    // 06-23 and 06-24 are each fully explained by one deal; 06-25's +31,000
+    // has no explaining deal at all (an unrecorded deposit), so the plan
+    // halts there. The 06-23 deal also carries a broker-offset twin. Both the
+    // halt AND the drop must be visible in the same result.
+    const { genuine, twin } = genuineAndTwin("2026-06-23T10:00:00Z", 1_000n, 9_001);
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [
+        snap("2026-06-22", 100_000n, 100_000n),
+        snap("2026-06-23", 101_000n, 101_000n),
+        snap("2026-06-24", 102_000n, 102_000n),
+        snap("2026-06-25", 133_000n, 133_000n),
+      ],
+      deals: [genuine, twin, closed("2026-06-24T10:00:00Z", 1_000n)],
+      cursor: { lastReadingDate: null },
+    });
+    expect(plan.kind).toBe("halt");
+    if (plan.kind !== "halt") throw new Error("expected halt");
+    expect(plan.candidate.tradeDate).toBe("2026-06-25");
+    expect(plan.droppedDeals).toEqual([{ deal: twin, duplicateOfTicket: genuine.ticket }]);
+  });
+
+  it("is still reported when the run is idle because the cursor is already caught up", () => {
+    // Nothing new to post, but dedupeDeals still ran over the full deals
+    // array the caller handed in, so a dropped duplicate is still knowable —
+    // and must still be reported, not silently lost because there was
+    // nothing to advance.
+    const { genuine, twin } = genuineAndTwin("2026-05-03T08:31:00Z", 1_000n, 9_002);
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [snap("2026-05-02", 100_000n), snap("2026-05-03", 101_000n)],
+      deals: [genuine, twin],
+      cursor: { lastReadingDate: "2026-05-03" },
+    });
+    expect(plan.kind).toBe("idle");
+    expect(plan.droppedDeals).toEqual([{ deal: twin, duplicateOfTicket: genuine.ticket }]);
+  });
+});
+
 describe("planReadings — the window must reach back to the cursor", () => {
   it("refuses a window that begins after the cursor", () => {
     expect(() =>
@@ -254,5 +335,62 @@ describe("planReadings — the window must reach back to the cursor", () => {
         cursor: { lastReadingDate: null },
       }),
     ).not.toThrow();
+  });
+});
+
+describe("planReadings — a duplicate tradeDate must not swallow the halt (C1)", () => {
+  // The exact C1 reproduction. Two rows both dated 2026-06-25: a genuine
+  // 102,000 balance and a 133,000 balance after an unrecorded 31,000 deposit.
+  // 06-26 follows with 134,000 (a fully explained +1,000 trading day).
+  //
+  // Before the guard: `ordered[0]` (the 102,000 row) becomes the baseline and
+  // sets cursorDate = "2026-06-25". reconcileDays correctly flags the interval
+  // ending 06-25 as unexplained by 31,000 — but planReadings' cursor skip
+  // (`day.tradeDate <= cursorDate`) discards that exact row, because it is
+  // also dated 06-25. The halt that reaches the caller is on 06-26 with a
+  // candidate of only 1,000n. The 31,000 deposit never surfaces, and a run
+  // that classifies the 1,000 candidate and resumes steps NAV 102,000 →
+  // 134,000 while only 1,000 is ever accounted for. That is the loss
+  // spec §5.3 exists to prevent.
+  const duplicatedSnapshots = [
+    { tradeDate: "2026-06-25", balanceCloseCents: 102_000n, equityCloseCents: 102_000n },
+    { tradeDate: "2026-06-25", balanceCloseCents: 133_000n, equityCloseCents: 133_000n },
+    { tradeDate: "2026-06-26", balanceCloseCents: 134_000n, equityCloseCents: 134_000n },
+  ];
+
+  it("throws instead of halting on 06-26 with the wrong (1,000n) candidate", () => {
+    expect(() =>
+      planReadings({
+        ...BASE,
+        snapshots: duplicatedSnapshots,
+        deals: [],
+        cursor: { lastReadingDate: null },
+      }),
+    ).toThrow(/before calling planReadings/);
+  });
+
+  it("names the offending date in the error", () => {
+    expect(() =>
+      planReadings({
+        ...BASE,
+        snapshots: duplicatedSnapshots,
+        deals: [],
+        cursor: { lastReadingDate: null },
+      }),
+    ).toThrow(/2026-06-25/);
+  });
+
+  it("also refuses when the duplicate sits at the incoming cursor date — the ordinary resume shape", () => {
+    // The window precondition requires a snapshot at or before the cursor, so
+    // the "duplicate equals cursorDate" shape is not an edge case — it is how
+    // every ordinary resume window is built.
+    expect(() =>
+      planReadings({
+        ...BASE,
+        snapshots: duplicatedSnapshots,
+        deals: [],
+        cursor: { lastReadingDate: "2026-06-25" },
+      }),
+    ).toThrow(/2026-06-25/);
   });
 });

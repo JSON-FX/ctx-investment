@@ -70,6 +70,35 @@ describe("dedupeDeals — what it must NOT drop", () => {
     expect(dedupeDeals([a, b], 3).dropped).toHaveLength(0);
   });
 
+  // symbol, side, swap and commission are held constant across every OTHER
+  // fixture in this file (deal()'s defaults), so a mutant that dropped any
+  // one of them from valueKey would still pass every test above. Each of
+  // these four is the one case that varies exactly that field and nothing
+  // else, so only it can catch that mutant.
+  it("keeps a pair shifted correctly but differing in symbol", () => {
+    const a = deal({ ticket: 1000 });
+    const b = { ...shifted(a, 3, 9000), symbol: "EURUSD" };
+    expect(dedupeDeals([a, b], 3).dropped).toHaveLength(0);
+  });
+
+  it("keeps a pair shifted correctly but differing in side", () => {
+    const a = deal({ ticket: 1000 }); // side: "sell"
+    const b: ClosedDeal = { ...shifted(a, 3, 9000), side: "buy" };
+    expect(dedupeDeals([a, b], 3).dropped).toHaveLength(0);
+  });
+
+  it("keeps a pair shifted correctly but differing in swap", () => {
+    const a = deal({ ticket: 1000 }); // swapCents: -38n
+    const b = { ...shifted(a, 3, 9000), swapCents: -39n };
+    expect(dedupeDeals([a, b], 3).dropped).toHaveLength(0);
+  });
+
+  it("keeps a pair shifted correctly but differing in commission", () => {
+    const a = deal({ ticket: 1000 }); // commissionCents: 0n
+    const b = { ...shifted(a, 3, 9000), commissionCents: 5n };
+    expect(dedupeDeals([a, b], 3).dropped).toHaveLength(0);
+  });
+
   it("keeps a pair where only close time is shifted, not open time", () => {
     // A real duplicate is shifted on BOTH ends. One end only is a different
     // trade that happened to close 3h later.

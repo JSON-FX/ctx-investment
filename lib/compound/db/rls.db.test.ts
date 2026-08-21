@@ -412,6 +412,361 @@ describe("the admin gate", () => {
   });
 });
 
+describe("the admin gate closes writes too", () => {
+  // Same idea as "the admin gate" above, extended to INSERT and to UPDATE
+  // where a policy exists. Alice, same rows, only the claim changes. Every
+  // row attempted below is one the admin claim CAN write — each negative
+  // case has a sibling that runs the identical statement as admin, so a
+  // refusal here is attributable to the gate and not to some other reason
+  // the row was bad.
+  //
+  // UPDATE does not behave like INSERT or SELECT here, and the difference
+  // matters for what these tests assert. Every UPDATE policy below pairs an
+  // identical `gate and key` expression for USING and WITH CHECK, and none
+  // of the statements here touch an ownership column. That means a
+  // gate-only failure is caught entirely by USING, before WITH CHECK is
+  // ever reached — the row is filtered out of the update target list the
+  // same way a WHERE clause that matches nothing filters it out, and that
+  // is not an error in Postgres, RLS-derived or not. Verified directly
+  // against a running stack before writing these assertions, not assumed:
+  // the identical statement returns rowCount 1 under the admin claim and
+  // rowCount 0 under "user" or no claim, with no exception either way. So
+  // the UPDATE cases below assert on rowCount, the same way "the admin
+  // gate" above asserts on an empty SELECT array — not on expectPgError,
+  // which only fires on an actual server error. compound_ledger_entry and
+  // compound_audit have no UPDATE policy at all (append-only by grant), so
+  // neither gets an UPDATE case; the structural policy-count test near the
+  // end of this file already pins that down.
+  //
+  // Every UPDATE probe below is unfiltered — no `where id = ...` — and that
+  // is load-bearing, not a style choice. Found by mutation-testing this
+  // file's own first draft: a WHERE-qualified UPDATE requires the table's
+  // SELECT policy to pass in addition to the UPDATE policy being exercised,
+  // so a filtered version of e.g. the compound_holder case below still read
+  // rowCount 0 after stripping the gate from compound_holder_update alone —
+  // compound_holder_select's own, still-intact copy of the identical gate
+  // was silently doing the blocking instead, and the test would have kept
+  // passing for the wrong reason forever. Unfiltered avoids the SELECT
+  // policy entirely; ownership alone already narrows every table below to
+  // Alice's own row or rows.
+  const NON_ADMIN_CLAIMS = [
+    ["a user-role claim", "user"],
+    ["no claim at all", null],
+  ] as const;
+
+  describe("compound_account", () => {
+    const insertOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_account
+               (mt5_account, label, currency, default_split_bps, inception_date, manager_user_id)
+             values (9900201, 'Gate Probe', 'USD', 4000, '2026-05-01', $1)`,
+            [ALICE],
+          ),
+        ),
+      );
+    const updateOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(`update public.compound_account set label = 'Gate Renamed'`),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        await expectPgError(
+          insertOne(appRole),
+          "42501",
+          /row-level security policy for table "compound_account"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT — the row itself was always valid", async () => {
+      const { rowCount } = await insertOne("admin");
+      expect(rowCount).toBe(1);
+    });
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an UPDATE with valid ownership under %s — silently, not by error",
+      async (_label, appRole) => {
+        const { rowCount } = await updateOne(appRole);
+        expect(rowCount).toBe(0);
+      },
+    );
+
+    it("lets the admin claim make that same UPDATE — the row was reachable", async () => {
+      const { rowCount } = await updateOne("admin");
+      expect(rowCount).toBe(1);
+    });
+  });
+
+  describe("compound_holder", () => {
+    const insertOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_holder
+               (account_id, name, is_manager, split_bps, status)
+             values ($1, 'Gate Investor', false, 4000, 'active')`,
+            [alicesAccount],
+          ),
+        ),
+      );
+    // Unfiltered, deliberately — not `where id = $1`. Verified directly
+    // against a running stack: a WHERE-qualified UPDATE also requires the
+    // table's SELECT policy to pass, not only the UPDATE policy being
+    // exercised here — so a `where id = ...` version of this test would
+    // still read 0 rows after stripping the gate from compound_holder_update
+    // alone, because compound_holder_select's own, still-intact copy of the
+    // same gate would keep silently absorbing it. That is exactly the kind
+    // of assertion that cannot fail the dispatch warned about, caught here
+    // by actually stripping the policy and watching this go red before
+    // trusting it. Unfiltered sidesteps the SELECT policy entirely — Alice
+    // has exactly one holder row, so ownership alone already narrows this to
+    // it, same as the compound_account and compound_capital_event_candidate
+    // cases below.
+    const updateOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(`update public.compound_holder set name = 'Gate Renamed'`),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        await expectPgError(
+          insertOne(appRole),
+          "42501",
+          /row-level security policy for table "compound_holder"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT", async () => {
+      const { rowCount } = await insertOne("admin");
+      expect(rowCount).toBe(1);
+    });
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an UPDATE with valid ownership under %s — silently, not by error",
+      async (_label, appRole) => {
+        const { rowCount } = await updateOne(appRole);
+        expect(rowCount).toBe(0);
+      },
+    );
+
+    it("lets the admin claim make that same UPDATE", async () => {
+      const { rowCount } = await updateOne("admin");
+      expect(rowCount).toBe(1);
+    });
+  });
+
+  describe("compound_ledger_entry", () => {
+    const insertOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_ledger_entry
+               (account_id, seq, occurred_on, type, amount_cents)
+             values ($1, 50, '2026-05-03', 'equity_reading', 1000300)`,
+            [alicesAccount],
+          ),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        await expectPgError(
+          insertOne(appRole),
+          "42501",
+          /row-level security policy for table "compound_ledger_entry"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT", async () => {
+      const { rowCount } = await insertOne("admin");
+      expect(rowCount).toBe(1);
+    });
+
+    // No UPDATE case: compound_ledger_entry has no UPDATE policy at all —
+    // append-only by grant and by trigger (see "grants exactly INSERT and
+    // SELECT to authenticated and service_role" below).
+  });
+
+  describe("compound_capital_event_candidate", () => {
+    const insertOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_capital_event_candidate
+               (account_id, trade_date, balance_delta_cents, explained_cents, unexplained_cents)
+             values ($1, '2026-07-15', 700000, 0, 700000)`,
+            [alicesAccount],
+          ),
+        ),
+      );
+    const updateOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(`update public.compound_capital_event_candidate set status = 'ignored'`),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        await expectPgError(
+          insertOne(appRole),
+          "42501",
+          /row-level security policy for table "compound_capital_event_candidate"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT", async () => {
+      const { rowCount } = await insertOne("admin");
+      expect(rowCount).toBe(1);
+    });
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an UPDATE with valid ownership under %s — silently, not by error",
+      async (_label, appRole) => {
+        const { rowCount } = await updateOne(appRole);
+        expect(rowCount).toBe(0);
+      },
+    );
+
+    it("lets the admin claim make that same UPDATE", async () => {
+      const { rowCount } = await updateOne("admin");
+      expect(rowCount).toBe(1);
+    });
+  });
+
+  describe("compound_reconcile_cursor", () => {
+    // No behavioural write coverage exists anywhere else in this file for
+    // this table. The shared beforeEach fixture already seeds a cursor row
+    // for alicesAccount, so a valid-ownership INSERT needs an account that
+    // does not have one yet — this table's primary key IS account_id, not a
+    // separate id column. Created here, locally, rather than in the shared
+    // fixture, because no other test in this file needs a second account.
+    async function freshAccountForAlice(): Promise<number> {
+      return withTestClient(async (c) => {
+        const { rows } = await c.query<{ id: string }>(
+          `insert into public.compound_account
+             (mt5_account, label, currency, default_split_bps, inception_date, manager_user_id)
+           values (9900202, 'Alice Second Desk', 'USD', 4000, '2026-05-01', $1)
+           returning id`,
+          [ALICE],
+        );
+        return Number(rows[0]!.id);
+      });
+    }
+    const insertOne = (appRole: "admin" | "user" | null, accountId: number) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_reconcile_cursor
+               (account_id, last_reading_date, last_run_at)
+             values ($1, '2026-05-02', now())`,
+            [accountId],
+          ),
+        ),
+      );
+    // Unfiltered, deliberately — not `where account_id = $1`. Same reason as
+    // compound_holder above: a WHERE-qualified UPDATE also requires the
+    // SELECT policy to pass, not only the UPDATE policy under test, which
+    // would silently absorb the strip through compound_reconcile_cursor_
+    // select's own still-intact gate instead of proving anything about
+    // compound_reconcile_cursor_update. The fixture seeds a cursor row for
+    // both Alice's and Bob's accounts, so ownership alone already narrows an
+    // unfiltered update to Alice's one row.
+    const updateOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(`update public.compound_reconcile_cursor set last_run_at = now()`),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        const accountId = await freshAccountForAlice();
+        await expectPgError(
+          insertOne(appRole, accountId),
+          "42501",
+          /row-level security policy for table "compound_reconcile_cursor"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT", async () => {
+      const accountId = await freshAccountForAlice();
+      const { rowCount } = await insertOne("admin", accountId);
+      expect(rowCount).toBe(1);
+    });
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an UPDATE with valid ownership under %s — silently, not by error",
+      async (_label, appRole) => {
+        const { rowCount } = await updateOne(appRole);
+        expect(rowCount).toBe(0);
+      },
+    );
+
+    it("lets the admin claim make that same UPDATE", async () => {
+      const { rowCount } = await updateOne("admin");
+      expect(rowCount).toBe(1);
+    });
+  });
+
+  describe("compound_audit", () => {
+    // Reachability, checked rather than assumed: WITH CHECK on an INSERT
+    // always evaluates against the proposed row — there is no existing row
+    // for USING to filter first, the way there is for UPDATE — so a
+    // non-admin claim's INSERT does reach the policy and is refused by it,
+    // not by something else (a NOT NULL violation, say) firing first.
+    // Confirmed directly against a running stack before writing this
+    // assertion: both claims below produce exactly the RLS error, nothing
+    // else.
+    const insertOne = (appRole: "admin" | "user" | null) =>
+      withTestClient((c) =>
+        asRole(c, "authenticated", { userId: ALICE, appRole }, () =>
+          c.query(
+            `insert into public.compound_audit (account_id, actor, action, entity, entity_id)
+             values ($1, $2, 'gate_probe', 'gate_probe_entity', null)`,
+            [alicesAccount, ALICE],
+          ),
+        ),
+      );
+
+    it.each(NON_ADMIN_CLAIMS)(
+      "refuses an INSERT with valid ownership under %s",
+      async (_label, appRole) => {
+        await expectPgError(
+          insertOne(appRole),
+          "42501",
+          /row-level security policy for table "compound_audit"/,
+        );
+      },
+    );
+
+    it("lets the admin claim make that same INSERT", async () => {
+      const { rowCount } = await insertOne("admin");
+      expect(rowCount).toBe(1);
+    });
+
+    // No UPDATE case: compound_audit has no UPDATE policy at all —
+    // append-only by grant (see "is append-only by grant — no UPDATE, no
+    // DELETE" above).
+  });
+});
+
 describe("anon sees nothing on any compound table", () => {
   it.each(ALL_TABLES)("%s is closed to anon", async (table) => {
     await withTestClient((c) =>

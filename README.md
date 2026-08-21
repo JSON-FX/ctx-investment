@@ -112,6 +112,23 @@ fictional users (a manager and an investor), and a scripted scenario — a
 clean run of days, one unexplained balance jump, one duplicate-deal pair,
 one weekend gap — shaped for testing `lib/compound/reconcile/`.
 
+## Database tests
+
+The `db/` integration suite runs against a local Supabase, never against a
+hosted project.
+
+```bash
+supabase start          # ports come from supabase/config.toml
+supabase db reset       # apply every migration, re-run the seed
+pnpm test:db
+```
+
+`pnpm test` stays offline and never touches Postgres.
+
+**Never run `supabase link` or `supabase db push` in this repository.** The
+`compound_*` migrations are applied to CopyTraderX by hand, as a reviewed step,
+not by any command in this repo.
+
 ## What the page shows today
 
 A deployment shell, not the desk. It replays a fictional 15-entry ledger

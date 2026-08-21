@@ -61,6 +61,20 @@ export function reconcileDays(
     const prev = ordered[i - 1]!;
     const cur = ordered[i]!;
 
+    // Two rows dated the same day make the interval (previousDate, tradeDate]
+    // a zero-width lie: no close day is both > prev and <= cur, so explained
+    // silently comes out 0n regardless of which balance is "real." Whichever
+    // of the two rows the caller intended as authoritative, this function
+    // cannot tell — and guessing is how a reconciler invents or hides a
+    // capital event. Refuse instead.
+    if (cur.tradeDate === prev.tradeDate) {
+      throw new RangeError(
+        `duplicate snapshot for tradeDate ${cur.tradeDate}: two rows both claim to close ` +
+          `that day, so the interval (previousDate, tradeDate] is ambiguous. Collapse to ` +
+          `one snapshot per trade date before calling reconcileDays.`,
+      );
+    }
+
     // The interval is (previousDate, tradeDate] — half-open at the start, so a
     // trade is counted exactly once, and closed at the end. Snapshot series
     // have gaps (weekends, holidays), and a trade closing inside a gap belongs
