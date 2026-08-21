@@ -27,11 +27,18 @@ CRED_PATTERNS=(
   'eyJ[A-Za-z0-9_-]{20,}\.'                 # a JWT: header.payload
   'sb_secret_[A-Za-z0-9_-]{16,}'            # Supabase secret key
   'sbp_[A-Za-z0-9]{40,}'                    # Supabase personal token
-  'service_role[[:space:]]*[:=][[:space:]]*[A-Za-z0-9]'  # an assigned service key
+  # A service key actually assigned to something. Requires a key-shaped value:
+  # "service_role:INSERT" in a grant assertion is not a credential.
+  'service_role[[:space:]]*[:=][[:space:]]*.{0,3}[A-Za-z0-9_-]{20,}'
   '-----BEGIN [A-Z ]*PRIVATE KEY-----'
-  'postgres://[^:]*:[^@]*@'                   # a DSN carrying a password
-  'postgresql://[^:]*:[^@]*@'
 )
+
+# A DSN carrying a password, but only when it points somewhere real. The local
+# Supabase default is postgres:postgres@127.0.0.1 and appears in every dev doc
+# this project will ever write — flagging it trains people to ignore this check,
+# which is how a security check dies.
+DSN_PATTERN='postgres(ql)?://[^:/@[:space:]]*:[^@[:space:]]*@'
+DSN_LOCAL_HOSTS='@(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|db|postgres|host\.docker\.internal)(:[0-9]+)?[/[:space:]"'"'"']'
 
 # Identifiers that would tie this public repository to a real account. The MT5
 # number and Supabase project ref are the ones that matter; the rest are
@@ -77,6 +84,13 @@ while IFS= read -r f; do
       report "credential" "$f  (matched /$p/)"
     fi
   done
+
+  # A remote DSN with a password. Local hosts are excluded by line, not by
+  # file, so a real remote DSN sitting beside a local one is still caught.
+  if grep -E "$DSN_PATTERN" "$f" 2>/dev/null | grep -qvE "$DSN_LOCAL_HOSTS"; then
+    [ "$FAIL" -eq 0 ] && echo "check-secrets: FAILED" && echo
+    report "remote DSN" "$f  (a connection string with a password, non-local host)"
+  fi
   for p in "${IDENTITY_PATTERNS[@]}"; do
     if grep -qE "$p" "$f" 2>/dev/null; then
       [ "$FAIL" -eq 0 ] && echo "check-secrets: FAILED" && echo
