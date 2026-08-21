@@ -1,5 +1,6 @@
 import {
   DEFAULT_SIZES,
+  flattenParams,
   hrefWith,
   paginate,
   parseTableState,
@@ -229,5 +230,16 @@ describe("paginate", () => {
   // Mutation caught: pageCount 0 for an empty table, which renders "Page 1 of 0".
   it("reports one page for an empty table", () => {
     expect(paginate([], state)).toEqual({ rows: [], total: 0, page: 1, pageCount: 1 });
+  });
+});
+
+describe("flattenParams", () => {
+  // Mutation caught: taking the LAST value, so appending &t.sort=<anything>
+  // to a link overrides what the page itself put there.
+  it("takes the first value of a repeated parameter and drops undefined", () => {
+    expect(flattenParams({ a: ["1", "2"], b: "x", c: undefined, d: [] })).toEqual({
+      a: "1",
+      b: "x",
+    });
   });
 });

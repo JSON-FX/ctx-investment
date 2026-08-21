@@ -48,6 +48,23 @@ const MAX_TEXT = 64;
 
 export type Params = Readonly<Record<string, string | undefined>>;
 
+/**
+ * Next.js hands searchParams as string | string[] | undefined, because a
+ * parameter can repeat. Every control here writes a parameter once, so a
+ * repeat is either a hand-edited URL or an attack; taking the FIRST value is
+ * the choice that cannot be surprised by an appended duplicate.
+ */
+export function flattenParams(
+  sp: Readonly<Record<string, string | string[] | undefined>>,
+): Params {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(sp)) {
+    if (typeof v === "string") out[k] = v;
+    else if (Array.isArray(v) && typeof v[0] === "string") out[k] = v[0];
+  }
+  return out;
+}
+
 function key(prefix: string, name: string): string {
   return prefix ? `${prefix}.${name}` : name;
 }
