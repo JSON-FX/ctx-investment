@@ -226,13 +226,14 @@ describe("dedupeDeals — offset tolerance (near-miss shifts)", () => {
   });
 
   // Mutation caught: same independent-per-end check as above, from the
-  // other direction — this is the historical bug this module's own doc
-  // comment names: "an earlier version of this same predicate compared the
-  // two gaps independently in absolute terms, which dropped genuine
-  // trades." Both ends individually sit within tolerance of the offset in
-  // ABSOLUTE terms (+10,799,000 and −10,799,000 both have |shift| close to
-  // 10,800,000), but opposite in sign, so this pair's duration is six hours
-  // shorter than its partner's — two genuine trades, not a timezone twin.
+  // other direction. This is exactly the failure mode the predicate's own
+  // inline comment above warns about — "Comparing absolute gaps
+  // independently would also accept a pair shifted +offset at one end and
+  // −offset at the other." Both ends individually sit within tolerance of
+  // the offset in ABSOLUTE terms (+10,799,000 and −10,799,000 both have
+  // |shift| close to 10,800,000), but opposite in sign, so this pair's
+  // duration is six hours shorter than its partner's — two genuine trades,
+  // not a timezone twin.
   it("keeps a pair shifted +offset at the open and −offset at the close, both individually near tolerance", () => {
     const genuine = deal({ ticket: 1000 });
     const twin: ClosedDeal = {
