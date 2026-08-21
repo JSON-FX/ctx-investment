@@ -49,6 +49,12 @@ export type ReadingPlan =
     };
 
 export interface PlanInput {
+  /**
+   * Precondition: whenever `cursor.lastReadingDate` is non-null, this window
+   * must include a snapshot at or before that date. Without one, the earliest
+   * snapshot's balance move cannot be reconciled against anything, and
+   * `planReadings` throws rather than posting past an unclassified day.
+   */
   snapshots: readonly DailySnapshot[];
   deals: readonly ClosedDeal[];
   cursor: ReconcileCursor;
@@ -63,6 +69,22 @@ export function planReadings(input: PlanInput): ReadingPlan {
   const ordered = [...snapshots].sort((a, b) =>
     a.tradeDate < b.tradeDate ? -1 : a.tradeDate > b.tradeDate ? 1 : 0,
   );
+
+  // A window that begins after the cursor cannot reconcile its own first day:
+  // that day's balance move needs the balance at the cursor date, and it is not
+  // here. Advancing anyway posts readings straight past an unclassified capital
+  // event — the exact loss the interlock exists to prevent. The natural caller
+  // query `WHERE trade_date > $cursor` produces this window, so it fails loudly
+  // rather than silently dropping the day.
+  const firstDate = ordered[0]!.tradeDate;
+  if (cursor.lastReadingDate !== null && firstDate > cursor.lastReadingDate) {
+    throw new RangeError(
+      `snapshots begin at ${firstDate}, after the cursor at ${cursor.lastReadingDate}. ` +
+        `The window must include a snapshot at or before the cursor date, or the ` +
+        `first day's balance move cannot be reconciled.`,
+    );
+  }
+
   const equityByDate = new Map(ordered.map((s) => [s.tradeDate, s.equityCloseCents]));
 
   const { kept } = dedupeDeals(deals, brokerOffsetHours);

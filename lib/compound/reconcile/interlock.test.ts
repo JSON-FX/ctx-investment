@@ -109,6 +109,23 @@ describe("planReadings — a clean run", () => {
     if (plan.kind !== "advance") throw new Error("expected advance");
     expect(plan.readings.map((r) => r.occurredOn)).toEqual(["2026-05-04"]);
   });
+
+  it("sorts the window, so input order does not change the plan", () => {
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [
+        snap("2026-05-04", 102_500n),
+        snap("2026-05-02", 100_000n),
+        snap("2026-05-03", 101_000n),
+      ],
+      deals: [closed("2026-05-03T10:00:00Z", 1_000n), closed("2026-05-04T10:00:00Z", 1_500n)],
+      cursor: { lastReadingDate: null },
+    });
+    if (plan.kind !== "advance") throw new Error("expected advance");
+    expect(plan.readings.map((r) => r.occurredOn)).toEqual([
+      "2026-05-02", "2026-05-03", "2026-05-04",
+    ]);
+  });
 });
 
 describe("planReadings — THE INTERLOCK", () => {
@@ -123,6 +140,7 @@ describe("planReadings — THE INTERLOCK", () => {
   const deals = [
     closed("2026-06-23T10:00:00Z", 1_000n),
     closed("2026-06-24T10:00:00Z", 1_000n),
+    closed("2026-06-25T10:00:00Z", 1_000n),
     closed("2026-06-26T10:00:00Z", 1_000n),
     closed("2026-06-27T10:00:00Z", 1_000n),
   ];
@@ -141,8 +159,8 @@ describe("planReadings — THE INTERLOCK", () => {
     expect(plan.candidate.tradeDate).toBe("2026-06-25");
     expect(plan.candidate.previousDate).toBe("2026-06-24");
     expect(plan.candidate.balanceDeltaCents).toBe(31_000n);
-    expect(plan.candidate.explainedCents).toBe(0n);
-    expect(plan.candidate.unexplainedCents).toBe(31_000n);
+    expect(plan.candidate.explainedCents).toBe(1_000n);
+    expect(plan.candidate.unexplainedCents).toBe(30_000n);
   });
 
   it("posts every day up to the one before, and NOT ONE DAY MORE", () => {
@@ -202,5 +220,39 @@ describe("planReadings — dedupe is applied", () => {
       cursor: { lastReadingDate: null },
     });
     expect(plan.kind).toBe("advance");
+  });
+});
+
+describe("planReadings — the window must reach back to the cursor", () => {
+  it("refuses a window that begins after the cursor", () => {
+    expect(() =>
+      planReadings({
+        ...BASE,
+        snapshots: [snap("2026-06-25", 133_000n), snap("2026-06-26", 134_000n)],
+        deals: [],
+        cursor: { lastReadingDate: "2026-06-24" },
+      }),
+    ).toThrow(/begin at 2026-06-25, after the cursor at 2026-06-24/);
+  });
+
+  it("accepts a window that starts exactly at the cursor", () => {
+    const plan = planReadings({
+      ...BASE,
+      snapshots: [snap("2026-06-24", 102_000n), snap("2026-06-25", 103_000n)],
+      deals: [closed("2026-06-25T10:00:00Z", 1_000n)],
+      cursor: { lastReadingDate: "2026-06-24" },
+    });
+    expect(plan.kind).toBe("advance");
+  });
+
+  it("does not refuse when the cursor is empty", () => {
+    expect(() =>
+      planReadings({
+        ...BASE,
+        snapshots: [snap("2026-06-25", 133_000n)],
+        deals: [],
+        cursor: { lastReadingDate: null },
+      }),
+    ).not.toThrow();
   });
 });
