@@ -5,14 +5,11 @@
  * a bigint, and a JSON number above 2^53 is not the number you sent. pg's
  * parameter binding takes the string and Postgres casts it to bigint exactly.
  *
- * BOOTSTRAPPED FOR TASK 13: this file and its migration are plan 4's Task 12
- * deliverable (docs/superpowers/plans/2026-08-21-compound-desk.md, ~line
- * 8001). At the time Task 13 was built, `.worktrees/invest` (feat/desk-invest)
- * had no commits yet. Task 13's own db-test fixtures (write-payout.db.test.ts)
- * need a funded account, so this is a verbatim transcription of the plan's
- * reference source used ONLY to unblock that fixture — Task 13 does not
- * otherwise touch deposits. Reconcile with whatever Task 12 actually ships
- * once feat/desk-invest merges.
+ * This writer stores the amount that was deposited — an INPUT. It does not
+ * compute or store how many units that bought: engine/replay.ts's fold()
+ * derives that by replaying, at whatever NAV is prevailing when the entry is
+ * folded, which is what keeps a deposit from being able to disagree with the
+ * engine after any change to it (section 6.1).
  */
 import type { Cents } from "@/lib/compound/engine/money";
 import type { Queryable } from "./types";
@@ -28,10 +25,15 @@ export interface CommitDepositInput {
   actorUserId: string;
 }
 
+export interface CommitDepositResult {
+  ledgerEntryId: number;
+  seq: number;
+}
+
 export async function commitDeposit(
   c: Queryable,
   input: CommitDepositInput,
-): Promise<{ ledgerEntryId: number; seq: number }> {
+): Promise<CommitDepositResult> {
   if (input.amountCents <= 0n) {
     throw new RangeError(`a deposit must be positive, got ${input.amountCents}`);
   }
@@ -40,8 +42,10 @@ export async function commitDeposit(
     [input.accountId, input.holderId, input.occurredOn,
      input.amountCents.toString(), input.note ?? "", input.actorUserId],
   );
+  const raw = rows[0]?.result;
+  if (!raw) throw new Error("compound_commit_deposit returned no row");
   return {
-    ledgerEntryId: toId(rows[0]!.result.ledger_entry_id, "compound_commit_deposit.ledger_entry_id"),
-    seq: toId(rows[0]!.result.seq, "compound_commit_deposit.seq"),
+    ledgerEntryId: toId(raw.ledger_entry_id, "compound_commit_deposit.ledger_entry_id"),
+    seq: toId(raw.seq, "compound_commit_deposit.seq"),
   };
 }

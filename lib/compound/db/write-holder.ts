@@ -2,14 +2,11 @@
  * Adding a holder. Terms only — no ledger entry, because joining and funding
  * are separate events and only the second one moves money.
  *
- * BOOTSTRAPPED FOR TASK 13: this file and its migration are plan 4's Task 12
- * deliverable (docs/superpowers/plans/2026-08-21-compound-desk.md, ~line
- * 7813). At the time Task 13 was built, `.worktrees/invest` (feat/desk-invest)
- * had no commits yet. Task 13's own db-test fixtures (write-payout.db.test.ts)
- * need a funded account, which needs a holder, so this is a verbatim
- * transcription of the plan's reference source used ONLY to unblock that
- * fixture — Task 13 does not otherwise touch holder creation. Reconcile with
- * whatever Task 12 actually ships once feat/desk-invest merges.
+ * compound_holder stores no balance columns by design (section 6.1): units
+ * and cost basis are derived by folding the ledger, never stored here. A
+ * holder this function creates starts with no units and no value until a
+ * deposit is recorded for them — that absence is not a special "zero" case,
+ * it is what every holder looks like before their first deposit.
  */
 import type { Queryable } from "./types";
 import { toId } from "./sql";
