@@ -14,18 +14,42 @@
 // everywhere, not just on whichever machine happens to run it.
 //
 // Do not "simplify" this back to UTC or remove it — that reintroduces the
-// exact blind spot this comment describes.
+// exact blind spot this comment describes. It stays at module scope so it is
+// set before either project below is constructed.
 process.env.TZ = "Asia/Manila";
 
 /** @type {import('jest').Config} */
-export default {
+const shared = {
   preset: "ts-jest",
-  testEnvironment: "node",
-  roots: ["<rootDir>/lib"],
   moduleNameMapper: { "^@/(.*)$": "<rootDir>/$1" },
   transform: {
-    "^.+\\.tsx?$": ["ts-jest", { tsconfig: { target: "ES2022", module: "CommonJS" } }],
+    "^.+\\.tsx?$": [
+      "ts-jest",
+      { tsconfig: { target: "ES2022", module: "CommonJS", jsx: "react-jsx" } },
+    ],
   },
-  // Integration tests need a live Postgres. pnpm test must stay runnable offline.
-  testPathIgnorePatterns: ["/node_modules/", "\\.db\\.test\\.ts$"],
+};
+
+export default {
+  projects: [
+    {
+      ...shared,
+      displayName: "unit",
+      testEnvironment: "node",
+      roots: ["<rootDir>/lib"],
+      testPathIgnorePatterns: [
+        "/node_modules/",
+        "\\.db\\.test\\.ts$",
+        "<rootDir>/lib/compound/ui/",
+      ],
+    },
+    {
+      ...shared,
+      displayName: "ui",
+      testEnvironment: "jsdom",
+      roots: ["<rootDir>/lib/compound/ui"],
+      testPathIgnorePatterns: ["/node_modules/", "\\.db\\.test\\.ts$"],
+      setupFilesAfterEnv: ["<rootDir>/jest.setup.ui.ts"],
+    },
+  ],
 };
