@@ -5439,3 +5439,497 @@ MSG
 )"
 ```
 
+---
+
+### Task 9: `/a/[id]/ledger` — chronological activity
+
+Spec §7: "deposits, payouts, readings (R3)". Every row carries the state the pool was in *after* that entry, derived by folding the prefix (decision D-E).
+
+Two facts the spec insists on and this page is the only place that shows both: **`occurred_on` is a broker-server date and `recorded_at` is UTC** (§4), and they are different facts that both matter in a dispute. Plan 3's `LedgerEntry` carries neither `recorded_at` nor `note`, on purpose — `fold` must not be able to see them. So this task adds a metadata reader alongside, and joins the two in the presenter.
+
+**No reversal control.** Invariant 5 says corrections are reversing entries, and this page renders a voided pair correctly if one exists. Spec §11's coverage list puts E5 outside v1, so nothing here offers a button that creates one. The ledger is append-only and the screen offers no edit and no delete, which is §9's guarantee made visible.
+
+**Files:**
+- Create: `lib/compound/db/ledger-meta.ts`
+- Create: `lib/compound/ui/ledger-table.tsx`
+- Create: `app/a/[id]/ledger/page.tsx`
+- Test: `lib/compound/db/ledger-meta.db.test.ts`
+- Test: `lib/compound/ui/ledger-table.test.tsx`
+
+**Interfaces:**
+- Consumes: `ledgerSteps`, `LedgerStep` from `@/lib/compound/present/derive`; `navTimes1e4`, `totalsOf`
+- Produces:
+  - `interface LedgerEntryMeta { id: number; recordedAt: string; note: string | null; createdBy: string | null }`
+  - `listLedgerMeta(c: Queryable, accountId: number): Promise<LedgerEntryMeta[]>`
+  - `LedgerTable` component
+
+- [ ] **Step 1: Create `lib/compound/db/ledger-meta.ts`**
+
+```typescript
+/**
+ * The columns of compound_ledger_entry that fold() must never see.
+ *
+ * note, recorded_at and created_by are provenance. They belong on a screen and
+ * in a dispute, and they must not reach the reducer: an entry's effect on the
+ * pool cannot depend on who typed it or when the row was written. Plan 3's
+ * LedgerEntry deliberately omits them, and this reader deliberately returns
+ * nothing else — the two shapes cannot be confused for one another.
+ *
+ * recorded_at is UTC and occurred_on is a broker-server date. Spec section 4
+ * keeps both because they answer different questions: what day the broker says
+ * it happened, and what moment this office wrote it down.
+ */
+import type { Queryable } from "./types";
+import { toId, utcIsoExpr } from "./sql";
+
+export interface LedgerEntryMeta {
+  id: number;
+  /** ISO 8601, UTC. */
+  recordedAt: string;
+  note: string | null;
+  /** public.users id, or null for an entry written by a job. */
+  createdBy: string | null;
+}
+
+export async function listLedgerMeta(
+  c: Queryable,
+  accountId: number,
+): Promise<LedgerEntryMeta[]> {
+  const { rows } = await c.query<{
+    id: string; recorded_at: string; note: string | null; created_by: string | null;
+  }>(
+    `select id, ${utcIsoExpr("recorded_at")} as recorded_at, note, created_by
+       from public.compound_ledger_entry
+      where account_id = $1
+      order by seq asc`,
+    [accountId],
+  );
+  return rows.map((r) => ({
+    id: toId(r.id, "compound_ledger_entry.id"),
+    recordedAt: r.recorded_at,
+    note: r.note,
+    createdBy: r.created_by,
+  }));
+}
+```
+
+- [ ] **Step 2: Create `lib/compound/ui/ledger-table.tsx`**
+
+```tsx
+/**
+ * The ledger, one row per entry, with the pool's state after each one.
+ *
+ * Every "after" figure comes from folding the prefix (decision D-E). It is
+ * O(n^2) and it is the only construction under which this page cannot
+ * disagree with the desk: the last row's state IS fold(everything), by
+ * construction rather than by care.
+ *
+ * The CASH column is the equity delta, not entry.amountCents. For a deposit the
+ * two agree. For a payout they do not — replay.ts recomputes the payout from
+ * quote() and never reads amountCents, so the stored figure is what was asked
+ * for and the delta is what left the account. A ledger that prints the request
+ * where the reader expects the movement is a ledger that will be argued with.
+ *
+ * A reading moves no cash, so its cash cell is a dash rather than a zero. Zero
+ * would claim a movement of nothing happened; a dash says the column does not
+ * apply.
+ */
+import { navTimes1e4 } from "@/lib/compound/engine/nav";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import type { LedgerEntryMeta } from "@/lib/compound/db/ledger-meta";
+import type { LedgerStep } from "@/lib/compound/present/derive";
+import {
+  formatDate, formatNav, formatUnitsDp, formatUtcStamp,
+} from "@/lib/compound/present/format";
+import { DeltaMoney, EmptyState, Money } from "./primitives";
+import { holderHref } from "./routes";
+
+const TYPE_LABELS: Record<string, string> = {
+  deposit: "Deposit",
+  payout: "Payout",
+  exit: "Exit",
+  equity_reading: "Equity reading",
+  adjustment: "Adjustment",
+};
+
+export function LedgerTable({
+  accountId, steps, meta, names, currency,
+}: {
+  accountId: number;
+  steps: LedgerStep[];
+  meta: Map<number, LedgerEntryMeta>;
+  names: Record<number, string>;
+  currency: string;
+}) {
+  if (steps.length === 0) {
+    return (
+      <EmptyState title="No entries yet">
+        Every deposit, payout and equity reading appears here, in the order it was
+        applied. Nothing else moves a figure on this account.
+      </EmptyState>
+    );
+  }
+
+  const voidedBy = new Map<number, number>();
+  for (const s of steps) {
+    if (s.entry.reversesId !== null) voidedBy.set(s.entry.reversesId, s.entry.id);
+  }
+
+  return (
+    <div className="scroller">
+      <table>
+        <caption className="eyebrow">
+          Ledger · {steps.length} {steps.length === 1 ? "entry" : "entries"} ·
+          append-only, ordered by seq
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Seq</th>
+            <th scope="col">Occurred</th>
+            <th scope="col">Type</th>
+            <th scope="col">Holder</th>
+            <th scope="col">Cash</th>
+            <th scope="col">Units</th>
+            <th scope="col">Equity after</th>
+            <th scope="col">Units after</th>
+            <th scope="col">NAV after</th>
+            <th scope="col">Recorded</th>
+          </tr>
+        </thead>
+        <tbody>
+          {steps.map((s) => {
+            const m = meta.get(s.entry.id);
+            const holderId = s.entry.holderId;
+            const reversedBy = voidedBy.get(s.entry.id);
+            return (
+              <tr key={s.entry.id} className={s.voided ? "voided" : ""}>
+                <th scope="row" className="num" style={{ fontWeight: 400 }}>{s.entry.seq}</th>
+                <td className="num">{formatDate(s.entry.occurredOn)}</td>
+                <td>
+                  {TYPE_LABELS[s.entry.type] ?? s.entry.type}
+                  {s.entry.feeSettlement === null ? null : (
+                    <span className="muted"> · fee as {s.entry.feeSettlement}</span>
+                  )}
+                  {s.voided ? (
+                    <span className="muted">
+                      {" "}· voided{reversedBy === undefined ? "" : ` by #${reversedBy}`}
+                    </span>
+                  ) : null}
+                </td>
+                <td>
+                  {holderId === null ? "—" : (
+                    <a href={holderHref(accountId, holderId)}>
+                      {names[holderId] ?? `Holder #${holderId}`}
+                    </a>
+                  )}
+                </td>
+                <td>
+                  {s.entry.type === "equity_reading" || s.equityDelta === 0n
+                    ? <span className="num">—</span>
+                    : <DeltaMoney cents={s.equityDelta} currency={currency} />}
+                </td>
+                <td className="num">
+                  {s.unitsDelta === 0n
+                    ? "—"
+                    : `${s.unitsDelta > 0n ? "+" : "-"}${formatUnitsDp(
+                        s.unitsDelta < 0n ? -s.unitsDelta : s.unitsDelta,
+                      )}`}
+                </td>
+                <td><Money cents={s.after.equityCents} currency={currency} /></td>
+                <td className="num">{formatUnitsDp(s.after.units)}</td>
+                <td className="num">{formatNav(totalsOf(s.after))}</td>
+                <td className="num muted">
+                  {m === undefined ? "—" : formatUtcStamp(m.recordedAt)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="foot" style={{ padding: "14px 16px" }}>
+        The ledger is append-only. There is no edit and no delete on this screen or
+        anywhere else, and none is granted in the database. A correction is a
+        reversing entry, which voids both itself and the entry it reverses.
+      </p>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 3: Create `app/a/[id]/ledger/page.tsx`**
+
+```tsx
+import { withDb } from "@/lib/compound/db/client";
+import { listLedgerMeta } from "@/lib/compound/db/ledger-meta";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadHolderNames, loadLedger, loadSeeds } from "@/lib/compound/load/ledger";
+import { ledgerSteps } from "@/lib/compound/present/derive";
+import { Panel } from "@/lib/compound/ui/primitives";
+import { LedgerTable } from "@/lib/compound/ui/ledger-table";
+
+export const dynamic = "force-dynamic";
+
+export default async function LedgerPage({ params }: { params: Promise<{ id: string }> }) {
+  const account = await requireAccount((await params).id);
+  const [entries, seeds, names, meta] = await Promise.all([
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    loadHolderNames(account.id),
+    withDb((c) => listLedgerMeta(c, account.id)),
+  ]);
+
+  return (
+    <Panel flush>
+      <LedgerTable
+        accountId={account.id}
+        steps={ledgerSteps(entries, seeds)}
+        meta={new Map(meta.map((m) => [m.id, m]))}
+        names={names}
+        currency={account.currency}
+      />
+    </Panel>
+  );
+}
+```
+
+- [ ] **Step 4: Write `lib/compound/ui/ledger-table.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { LedgerEntry } from "@/lib/compound/engine/replay";
+import type { LedgerEntryMeta } from "@/lib/compound/db/ledger-meta";
+import { ledgerSteps } from "@/lib/compound/present/derive";
+import { ADA_ID, GRACE_ID, HOLDER_NAMES, LEDGER, SEEDS } from "@/lib/compound/present/fixture";
+import { LedgerTable } from "./ledger-table";
+
+const META = new Map<number, LedgerEntryMeta>(
+  LEDGER.map((e) => [e.id, {
+    id: e.id,
+    recordedAt: `2026-08-19T1${e.seq}:05:00.000Z`,
+    note: null,
+    createdBy: "00000000-0000-0000-0000-000000000001",
+  }]),
+);
+
+function cellsOf(seq: string): string[] {
+  const row = screen.getByRole("row", { name: new RegExp(`^${seq}\\s`) });
+  return [
+    ...within(row).getAllByRole("rowheader"),
+    ...within(row).getAllByRole("cell"),
+  ].map((c) => c.textContent ?? "");
+}
+
+function renderLedger(entries: readonly LedgerEntry[] = LEDGER, meta = META) {
+  return render(
+    <LedgerTable
+      accountId={7}
+      steps={ledgerSteps(entries, SEEDS)}
+      meta={meta}
+      names={HOLDER_NAMES}
+      currency="USD"
+    />,
+  );
+}
+
+describe("LedgerTable — the running state", () => {
+  beforeEach(() => renderLedger());
+
+  it("renders the genesis deposit at NAV 1.0000", () => {
+    expect(cellsOf("1")).toEqual([
+      "1", "2 Mar 2026", "Deposit", "J. Marsh",
+      "+$25,000.00", "+25,000.0000",
+      "$25,000.00", "25,000.0000", "1.0000",
+      "19 Aug 2026, 11:05 UTC",
+    ]);
+  });
+
+  it("shows a reading moving equity and NAV without moving cash or units", () => {
+    const c = cellsOf("2");
+    expect(c[2]).toBe("Equity reading");
+    expect(c[4]).toBe("—");          // cash: a reading restates, it does not move
+    expect(c[5]).toBe("—");          // units
+    expect(c[6]).toBe("$27,431.19");
+    expect(c[8]).toBe("1.0972");
+  });
+
+  it("issues Ada units at the prevailing NAV, leaving NAV alone", () => {
+    const c = cellsOf("3");
+    expect(c[3]).toBe("Ada Lovelace");
+    expect(c[4]).toBe("+$10,000.00");
+    expect(c[5]).toBe("+9,113.7132");
+    expect(c[8]).toBe("1.0972");     // unchanged from seq 2
+  });
+
+  it("ends on the state the desk shows", () => {
+    const c = cellsOf("6");
+    expect(c[6]).toBe("$55,743.91");
+    expect(c[7]).toBe("40,222.4547");
+    expect(c[8]).toBe("1.3858");
+  });
+
+  it("shows the recorded-at stamp in UTC, distinct from the occurred date", () => {
+    const c = cellsOf("1");
+    expect(c[1]).toBe("2 Mar 2026");                   // broker-server date
+    expect(c[9]).toBe("19 Aug 2026, 11:05 UTC");       // when it was written down
+  });
+});
+
+describe("LedgerTable — a payout", () => {
+  const payout: LedgerEntry = {
+    id: 7, seq: 7, holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+    amountCents: 263_060n, feeSettlement: "units", splitBpsApplied: 4000, reversesId: null,
+  };
+
+  it("shows the cash that LEFT, not the amount that was requested", () => {
+    // The entry says 2630.60. 1578.36 left; the fee stayed in as units.
+    renderLedger([...LEDGER, payout]);
+    const c = cellsOf("7");
+    expect(c[4]).toBe("-$1,578.36");
+    expect(c[4]).not.toBe("-$2,630.60");
+  });
+
+  it("nets the unit movement across the redemption and the fee units", () => {
+    renderLedger([...LEDGER, payout]);
+    // Ada surrenders 1,898.1300; the manager is issued 759.2520. Net -1,138.8780.
+    expect(cellsOf("7")[5]).toBe("-1,138.8780");
+  });
+
+  it("says how the fee settled", () => {
+    renderLedger([...LEDGER, payout]);
+    expect(cellsOf("7")[2]).toContain("fee as units");
+  });
+
+  it("leaves NAV where it was", () => {
+    renderLedger([...LEDGER, payout]);
+    expect(cellsOf("7")[8]).toBe("1.3858");
+  });
+});
+
+describe("LedgerTable — a reversal", () => {
+  const reversal: LedgerEntry = {
+    id: 7, seq: 7, holderId: GRACE_ID, occurredOn: "2026-08-20", type: "deposit",
+    amountCents: -750_000n, feeSettlement: null, splitBpsApplied: null, reversesId: 5,
+  };
+
+  it("strikes both entries and names which one voided which", () => {
+    renderLedger([...LEDGER, reversal]);
+    expect(cellsOf("5")[2]).toContain("voided by #7");
+    expect(cellsOf("7")[2]).toContain("voided");
+    expect(screen.getByRole("row", { name: /^5\s/ })).toHaveClass("voided");
+  });
+
+  it("shows the state after a voided entry as if it never applied", () => {
+    renderLedger([...LEDGER, reversal]);
+    // Grace's 7,500 deposit is voided, so equity at seq 5 is still 41,883.07.
+    expect(cellsOf("5")[6]).toBe("$41,883.07");
+  });
+});
+
+describe("LedgerTable — provenance and safety", () => {
+  it("offers no edit and no delete", () => {
+    renderLedger();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("link", { name: /edit|delete|void|reverse/i })).toBeNull();
+  });
+
+  it("says the ledger is append-only in words, not only by omission", () => {
+    renderLedger();
+    expect(screen.getByText(/append-only\. There is no edit and no delete/))
+      .toBeInTheDocument();
+  });
+
+  it("renders a dash rather than crashing when metadata is missing", () => {
+    renderLedger(LEDGER, new Map());
+    expect(cellsOf("1")[9]).toBe("—");
+  });
+
+  it("says what the page is for when there is nothing on it", () => {
+    render(
+      <LedgerTable accountId={7} steps={[]} meta={new Map()} names={{}} currency="USD" />,
+    );
+    expect(screen.getByText("No entries yet")).toBeInTheDocument();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+});
+```
+
+**How these bite.** Print `entry.amountCents` in the cash column and the payout test reads `-$2,630.60`. Compute the after-state with a running total instead of a prefix fold and the reversal test's `$41,883.07` becomes `$49,383.07`, because a running total has no way to un-apply an entry it already added. Show `$0.00` instead of `—` for a reading's cash and one assertion names it. Add a reverse button and the append-only test fails.
+
+- [ ] **Step 5: Write `lib/compound/db/ledger-meta.db.test.ts`**
+
+```typescript
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { listLedgerMeta } from "@/lib/compound/db/ledger-meta";
+import { seedTwoAccounts, seedLedger } from "@/lib/compound/db/test-harness";
+
+const rollback = (e: Error) => { if (e.message !== "rollback") throw e; };
+
+describe("listLedgerMeta", () => {
+  it("returns entries in seq order, not id order", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      // seedLedger writes ids and seqs that disagree, so an order-by-id bug
+      // is visible. If plan 3's harness does not do that, make it.
+      const ids = await seedLedger(c, mine.accountId);
+      const meta = await listLedgerMeta(c, mine.accountId);
+      expect(meta.map((m) => m.id)).toEqual(ids.inSeqOrder);
+      expect(meta.map((m) => m.id)).not.toEqual([...ids.inSeqOrder].sort((a, b) => a - b));
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("returns recorded_at as a UTC ISO string, not a Date", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await seedLedger(c, mine.accountId);
+      const [first] = await listLedgerMeta(c, mine.accountId);
+      expect(typeof first!.recordedAt).toBe("string");
+      expect(first!.recordedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("returns only this account's entries", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      await seedLedger(c, mine.accountId);
+      await seedLedger(c, theirs.accountId);
+      const mineMeta = await listLedgerMeta(c, mine.accountId);
+      const theirsMeta = await listLedgerMeta(c, theirs.accountId);
+      expect(mineMeta.length).toBeGreaterThan(0);
+      const overlap = mineMeta.filter((m) => theirsMeta.some((t) => t.id === m.id));
+      expect(overlap).toEqual([]);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+```
+
+> **`seedLedger` may not exist in plan 3's harness.** If it does not, add it there rather than here — Tasks 12, 13 and 14's integration tests all need one, and three inline seeders will drift. It must write `id` order and `seq` order that **disagree**, or the seq-ordering assertion above cannot fail.
+
+- [ ] **Step 6: Run the gates and prove two probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `LedgerTable`, print `s.entry.amountCents` in the cash column. Expect exactly the payout cash assertion to fail — the six deposit and reading rows still pass, which is why the fixture has a payout in it.
+2. In `listLedgerMeta`, change `order by seq asc` to `order by id asc`. Expect the seq-order integration test to fail.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the ledger page, with the pool's state after every entry
+
+Each row's after-state comes from folding the prefix, so this page cannot
+disagree with the desk. The cash column is the equity delta rather than the
+stored amount, because replay recomputes a payout and never reads that field.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
