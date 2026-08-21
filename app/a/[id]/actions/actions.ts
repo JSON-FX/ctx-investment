@@ -16,6 +16,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { withDbTransaction } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
+import { classifyCandidate } from "@/lib/compound/db/write-classify";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadPoolState } from "@/lib/compound/load/ledger";
@@ -24,7 +25,7 @@ import { encodeDroppedDeals, planFor } from "@/lib/compound/load/reconcile";
 import { fingerprintOf } from "@/lib/compound/present/derive";
 import { explainCommitError, isNextControlFlow } from "@/lib/compound/present/errors";
 import { fingerprintFromFields, fingerprintMismatch } from "@/lib/compound/present/fingerprint";
-import { deskHref, readingHref } from "@/lib/compound/ui/routes";
+import { classifyHref, deskHref, readingHref, reviewHref } from "@/lib/compound/ui/routes";
 
 /**
  * Re-derive, compare, and hand back the sentence to show — or null to
@@ -142,6 +143,70 @@ export async function postReading(formData: FormData) {
     );
     revalidatePath(deskHref(account.id), "layout");
     redirect(deskHref(account.id));
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+
+/**
+ * Classifying one capital-event candidate. Decision D-J: deposit, match an
+ * existing entry, or not-a-capital-event with a required note — and no
+ * fourth option, because a negative unexplained move that is not an
+ * already-recorded payout is a partial withdrawal (spec §12, P6) and this
+ * action has no way to record one correctly.
+ *
+ * classifyCandidate re-checks everything this action checks (outcome shape,
+ * positive amount, note-on-ignore) inside its own transaction — the checks
+ * here are a fast local refusal with a form-shaped error message, not the
+ * authority. What classifyCandidate additionally guarantees, and this
+ * action does not need to: the candidate is still 'pending' (CX203) and the
+ * account has not moved since the receipt (CX204), both re-verified under
+ * the row lock, atomically with the write.
+ */
+export async function classify(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const candidateId = Number(formData.get("candidateId"));
+  const back = classifyHref(account.id, candidateId);
+
+  const stale = await staleness(account.id, formData);
+  if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
+  const shown = fingerprintFromFields((k) => {
+    const v = formData.get(k);
+    return typeof v === "string" ? v : null;
+  })!;
+
+  const outcome = String(formData.get("outcome"));
+  if (outcome !== "deposit" && outcome !== "match" && outcome !== "ignore") {
+    redirect(`${back}?error=${encodeURIComponent("Choose what this was before classifying it.")}`);
+  }
+
+  let amountCents: bigint | null = null;
+  if (outcome === "deposit") {
+    try {
+      amountCents = centsFromDecimal(String(formData.get("amount")));
+    } catch {
+      redirect(`${back}?error=${encodeURIComponent("That is not an amount. Use digits and at most two decimal places.")}`);
+    }
+  }
+
+  try {
+    await withDbTransaction((c) =>
+      classifyCandidate(c, {
+        accountId: account.id,
+        candidateId,
+        outcome: outcome as "deposit" | "match" | "ignore",
+        holderId: outcome === "deposit" ? Number(formData.get("holderId")) : null,
+        amountCents,
+        matchEntryId: outcome === "match" ? Number(formData.get("matchEntryId")) : null,
+        note: String(formData.get("note") ?? "") || null,
+        expectedSeq: shown.seq,
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(reviewHref(account.id));
   } catch (e) {
     if (isNextControlFlow(e)) throw e;
     redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
