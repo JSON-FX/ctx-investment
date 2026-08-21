@@ -183,3 +183,38 @@ describe("reconcileDays — the tolerance boundary", () => {
     expect(() => reconcileDays([], [], -1n)).toThrow(/tolerance/);
   });
 });
+
+describe("reconcileDays — duplicate trade dates (C1)", () => {
+  it("rejects two snapshot rows that both claim the same tradeDate", () => {
+    // The exact C1 reproduction: two rows both dated 2026-06-25. Without a
+    // guard this silently produces a zero-width (previousDate === tradeDate)
+    // interval with explainedCents always 0n — nonsense, not a diagnosis.
+    expect(() =>
+      reconcileDays(
+        [snap("2026-06-25", 102_000n), snap("2026-06-25", 133_000n), snap("2026-06-26", 134_000n)],
+        [],
+        0n,
+      ),
+    ).toThrow(/before calling reconcileDays/);
+  });
+
+  it("names the offending date in the error", () => {
+    expect(() =>
+      reconcileDays(
+        [snap("2026-06-25", 102_000n), snap("2026-06-25", 133_000n), snap("2026-06-26", 134_000n)],
+        [],
+        0n,
+      ),
+    ).toThrow(/2026-06-25/);
+  });
+
+  it("still works when the duplicate is not the first pair", () => {
+    expect(() =>
+      reconcileDays(
+        [snap("2026-06-24", 100_000n), snap("2026-06-25", 102_000n), snap("2026-06-25", 133_000n)],
+        [],
+        0n,
+      ),
+    ).toThrow(/2026-06-25/);
+  });
+});
