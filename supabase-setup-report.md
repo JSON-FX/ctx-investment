@@ -372,6 +372,54 @@ output above. Worth remembering for the `compound_*` migration too: RLS
 policies alone will not be enough, `service_role` needs its `GRANT SELECT`
 stated explicitly, same as any other role.
 
+**Follow-up from the plan-authoring agent, worth recording here too: default
+grants include `TRUNCATE`, and `revoke update` on a fresh table is a
+no-op.** I had already captured the evidence for this without realizing its
+second implication — the `role_table_grants` query I ran while chasing the
+gotcha above returned exactly this, for `public.deals` before I added any
+explicit grant:
+
+```
+    grantee    | privilege_type 
+---------------+----------------
+ postgres      | INSERT
+ postgres      | SELECT
+ postgres      | UPDATE
+ postgres      | DELETE
+ postgres      | TRUNCATE
+ postgres      | REFERENCES
+ postgres      | TRIGGER
+ anon          | TRUNCATE
+ anon          | REFERENCES
+ anon          | TRIGGER
+ authenticated | TRUNCATE
+ authenticated | REFERENCES
+ authenticated | TRIGGER
+ service_role  | TRUNCATE
+ service_role  | REFERENCES
+ service_role  | TRIGGER
+(16 rows)
+```
+
+`anon`/`authenticated`/`service_role` each start with exactly `TRUNCATE`,
+`REFERENCES`, `TRIGGER` on any new table in this schema — never `UPDATE`,
+`DELETE`, `SELECT`, or `INSERT`. Two consequences the plan-authoring agent
+caught that I hadn't drawn out: since `UPDATE` was never granted to begin
+with, a `revoke update on <table> from service_role` on a freshly created
+table is a **local no-op** — a test that revokes `UPDATE` and then asserts
+an update fails will pass whether or not the revoke did anything, which is
+exactly backwards for a test meant to prove a protection exists. And
+because `TRUNCATE` *is* in that default set, a table trying to be
+append-only by revoking only `UPDATE`/`DELETE` is still truncatable by
+`service_role` unless `TRUNCATE` is revoked too, or blocked some other way.
+Their plan works around this for `compound_ledger_entry` with
+`before update or delete or truncate` triggers that refuse unconditionally
+(including for `postgres`), rather than relying on grants at all, plus a
+test that grants `UPDATE` back explicitly and confirms the trigger still
+refuses. Recording it here since it's the same class of surprise as the
+`SELECT` gotcha above and applies to any table in this project, not just
+theirs.
+
 ## Note on `supabase projects list`
 
 While confirming this worktree had no remote link (`supabase/.temp` has no
