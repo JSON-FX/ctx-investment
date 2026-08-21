@@ -37,6 +37,12 @@ function closed(closeTime: string, netCents: bigint): ClosedDeal {
 const BASE = {
   brokerOffsetHours: 3,
   toleranceCents: 0n,
+  // Every existing test in this file predates classification. Spelled out
+  // explicitly, not omitted, so a reader never has to guess whether "no
+  // classifiedDates" means "none" or "forgotten" — same reasoning as
+  // droppedDeals on ReadingPlan. Tests about classifiedDates itself override
+  // this below.
+  classifiedDates: [] as readonly string[],
 };
 
 describe("planReadings — nothing to do", () => {
@@ -199,6 +205,132 @@ describe("planReadings — THE INTERLOCK", () => {
     });
     if (plan.kind !== "halt") throw new Error("expected halt");
     expect(plan.candidate.tradeDate).toBe("2026-06-25");
+  });
+});
+
+describe("planReadings — classifiedDates (the classified-cursor deadlock)", () => {
+  // Resumes exactly where "planReadings — THE INTERLOCK" left off: that
+  // block's own fixture halts with readings through 06-24 and
+  // newCursorDate "2026-06-24" — the state a real refreshReadings leaves in
+  // the database after the first refresh. This block starts from THAT
+  // cursor, the same way planFor's second call would after a manager
+  // classifies 06-25, and proves the run can now get past it.
+  const snapshots = [
+    snap("2026-06-22", 100_000n, 100_000n),
+    snap("2026-06-23", 101_000n, 101_000n),
+    snap("2026-06-24", 102_000n, 102_000n),
+    snap("2026-06-25", 133_000n, 133_000n), // +31,000 with no trade — the deposit
+    snap("2026-06-26", 134_000n, 134_000n),
+    snap("2026-06-27", 135_000n, 135_000n),
+  ];
+  const deals = [
+    closed("2026-06-23T10:00:00Z", 1_000n),
+    closed("2026-06-24T10:00:00Z", 1_000n),
+    closed("2026-06-25T10:00:00Z", 1_000n),
+    closed("2026-06-26T10:00:00Z", 1_000n),
+    closed("2026-06-27T10:00:00Z", 1_000n),
+  ];
+  const resumedFromHalt = { cursor: { lastReadingDate: "2026-06-24" } };
+
+  it("without classifiedDates, resuming from the halt cursor halts on the SAME day forever — this is the deadlock", () => {
+    // The reproduction, exactly: refresh already happened once (the cursor
+    // is at 06-24, from THE INTERLOCK's own "stays halted on the same day
+    // when re-run after posting" test). Running again with nothing new
+    // classified must halt again, on the same candidate — proving the
+    // deadlock is real before the rest of this block proves the fix.
+    const plan = planReadings({ ...BASE, snapshots, deals, ...resumedFromHalt });
+    expect(plan.kind).toBe("halt");
+    if (plan.kind !== "halt") throw new Error("expected halt");
+    expect(plan.candidate.tradeDate).toBe("2026-06-25");
+    expect(plan.readings).toEqual([]);
+  });
+
+  it("posts the classified day as an ordinary reading and advances past it", () => {
+    const plan = planReadings({
+      ...BASE, snapshots, deals, ...resumedFromHalt,
+      classifiedDates: ["2026-06-25"],
+    });
+    expect(plan.kind).toBe("advance");
+    if (plan.kind !== "advance") throw new Error("expected advance");
+    expect(plan.readings.map((r) => r.occurredOn)).toEqual([
+      "2026-06-25", "2026-06-26", "2026-06-27",
+    ]);
+    expect(plan.newCursorDate).toBe("2026-06-27");
+  });
+
+  it("posts the classified day's own equity, not a placeholder or zero", () => {
+    const plan = planReadings({
+      ...BASE, snapshots, deals, ...resumedFromHalt,
+      classifiedDates: ["2026-06-25"],
+    });
+    if (plan.kind !== "advance") throw new Error("expected advance");
+    expect(plan.readings[0]).toEqual({ occurredOn: "2026-06-25", equityCents: 133_000n });
+  });
+
+  it("classifying a DIFFERENT date does not unfreeze this one", () => {
+    const plan = planReadings({
+      ...BASE, snapshots, deals, ...resumedFromHalt,
+      classifiedDates: ["2026-06-26"],
+    });
+    expect(plan.kind).toBe("halt");
+    if (plan.kind !== "halt") throw new Error("expected halt");
+    expect(plan.candidate.tradeDate).toBe("2026-06-25");
+  });
+
+  describe("a second, later capital event nothing has classified yet", () => {
+    // Adversarial variant 1 (report): a classified event followed by a
+    // LATER unclassified one must halt at the later one, not sail past it.
+    // 06-28 is a second, independent +40,000 move with no covering deal —
+    // 135,000 -> 175,000 — layered on top of the already-classified 06-25.
+    const withSecondEvent = [...snapshots, snap("2026-06-28", 175_000n, 175_000n)];
+
+    it("halts at the later, unclassified day — classifying 06-25 does not also excuse 06-28", () => {
+      const plan = planReadings({
+        ...BASE, deals, ...resumedFromHalt,
+        snapshots: withSecondEvent,
+        classifiedDates: ["2026-06-25"],
+      });
+      expect(plan.kind).toBe("halt");
+      if (plan.kind !== "halt") throw new Error("expected halt");
+      expect(plan.candidate.tradeDate).toBe("2026-06-28");
+      // 06-25 through 06-27 still post — classifying 06-25 does its job —
+      // NOT ONE reading lands on or after the still-unclassified 06-28.
+      expect(plan.readings.map((r) => r.occurredOn)).toEqual([
+        "2026-06-25", "2026-06-26", "2026-06-27",
+      ]);
+      expect(plan.newCursorDate).toBe("2026-06-27");
+    });
+
+    it("two candidates, the earlier classified and the later still pending, does not skip the pending one", () => {
+      // Restated from the run's-eye view rather than the fixture's: exactly
+      // the shape a real database leaves behind after two halts and only
+      // one classification — classifiedDates carries only the earlier date,
+      // the later candidate is simply absent from it, same as a genuinely
+      // pending row would be.
+      const plan = planReadings({
+        ...BASE, deals, ...resumedFromHalt,
+        snapshots: withSecondEvent,
+        classifiedDates: ["2026-06-25"], // 06-28 deliberately NOT included
+      });
+      if (plan.kind !== "halt") throw new Error("expected halt");
+      for (const r of plan.readings) {
+        expect(r.occurredOn < "2026-06-28").toBe(true);
+      }
+      expect(plan.candidate.tradeDate).toBe("2026-06-28");
+    });
+
+    it("classifying BOTH dates lets the run advance past both", () => {
+      const plan = planReadings({
+        ...BASE, deals, ...resumedFromHalt,
+        snapshots: withSecondEvent,
+        classifiedDates: ["2026-06-25", "2026-06-28"],
+      });
+      expect(plan.kind).toBe("advance");
+      if (plan.kind !== "advance") throw new Error("expected advance");
+      expect(plan.readings.map((r) => r.occurredOn)).toEqual([
+        "2026-06-25", "2026-06-26", "2026-06-27", "2026-06-28",
+      ]);
+    });
   });
 });
 

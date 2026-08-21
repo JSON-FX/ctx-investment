@@ -74,11 +74,38 @@ export interface PlanInput {
   cursor: ReconcileCursor;
   brokerOffsetHours: number;
   toleranceCents: Cents;
+  /**
+   * Trade dates (YYYY-MM-DD) whose capital-event candidate a manager has
+   * already resolved — via compound_classify_candidate, as a deposit, a
+   * match against an existing entry, or an explicit "not a capital event"
+   * with a note. Every one of those is a human decision, recorded either in
+   * the ledger (deposit/match) or in the candidate's own audit trail
+   * (ignore), so the day is no longer UNCLASSIFIED — the interlock's actual
+   * promise, per spec §5.3, is about unclassified events, not unexplained
+   * ones. A day in this set has already had its day in front of a human, and
+   * reconcileDays' fresh recomputation of the same old balance move is not
+   * new information that should halt the run a second time.
+   *
+   * A day whose date is in this set is posted as an ordinary reading, same
+   * as an explained day, instead of being raised as a (duplicate) candidate.
+   * It does NOT move the cursor by itself — planReadings still walks every
+   * day in order, so a later, still-pending candidate on a different date
+   * halts exactly where it always did. This is what closes the deadlock in
+   * the design spec's "cursor cannot advance past a classified event"
+   * report: compound_classify_candidate deliberately never touches the
+   * cursor (it can only ever affect the ONE candidate row it is given), and
+   * compound_commit_reading_plan deliberately never moves the cursor with no
+   * readings to post. Something has to tell planReadings the day is no
+   * longer unexplained, or nothing ever does — this is that something.
+   */
+  classifiedDates: readonly string[];
 }
 
 export function planReadings(input: PlanInput): ReadingPlan {
-  const { snapshots, deals, cursor, brokerOffsetHours, toleranceCents } = input;
+  const { snapshots, deals, cursor, brokerOffsetHours, toleranceCents, classifiedDates } = input;
   if (snapshots.length === 0) return { kind: "idle", droppedDeals: [] };
+
+  const classified = new Set(classifiedDates);
 
   const ordered = [...snapshots].sort((a, b) =>
     a.tradeDate < b.tradeDate ? -1 : a.tradeDate > b.tradeDate ? 1 : 0,
@@ -139,7 +166,14 @@ export function planReadings(input: PlanInput): ReadingPlan {
   for (const day of days) {
     if (day.tradeDate <= cursorDate) continue;
 
-    if (!day.isExplained) {
+    // An unexplained move only halts the run when it is ALSO unclassified.
+    // A day a manager already resolved (classified.has) is explained by
+    // that decision, not by this recomputation — post it like any other
+    // day and keep walking. This does not skip ahead: the loop still visits
+    // every day in order, so a DIFFERENT, still-pending day right after this
+    // one is still evaluated on its own and still halts there if it is
+    // itself unexplained and unclassified.
+    if (!day.isExplained && !classified.has(day.tradeDate)) {
       return {
         kind: "halt",
         readings,
