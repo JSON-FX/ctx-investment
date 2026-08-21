@@ -1,5 +1,28 @@
 import base from "./jest.config.mjs";
 
+// Point the PRODUCTION pool at the TEST database for the duration of this run.
+//
+// Some integration suites exercise lib/compound/db/client.ts's withDb() rather
+// than the harness's own connection, because the thing under test IS the
+// production path. withDb reads COMPOUND_DATABASE_URL, and nothing in this
+// repo loads .env into Jest — so those suites failed outright with
+// "COMPOUND_DATABASE_URL is not set" unless the developer happened to export
+// it, and passed against whatever they had exported when they did.
+//
+// Assigning it here rather than defaulting it is deliberate, and is the safety
+// half: these suites truncate shared tables. A developer with
+// COMPOUND_DATABASE_URL pointing at a real database in their shell would
+// otherwise have run them against it. This overrides that, every time.
+//
+// Precedence mirrors lib/compound/db/testing/env.ts: an explicit
+// COMPOUND_TEST_DATABASE_URL wins, otherwise the local Supabase stack from
+// supabase/config.toml. 127.0.0.1 rather than localhost because Docker here
+// resolves localhost to ::1 first and Postgres publishes on IPv4 only.
+const TEST_DB_URL =
+  process.env.COMPOUND_TEST_DATABASE_URL?.trim() ||
+  "postgresql://postgres:postgres@127.0.0.1:54622/postgres";
+process.env.COMPOUND_DATABASE_URL = TEST_DB_URL;
+
 // Task 5 found this override inert. `base` (jest.config.mjs) defines
 // `projects`, and Jest's project mode reads testMatch/testPathIgnorePatterns
 // from EACH PROJECT's own config, not from sibling keys one level up — the

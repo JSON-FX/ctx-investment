@@ -12,9 +12,17 @@ RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# NEXT_PUBLIC_* variables are inlined into the bundle at build time.
+# NEXT_PUBLIC_* variables are inlined into the bundle at build time, so they
+# must be present here rather than only at runtime. The Supabase URL and anon
+# key are public by design — the anon key carries no privilege beyond what RLS
+# grants, and the service-role key is deliberately NOT among these: it is read
+# from the environment at runtime and never reaches the bundle.
 ARG NEXT_PUBLIC_APP_URL
 ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
+ARG NEXT_PUBLIC_SUPABASE_URL
+ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL
+ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
+ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY
 
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm build

@@ -6,11 +6,16 @@ services:
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://ctxinvestment.lan}
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
     restart: unless-stopped
     environment:
       # Server-side secrets are read at runtime and never baked into the bundle.
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      # Compound reads money through pg, never PostgREST: PostgREST serialises
+      # bigint as a JSON number and loses precision above 2^53.
+      COMPOUND_DATABASE_URL: ${COMPOUND_DATABASE_URL:-}
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://ctxinvestment.lan}
     labels:
       - "traefik.enable=true"
@@ -32,7 +37,14 @@ services:
       - "traefik.http.services.ctxinvestment.loadbalancer.server.port=3000"
     networks:
       - dev-net
+      # Local development also joins Supabase's own network, so the app can
+      # reach Postgres and Kong by container name instead of a host port.
+      - supabase
+    depends_on: []
 
 networks:
   dev-net:
     external: true
+  supabase:
+    external: true
+    name: ${SUPABASE_NETWORK:-supabase_network_ctx-investment}
