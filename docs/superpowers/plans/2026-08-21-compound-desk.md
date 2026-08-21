@@ -10188,3 +10188,1359 @@ MSG
 )"
 ```
 
+---
+
+### Task 14: `/a/[id]/review` — the capital-event queue
+
+What the interlock produces, and the only way past it.
+
+**Written against the reconciler as it now stands** (merged, 211 tests). Two facts from that shape drive this task:
+
+1. **`ReadingPlan` carries `droppedDeals: DroppedDeal[]` on every variant** — `idle`, `advance` and `halt` alike, always present, never optional. Each `DroppedDeal` carries the deal and the `duplicateOfTicket` it was judged a copy of. **This page renders them.** Until that field existed nothing downstream could learn a deal had been suppressed, and dedupe's own module doc says dropping a genuine trade "destroys real P/L silently". A suppression nobody can see is a suppression nobody can challenge.
+
+2. **`planReadings` and `reconcileDays` throw `RangeError` on a duplicate snapshot `tradeDate`**, as well as on a window that starts after the cursor. **Neither is a halt.** A halt says "there is a capital event, classify it"; a `RangeError` says "the data upstream is wrong". Rendering the second as the first sends the manager looking for a capital event that does not exist, and the real one — which the duplicate date was hiding — stays hidden. `planFor` (Task 11) already separates them; this page must keep them separate on screen.
+
+> **Which way a dedupe mistake fails, because the manager needs to know which way to worry.**
+>
+> A genuine trade wrongly **dropped** makes `explained` too small, so `unexplained` is too large and a candidate appears that should not. That is loud and safe — it shows up in this queue.
+>
+> A duplicate wrongly **kept** makes `explained` too large, so `unexplained` is too small and a real capital event can be masked entirely. That is silent and expensive.
+>
+> So the suppressed-duplicates panel is not decoration. Every row on it is a pair the manager can check, and the pair that is *not* listed is the one that would hurt.
+
+> **Decision D-J: classification offers three outcomes and no more.**
+>
+> - **Deposit** — someone put money in. Writes a `deposit` entry dated on the candidate's day. Offered only for a positive unexplained move.
+> - **Match an existing entry** — the money moved for a payout already recorded in the ledger. Sets `resolved_ledger_entry_id` and writes nothing new. This is what that column is for: a payout recorded in Compound and then executed at the broker still produces a candidate, because the reconciler compares balance against closed trades and a withdrawal is neither.
+> - **Not a capital event** — a broker credit, a rebate, a correction. Status `ignored`, **a note is required**, and the amount is then absorbed into NAV pro-rata, which is correct for money that belongs to everyone.
+>
+> A negative unexplained move that is *not* an already-recorded payout is a partial withdrawal, which spec §12 defers as P6. The queue says so plainly rather than offering a control that would record it wrongly.
+
+**Files:**
+- Create: `supabase/migrations/<generated>_compound_classify_candidate.sql`
+- Create: `lib/compound/db/write-classify.ts`
+- Modify: `lib/compound/present/format.ts` — add `formatLots`
+- Create: `lib/compound/ui/review-queue.tsx`
+- Create: `lib/compound/ui/classify-sheet.tsx`
+- Create: `app/a/[id]/review/page.tsx`
+- Create: `app/a/[id]/review/[cid]/page.tsx`
+- Modify: `app/a/[id]/actions/actions.ts`
+- Test: `lib/compound/ui/review-queue.test.tsx`
+- Test: `lib/compound/ui/classify-sheet.test.tsx`
+- Test: `lib/compound/db/write-classify.db.test.ts`
+
+**Interfaces:**
+- Consumes: `ReadingPlan`, `CapitalEventCandidate` from `@/lib/compound/reconcile/interlock`; `DroppedDeal` from `@/lib/compound/reconcile/dedupe`; `dealNetCents` from `@/lib/compound/reconcile/types`; `CapitalEventCandidateRow`, `listCandidates` from `@/lib/compound/db/compound`; `planFor` from `@/lib/compound/load/reconcile`
+- Produces:
+  - `formatLots(milliLots: number): string`
+  - `public.compound_classify_candidate(...) returns jsonb`
+  - `classifyCandidate(c, input): Promise<{ ledgerEntryId: number | null }>`
+  - `ReviewQueue`, `SuppressedDeals`, `ClassifySheet` components
+
+- [ ] **Step 1: Add `formatLots` to `lib/compound/present/format.ts`**
+
+Into the existing module, not a new one — there is one money-and-figure formatter in this repository and plan 5 greps for a second.
+
+```typescript
+/** Milli-lots to lots. `volumeMilliLots` is lots x 1000 as an integer, so 50 is
+ *  0.05 lots. Integer arithmetic: a float divide reintroduces the comparison
+ *  problem the milli-lot representation exists to avoid. */
+export function formatLots(milliLots: number): string {
+  if (!Number.isInteger(milliLots) || milliLots < 0) {
+    throw new RangeError(`milliLots must be a non-negative integer, got ${milliLots}`);
+  }
+  return `${Math.trunc(milliLots / 1000)}.${(milliLots % 1000).toString().padStart(3, "0")}`;
+}
+```
+
+with tests appended to `format.test.ts`:
+
+```typescript
+describe("formatLots", () => {
+  it("renders 0.05 lots from 50 milli-lots", () => {
+    expect(formatLots(50)).toBe("0.050");
+  });
+
+  it("renders a whole lot", () => {
+    expect(formatLots(1000)).toBe("1.000");
+  });
+
+  it("pads a fraction with leading zeros", () => {
+    expect(formatLots(1)).toBe("0.001");
+  });
+
+  it("refuses a fractional milli-lot", () => {
+    expect(() => formatLots(0.5)).toThrow(/must be a non-negative integer/);
+  });
+});
+```
+
+- [ ] **Step 2: The classification writer**
+
+```bash
+supabase migration new compound_classify_candidate
+```
+
+```sql
+-- ============================================================================
+-- Classify a capital-event candidate. The only way past the interlock.
+-- ============================================================================
+--
+-- Three outcomes (decision D-J):
+--
+--   deposit  someone put money in. A deposit entry is written DATED ON THE
+--            CANDIDATE'S DAY. That is exactly the date compound_commit_deposit
+--            refuses, which is why classification needs its own writer: the
+--            interlock exists to stop entries crossing an UNCLASSIFIED event,
+--            and this function is the act of classifying it.
+--
+--   match    the money moved for something already in the ledger — a payout
+--            recorded here and then executed at the broker. Nothing new is
+--            written; resolved_ledger_entry_id points at the existing entry.
+--            That column exists for exactly this.
+--
+--   ignore   a broker credit, a rebate, a correction. No entry. The amount is
+--            absorbed into NAV pro-rata by the next reading, which is correct
+--            for money that belongs to every holder. A NOTE IS REQUIRED,
+--            because this is the outcome that discards information and the
+--            note is the only record of why.
+--
+-- The candidate must be 'pending'. Classifying a resolved one twice would
+-- write a second deposit for the same money.
+--
+-- Custom SQLSTATEs:
+--   CX001  no such account
+--   CX203  that candidate is not pending
+--   CX204  the account moved since the receipt was worked out
+--   CX205  no such holder on this account
+--   CX209  the ignore outcome requires a note
+--   CX210  the matched entry is not on this account
+--   CX211  a deposit classification needs a positive amount
+-- ============================================================================
+
+create or replace function public.compound_classify_candidate(
+  p_account_id     bigint,
+  p_candidate_id   bigint,
+  p_outcome        text,     -- 'deposit' | 'match' | 'ignore'
+  p_holder_id      bigint,   -- deposit only
+  p_amount_cents   bigint,   -- deposit only
+  p_match_entry_id bigint,   -- match only
+  p_note           text,
+  p_expected_seq   bigint,
+  p_actor          uuid
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_locked    bigint;
+  v_max_seq   bigint;
+  v_trade_date date;
+  v_status    text;
+  v_entry_id  bigint := null;
+begin
+  if p_outcome not in ('deposit', 'match', 'ignore') then
+    raise exception 'compound: outcome must be deposit, match or ignore, got %', p_outcome
+      using errcode = 'CX208';
+  end if;
+
+  select a.id into v_locked
+    from public.compound_account a where a.id = p_account_id for update;
+  if v_locked is null then
+    raise exception 'compound: no account %', p_account_id using errcode = 'CX001';
+  end if;
+
+  select k.trade_date, k.status into v_trade_date, v_status
+    from public.compound_capital_event_candidate k
+   where k.id = p_candidate_id and k.account_id = p_account_id
+     for update;
+
+  if v_trade_date is null then
+    raise exception 'compound: no candidate % on account %', p_candidate_id, p_account_id
+      using errcode = 'CX203';
+  end if;
+  if v_status <> 'pending' then
+    raise exception 'compound: candidate % is already %', p_candidate_id, v_status
+      using errcode = 'CX203';
+  end if;
+
+  select coalesce(max(l.seq), 0) into v_max_seq
+    from public.compound_ledger_entry l where l.account_id = p_account_id;
+  if v_max_seq <> p_expected_seq then
+    raise exception
+      'compound: account is at entry % and the receipt was worked out at entry %',
+      v_max_seq, p_expected_seq using errcode = 'CX204';
+  end if;
+
+  if p_outcome = 'deposit' then
+    if p_amount_cents is null or p_amount_cents <= 0 then
+      raise exception 'compound: a deposit classification needs a positive amount, got %',
+        p_amount_cents using errcode = 'CX211';
+    end if;
+    if not exists (
+      select 1 from public.compound_holder h
+       where h.id = p_holder_id and h.account_id = p_account_id
+    ) then
+      raise exception 'compound: holder % is not on account %', p_holder_id, p_account_id
+        using errcode = 'CX205';
+    end if;
+
+    insert into public.compound_ledger_entry
+      (account_id, holder_id, seq, occurred_on, type, amount_cents, note, created_by)
+    values
+      (p_account_id, p_holder_id, v_max_seq + 1, v_trade_date, 'deposit',
+       p_amount_cents, nullif(p_note, ''), p_actor)
+    returning id into v_entry_id;
+
+  elsif p_outcome = 'match' then
+    if not exists (
+      select 1 from public.compound_ledger_entry l
+       where l.id = p_match_entry_id and l.account_id = p_account_id
+    ) then
+      raise exception 'compound: entry % is not on account %', p_match_entry_id, p_account_id
+        using errcode = 'CX210';
+    end if;
+    v_entry_id := p_match_entry_id;
+
+  else
+    if p_note is null or btrim(p_note) = '' then
+      raise exception
+        'compound: classifying a capital event as "not a capital event" requires a note'
+        using errcode = 'CX209';
+    end if;
+  end if;
+
+  update public.compound_capital_event_candidate
+     set status = case when p_outcome = 'ignore' then 'ignored' else 'classified' end,
+         resolved_ledger_entry_id = v_entry_id,
+         resolved_at = now(),
+         resolved_by = p_actor
+   where id = p_candidate_id;
+
+  insert into public.compound_audit (actor, action, entity, entity_id, account_id, prior_state)
+  values (p_actor, 'classify_' || p_outcome, 'compound_capital_event_candidate',
+          p_candidate_id, p_account_id,
+          jsonb_build_object('status', v_status, 'trade_date', v_trade_date, 'note', p_note));
+
+  return jsonb_build_object('ledger_entry_id', v_entry_id);
+end;
+$$;
+```
+
+```typescript
+// lib/compound/db/write-classify.ts
+import type { Cents } from "@/lib/compound/engine/money";
+import type { Queryable } from "./types";
+import { toId } from "./sql";
+
+export type ClassifyOutcome = "deposit" | "match" | "ignore";
+
+export interface ClassifyInput {
+  accountId: number;
+  candidateId: number;
+  outcome: ClassifyOutcome;
+  holderId: number | null;
+  amountCents: Cents | null;
+  matchEntryId: number | null;
+  note: string | null;
+  expectedSeq: number;
+  actorUserId: string;
+}
+
+export async function classifyCandidate(
+  c: Queryable,
+  input: ClassifyInput,
+): Promise<{ ledgerEntryId: number | null }> {
+  if (input.outcome === "deposit" && (input.amountCents === null || input.amountCents <= 0n)) {
+    throw new RangeError(`a deposit classification needs a positive amount, got ${input.amountCents}`);
+  }
+  if (input.outcome === "ignore" && (input.note ?? "").trim() === "") {
+    throw new RangeError(
+      'classifying a capital event as "not a capital event" requires a note',
+    );
+  }
+  const { rows } = await c.query<{ result: { ledger_entry_id: string | null } }>(
+    `select public.compound_classify_candidate(
+       $1,$2,$3,$4,$5::bigint,$6,$7,$8::bigint,$9::uuid) as result`,
+    [
+      input.accountId, input.candidateId, input.outcome, input.holderId,
+      input.amountCents === null ? null : input.amountCents.toString(),
+      input.matchEntryId, input.note ?? "", String(input.expectedSeq), input.actorUserId,
+    ],
+  );
+  const id = rows[0]!.result.ledger_entry_id;
+  return { ledgerEntryId: id === null ? null : toId(id, "compound_classify_candidate.ledger_entry_id") };
+}
+```
+
+- [ ] **Step 3: Create `lib/compound/ui/review-queue.tsx`**
+
+```tsx
+/**
+ * The capital-event queue, and the suppressed-duplicates audit beneath it.
+ *
+ * Four states, and keeping them apart is most of this component's job:
+ *
+ *   clear           nothing pending. Readings are advancing.
+ *   halted          the reconciler stopped. There is a candidate to classify.
+ *   defect          planReadings threw. Upstream data is wrong — a duplicate
+ *                   trade date, or a window that starts after the cursor. This
+ *                   is NOT a halt and must not be dressed as one: telling a
+ *                   manager to classify a capital event that does not exist
+ *                   sends them looking in the wrong place while the real
+ *                   problem, which the duplicate date may be hiding, stays put.
+ *   not-configured  no broker offset, so nothing has been reconciled at all.
+ *
+ * The arithmetic on a candidate is rendered as an equation, because that is
+ * what it is: the balance moved by X, closed trades explain Y, and the
+ * difference is what nobody has accounted for.
+ */
+import type { ReadingPlan } from "@/lib/compound/reconcile/interlock";
+import type { DroppedDeal } from "@/lib/compound/reconcile/dedupe";
+import { dealNetCents } from "@/lib/compound/reconcile/types";
+import type { CapitalEventCandidateRow } from "@/lib/compound/db/compound";
+import {
+  formatDate, formatLots, formatMoney, formatUtcStamp,
+} from "@/lib/compound/present/format";
+import { DeltaMoney, EmptyState, Eyebrow, Money, Panel } from "./primitives";
+import { classifyHref } from "./routes";
+
+export function SuppressedDeals({
+  dropped, currency,
+}: { dropped: DroppedDeal[]; currency: string }) {
+  return (
+    <Panel flush>
+      <div className="scroller">
+        <table>
+          <caption className="eyebrow">
+            Suppressed as duplicates · {dropped.length}
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col">Ticket</th>
+              <th scope="col">Symbol</th>
+              <th scope="col">Side</th>
+              <th scope="col">Volume</th>
+              <th scope="col">Closed</th>
+              <th scope="col">Net</th>
+              <th scope="col">Judged a copy of</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dropped.length === 0 ? (
+              <tr>
+                <td colSpan={7} style={{ textAlign: "left" }} className="muted">
+                  Nothing was suppressed in this run.
+                </td>
+              </tr>
+            ) : (
+              dropped.map((d) => (
+                <tr key={d.deal.ticket}>
+                  <th scope="row" className="num" style={{ fontWeight: 400 }}>
+                    {d.deal.ticket}
+                  </th>
+                  <td>{d.deal.symbol}</td>
+                  <td>{d.deal.side}</td>
+                  <td className="num">{formatLots(d.deal.volumeMilliLots)}</td>
+                  <td className="num">{formatUtcStamp(d.deal.closeTime)}</td>
+                  <td><DeltaMoney cents={dealNetCents(d.deal)} currency={currency} /></td>
+                  <td className="num">{d.duplicateOfTicket}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      <p className="foot" style={{ padding: "14px 16px" }}>
+        These rows were excluded from reconciliation as time-shifted copies of the ticket
+        named beside them. Check each pair really is one trade recorded twice. A genuine
+        trade wrongly suppressed makes the explained figure too small, so it shows up here
+        as a capital event that is not one — loud, and safe. A duplicate wrongly kept makes
+        the explained figure too large and can mask a real capital event entirely — silent,
+        and the reason this list exists at all.
+      </p>
+    </Panel>
+  );
+}
+
+export function ReviewQueue({
+  accountId, currency, plan, pending, frozenAt, defect, notConfigured, refreshAction,
+}: {
+  accountId: number;
+  currency: string;
+  /** Null when planReadings could not run. */
+  plan: ReadingPlan | null;
+  pending: CapitalEventCandidateRow[];
+  frozenAt: string | null;
+  defect: string | null;
+  notConfigured: boolean;
+  refreshAction: React.ReactNode;
+}) {
+  return (
+    <>
+      {notConfigured ? (
+        <Panel>
+          <div className="banner-halt" role="status">
+            <strong>Reconciliation is switched off for this account.</strong>
+            <p style={{ margin: "6px 0 0" }}>
+              The broker&apos;s UTC offset is not set. Without it the duplicate-deal guard
+              cannot run, and reconciling with duplicates left in inflates the explained
+              figure and can hide a real capital event. Set the offset on the account to
+              switch reconciliation on.
+            </p>
+          </div>
+        </Panel>
+      ) : null}
+
+      {defect !== null ? (
+        <Panel>
+          <div className="banner-halt" role="alert">
+            <strong>The data upstream is wrong, and this is not a capital event.</strong>
+            <p style={{ margin: "6px 0 0" }}>{defect}</p>
+            <p style={{ margin: "6px 0 0" }} className="muted">
+              Nothing here needs classifying. Reconciliation cannot run until the snapshot
+              rows are fixed at the source — and note that a duplicated trade date can be
+              concealing a real capital event, so this is worth fixing rather than working
+              around.
+            </p>
+          </div>
+        </Panel>
+      ) : null}
+
+      {pending.length === 0 && defect === null && !notConfigured ? (
+        <Panel>
+          <EmptyState title="Nothing waiting">
+            Every balance move CopyTraderX has reported is explained by closed trades or by
+            an entry in the ledger. Readings are advancing
+            {frozenAt === null ? "" : `, last posted ${formatDate(frozenAt)}`}.
+          </EmptyState>
+          <div className="actions" style={{ justifyContent: "center" }}>{refreshAction}</div>
+        </Panel>
+      ) : null}
+
+      {pending.length > 0 ? (
+        <div className="queue">
+          {pending.map((k) => (
+            <article className="queue-item" key={k.id} aria-labelledby={`cand-${k.id}`}>
+              <Eyebrow>Unexplained balance move</Eyebrow>
+              <h2
+                id={`cand-${k.id}`}
+                style={{ fontFamily: "var(--serif)", fontWeight: 400, fontSize: 24, margin: "4px 0 10px" }}
+              >
+                {formatDate(k.tradeDate)}
+              </h2>
+
+              <dl className="receipt" aria-label={`Arithmetic for ${k.tradeDate}`}>
+                <div className="receipt-line">
+                  <dt className="l" id={`bd-${k.id}`}>
+                    The balance moved by
+                    <small>Close-to-close, against the previous snapshot.</small>
+                  </dt>
+                  <dd className="r" aria-labelledby={`bd-${k.id}`} style={{ margin: 0 }}>
+                    <DeltaMoney cents={k.balanceDeltaCents} currency={currency} />
+                  </dd>
+                </div>
+                <div className="receipt-line">
+                  <dt className="l" id={`ex-${k.id}`}>
+                    Closed trades explain
+                    <small>Profit, swap and commission on every deal that closed in between, duplicates removed.</small>
+                  </dt>
+                  <dd className="r" aria-labelledby={`ex-${k.id}`} style={{ margin: 0 }}>
+                    <DeltaMoney cents={k.explainedCents} currency={currency} />
+                  </dd>
+                </div>
+                <div className="receipt-line receipt-total">
+                  <dt className="l" id={`un-${k.id}`}>
+                    Nobody has accounted for
+                    <small>The difference. Capital moved, or something upstream is wrong.</small>
+                  </dt>
+                  <dd className="r" aria-labelledby={`un-${k.id}`} style={{ margin: 0 }}>
+                    <DeltaMoney cents={k.unexplainedCents} currency={currency} />
+                  </dd>
+                </div>
+              </dl>
+
+              <p className="split-note">
+                Readings are frozen at{" "}
+                {frozenAt === null ? "inception" : formatDate(frozenAt)} and NAV will not
+                advance past it until this is classified. That is deliberate: an unrecorded
+                deposit is indistinguishable from profit, and profit gets split.
+              </p>
+
+              <div className="actions">
+                <a className="btn btn-primary" href={classifyHref(accountId, k.id)}>
+                  Classify this
+                </a>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null}
+
+      {plan === null ? null : (
+        <SuppressedDeals dropped={plan.droppedDeals} currency={currency} />
+      )}
+    </>
+  );
+}
+```
+
+- [ ] **Step 4: Create `lib/compound/ui/classify-sheet.tsx`**
+
+```tsx
+/**
+ * Classifying one capital event.
+ *
+ * Three outcomes and no fourth (decision D-J). A negative unexplained move that
+ * is not an already-recorded payout is a partial withdrawal, which spec section
+ * 12 defers as P6 — so the sheet says that rather than offering a control that
+ * would record it wrongly. A missing feature stated plainly beats a present
+ * feature that is subtly incorrect about someone's money.
+ */
+import type { CapitalEventCandidateRow } from "@/lib/compound/db/compound";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import type { LedgerEntry } from "@/lib/compound/engine/replay";
+import type { Fingerprint } from "@/lib/compound/present/derive";
+import { formatDate, formatMoney } from "@/lib/compound/present/format";
+import { fingerprintToFields } from "@/lib/compound/present/fingerprint";
+import { DeltaMoney } from "./primitives";
+import { Receipt, ReceiptLine, ReceiptTotal } from "./receipt";
+import { Field, FieldError, Sheet, SheetActions } from "./sheet";
+
+export function ClassifySheet({
+  accountId, candidate, holders, matchable, fingerprint, currency, form, error,
+  backHref, commitAction,
+}: {
+  accountId: number;
+  candidate: CapitalEventCandidateRow;
+  holders: HolderRow[];
+  /** Ledger entries whose cash movement could account for this. */
+  matchable: { entry: LedgerEntry; cashCents: bigint }[];
+  fingerprint: Fingerprint;
+  currency: string;
+  form: { outcome?: string; holderId?: string; amount?: string; matchEntryId?: string; note?: string };
+  error?: string;
+  backHref: string;
+  commitAction: (formData: FormData) => Promise<void>;
+}) {
+  const money = (c: bigint) => formatMoney(c, { currency });
+  const positive = candidate.unexplainedCents > 0n;
+  const fields = fingerprintToFields(fingerprint);
+  const defaultAmount = candidate.unexplainedCents < 0n
+    ? -candidate.unexplainedCents
+    : candidate.unexplainedCents;
+
+  return (
+    <Sheet
+      title={`Classify — ${formatDate(candidate.tradeDate)}`}
+      lede="Readings are frozen until this is resolved. NAV never crosses a capital event nobody has explained."
+      backHref={backHref}
+    >
+      {error ? <FieldError>{error}</FieldError> : null}
+
+      <Receipt label="What happened on this day">
+        <ReceiptLine label="The balance moved by">
+          <DeltaMoney cents={candidate.balanceDeltaCents} currency={currency} />
+        </ReceiptLine>
+        <ReceiptLine label="Closed trades explain">
+          <DeltaMoney cents={candidate.explainedCents} currency={currency} />
+        </ReceiptLine>
+        <ReceiptTotal label="Nobody has accounted for">
+          <DeltaMoney cents={candidate.unexplainedCents} currency={currency} />
+        </ReceiptTotal>
+      </Receipt>
+
+      {positive ? null : (
+        <p className="split-note">
+          Money left the account. If it was a payout you have already recorded here, match
+          it below. If it was a partial withdrawal that is not in the ledger, Compound
+          cannot record it yet — partial capital withdrawal is deferred (spec §12, P6) —
+          and marking it &ldquo;not a capital event&rdquo; would give the loss to every
+          holder pro-rata, which is wrong. Record it as a full exit through the payout
+          screen instead, or leave this pending until P6 lands.
+        </p>
+      )}
+
+      <form action={commitAction}>
+        <input type="hidden" name="accountId" value={accountId} />
+        <input type="hidden" name="candidateId" value={candidate.id} />
+        {Object.entries(fields).map(([k, v]) => (
+          <input key={k} type="hidden" name={k} value={v} />
+        ))}
+
+        <fieldset style={{ border: 0, padding: 0, margin: "18px 0 0" }}>
+          <legend><span className="eyebrow">What was this</span></legend>
+
+          {positive ? (
+            <div style={{ margin: "12px 0", paddingBottom: 12, borderBottom: "1px solid var(--rule-soft)" }}>
+              <label>
+                <input type="radio" name="outcome" value="deposit" defaultChecked={form.outcome !== "match" && form.outcome !== "ignore"} />{" "}
+                <strong>A deposit</strong>
+                <small className="muted" style={{ display: "block", marginLeft: 22 }}>
+                  Someone put money in. Units are issued to them at the NAV on{" "}
+                  {formatDate(candidate.tradeDate)}, which is what makes a late-recorded
+                  deposit fair to everyone already in.
+                </small>
+              </label>
+              <div style={{ marginLeft: 22, marginTop: 10 }}>
+                <Field name="holderId" label="Whose">
+                  <select id="holderId" name="holderId" defaultValue={form.holderId}>
+                    <option value="">Choose…</option>
+                    {holders.map((h) => (
+                      <option key={h.id} value={h.id}>{h.name}{h.isManager ? " (you)" : ""}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field
+                  name="amount"
+                  label={`Amount, ${currency}`}
+                  hint={`Defaults to the unexplained figure, ${money(defaultAmount)}. Change it only if part of the move was something else.`}
+                >
+                  <input
+                    id="amount" name="amount" inputMode="decimal"
+                    defaultValue={form.amount ?? money(defaultAmount).replace(/[^0-9.]/g, "")}
+                  />
+                </Field>
+              </div>
+            </div>
+          ) : null}
+
+          <div style={{ margin: "12px 0", paddingBottom: 12, borderBottom: "1px solid var(--rule-soft)" }}>
+            <label>
+              <input
+                type="radio" name="outcome" value="match"
+                defaultChecked={form.outcome === "match" || (!positive && form.outcome !== "ignore")}
+                disabled={matchable.length === 0}
+              />{" "}
+              <strong>Already recorded here</strong>
+              <small className="muted" style={{ display: "block", marginLeft: 22 }}>
+                {matchable.length === 0
+                  ? "No entry in the ledger has a cash movement that could account for this."
+                  : "A payout recorded in Compound and then executed at the broker still shows up here, because the reconciler compares balance against closed trades and a withdrawal is neither."}
+              </small>
+            </label>
+            {matchable.length === 0 ? null : (
+              <div style={{ marginLeft: 22, marginTop: 10 }}>
+                <Field name="matchEntryId" label="Which entry">
+                  <select id="matchEntryId" name="matchEntryId" defaultValue={form.matchEntryId}>
+                    <option value="">Choose…</option>
+                    {matchable.map(({ entry, cashCents }) => (
+                      <option key={entry.id} value={entry.id}>
+                        #{entry.seq} · {formatDate(entry.occurredOn)} · {entry.type} ·{" "}
+                        {money(cashCents)}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+            )}
+          </div>
+
+          <div style={{ margin: "12px 0" }}>
+            <label>
+              <input type="radio" name="outcome" value="ignore" defaultChecked={form.outcome === "ignore"} />{" "}
+              <strong>Not a capital event</strong>
+              <small className="muted" style={{ display: "block", marginLeft: 22 }}>
+                A broker credit, a rebate, a correction. No ledger entry is written and the
+                amount is absorbed into NAV pro-rata by the next reading — which is right for
+                money that belongs to every holder, and wrong for money that belongs to one.
+              </small>
+            </label>
+            <div style={{ marginLeft: 22, marginTop: 10 }}>
+              <Field
+                name="note"
+                label="Why (required)"
+                hint="This is the only record of the decision. Nothing else will remember it."
+              >
+                <input id="note" name="note" defaultValue={form.note} />
+              </Field>
+            </div>
+          </div>
+        </fieldset>
+
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Classify and unfreeze</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 5: The pages and the action**
+
+```tsx
+// app/a/[id]/review/page.tsx
+import { withDb } from "@/lib/compound/db/client";
+import { listCandidates } from "@/lib/compound/db/compound";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadInterlock } from "@/lib/compound/load/interlock";
+import { planFor } from "@/lib/compound/load/reconcile";
+import { ReviewQueue } from "@/lib/compound/ui/review-queue";
+import { refreshReadings } from "../actions/actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function ReviewPage({ params }: { params: Promise<{ id: string }> }) {
+  const account = await requireAccount((await params).id);
+  const [outcome, pending, interlock] = await Promise.all([
+    planFor(account),
+    withDb((c) => listCandidates(c, account.id, "pending")),
+    loadInterlock(account.id),
+  ]);
+
+  return (
+    <ReviewQueue
+      accountId={account.id}
+      currency={account.currency}
+      plan={outcome.kind === "plan" ? outcome.plan : null}
+      pending={[...pending].sort((a, b) => (a.tradeDate < b.tradeDate ? -1 : 1))}
+      frozenAt={interlock.frozenAt}
+      defect={outcome.kind === "error" ? outcome.message : null}
+      notConfigured={outcome.kind === "not-configured"}
+      refreshAction={
+        <form action={refreshReadings}>
+          <input type="hidden" name="accountId" value={account.id} />
+          <button className="btn" type="submit">Refresh readings</button>
+        </form>
+      }
+    />
+  );
+}
+```
+
+```tsx
+// app/a/[id]/review/[cid]/page.tsx
+import { notFound } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { listCandidates } from "@/lib/compound/db/compound";
+import { listHolders } from "@/lib/compound/db/holders";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger";
+import { fingerprintOf, ledgerSteps } from "@/lib/compound/present/derive";
+import { ClassifySheet } from "@/lib/compound/ui/classify-sheet";
+import { reviewHref } from "@/lib/compound/ui/routes";
+import { classify } from "../../actions/actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function ClassifyPage({
+  params, searchParams,
+}: {
+  params: Promise<{ id: string; cid: string }>;
+  searchParams: Promise<Record<string, string | undefined>>;
+}) {
+  const { id, cid } = await params;
+  const account = await requireAccount(id);
+  if (!/^[1-9][0-9]{0,17}$/.test(cid)) notFound();
+  const q = await searchParams;
+
+  const [candidates, holders, entries, seeds, state] = await Promise.all([
+    withDb((c) => listCandidates(c, account.id, "pending")),
+    withDb((c) => listHolders(c, account.id)),
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    loadPoolState(account.id),
+  ]);
+  const candidate = candidates.find((k) => k.id === Number(cid));
+  if (candidate === undefined) notFound();
+
+  // An entry can account for this move when its cash movement matches the
+  // unexplained figure. The cash movement is the EQUITY DELTA, not the stored
+  // amount — replay recomputes a payout and never reads that field.
+  const matchable = ledgerSteps(entries, seeds)
+    .filter((s) => !s.voided && s.equityDelta !== 0n)
+    .filter((s) => s.equityDelta === candidate.unexplainedCents)
+    .map((s) => ({ entry: s.entry, cashCents: s.equityDelta }));
+
+  return (
+    <ClassifySheet
+      accountId={account.id}
+      candidate={candidate}
+      holders={holders}
+      matchable={matchable}
+      fingerprint={fingerprintOf(account.id, state)}
+      currency={account.currency}
+      form={q}
+      error={q.error}
+      backHref={reviewHref(account.id)}
+      commitAction={classify}
+    />
+  );
+}
+```
+
+Append to `app/a/[id]/actions/actions.ts`:
+
+```typescript
+export async function classify(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const candidateId = Number(formData.get("candidateId"));
+  const back = classifyHref(account.id, candidateId);
+
+  const stale = await staleness(account.id, formData);
+  if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
+  const shown = fingerprintFromFields((k) => {
+    const v = formData.get(k);
+    return typeof v === "string" ? v : null;
+  })!;
+
+  const outcome = String(formData.get("outcome"));
+  if (outcome !== "deposit" && outcome !== "match" && outcome !== "ignore") {
+    redirect(`${back}?error=${encodeURIComponent("Choose what this was before classifying it.")}`);
+  }
+
+  let amountCents: bigint | null = null;
+  if (outcome === "deposit") {
+    try {
+      amountCents = centsFromDecimal(String(formData.get("amount")));
+    } catch {
+      redirect(`${back}?error=${encodeURIComponent("That is not an amount. Use digits and at most two decimal places.")}`);
+      return;
+    }
+  }
+
+  try {
+    await withDbTransaction((c) =>
+      classifyCandidate(c, {
+        accountId: account.id,
+        candidateId,
+        outcome: outcome as "deposit" | "match" | "ignore",
+        holderId: outcome === "deposit" ? Number(formData.get("holderId")) : null,
+        amountCents,
+        matchEntryId: outcome === "match" ? Number(formData.get("matchEntryId")) : null,
+        note: String(formData.get("note") ?? "") || null,
+        expectedSeq: shown.seq,
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(reviewHref(account.id));
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+```
+
+- [ ] **Step 6: Write `lib/compound/ui/review-queue.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { CapitalEventCandidateRow } from "@/lib/compound/db/compound";
+import type { DroppedDeal } from "@/lib/compound/reconcile/dedupe";
+import type { ClosedDeal } from "@/lib/compound/reconcile/types";
+import type { ReadingPlan } from "@/lib/compound/reconcile/interlock";
+import { ReviewQueue, SuppressedDeals } from "./review-queue";
+
+const CANDIDATE: CapitalEventCandidateRow = {
+  id: 12, accountId: 7, tradeDate: "2026-08-12",
+  balanceDeltaCents: 500_000n, explainedCents: 0n, unexplainedCents: 500_000n,
+  status: "pending", detectedAt: "2026-08-13T02:00:00.000Z",
+};
+
+const DEAL: ClosedDeal = {
+  ticket: 90_019_999, symbol: "EURUSD", side: "sell", volumeMilliLots: 100,
+  openTime: "2026-08-06T08:00:00.000Z", closeTime: "2026-08-06T11:00:00.000Z",
+  profitCents: 8_000n, swapCents: 0n, commissionCents: 0n,
+};
+const DROPPED: DroppedDeal[] = [{ deal: DEAL, duplicateOfTicket: 90_010_004 }];
+
+const IDLE: ReadingPlan = { kind: "idle", droppedDeals: DROPPED };
+const refresh = <button type="button">Refresh readings</button>;
+
+function renderQueue(over: Partial<Parameters<typeof ReviewQueue>[0]> = {}) {
+  return render(
+    <ReviewQueue
+      accountId={7}
+      currency="USD"
+      plan={over.plan === undefined ? IDLE : over.plan}
+      pending={over.pending ?? [CANDIDATE]}
+      frozenAt={over.frozenAt === undefined ? "2026-08-11" : over.frozenAt}
+      defect={over.defect ?? null}
+      notConfigured={over.notConfigured ?? false}
+      refreshAction={refresh}
+    />,
+  );
+}
+
+describe("ReviewQueue — a pending candidate", () => {
+  beforeEach(() => renderQueue());
+
+  it("shows the arithmetic as an equation the reader can check", () => {
+    expect(screen.getByLabelText("The balance moved by").textContent).toBe("+$5,000.00");
+    expect(screen.getByLabelText("Closed trades explain").textContent).toBe("+$0.00");
+    expect(screen.getByLabelText("Nobody has accounted for").textContent).toBe("+$5,000.00");
+  });
+
+  it("adds up: explained plus unexplained is the balance move", () => {
+    const n = (label: string) => {
+      const t = screen.getByLabelText(label).textContent!;
+      return BigInt(t.replace(/[^0-9]/g, "")) * (t.startsWith("-") ? -1n : 1n);
+    };
+    expect(n("Closed trades explain") + n("Nobody has accounted for"))
+      .toBe(n("The balance moved by"));
+  });
+
+  it("dates the event and says where figures are frozen", () => {
+    expect(screen.getByRole("heading", { name: "12 Aug 2026" })).toBeInTheDocument();
+    expect(screen.getByText(/Readings are frozen at 11 Aug 2026/)).toBeInTheDocument();
+  });
+
+  it("says why freezing is deliberate rather than apologising for it", () => {
+    expect(screen.getByText(/an unrecorded deposit is indistinguishable from profit/))
+      .toBeInTheDocument();
+  });
+
+  it("links to the classify sheet", () => {
+    expect(screen.getByRole("link", { name: "Classify this" }))
+      .toHaveAttribute("href", "/a/7/review/12");
+  });
+});
+
+describe("ReviewQueue — suppressed duplicates", () => {
+  it("lists every dropped deal with the ticket it was judged a copy of", () => {
+    renderQueue();
+    const row = screen.getByRole("row", { name: /90019999/ });
+    const cells = [...within(row).getAllByRole("rowheader"), ...within(row).getAllByRole("cell")]
+      .map((c) => c.textContent);
+    expect(cells).toEqual([
+      "90019999", "EURUSD", "sell", "0.100",
+      "6 Aug 2026, 11:00 UTC", "+$80.00", "90010004",
+    ]);
+  });
+
+  it("shows the panel even when nothing is pending, because it is an audit", () => {
+    renderQueue({ pending: [] });
+    expect(screen.getByText(/Suppressed as duplicates · 1/)).toBeInTheDocument();
+  });
+
+  it("says which way a dedupe mistake fails, in both directions", () => {
+    renderQueue();
+    const note = screen.getByText(/wrongly suppressed/).textContent!;
+    expect(note).toContain("explained figure too small");
+    expect(note).toContain("loud, and safe");
+    expect(note).toContain("wrongly kept makes the explained figure too large");
+    expect(note).toContain("silent");
+  });
+
+  it("says so plainly when nothing was suppressed", () => {
+    render(<SuppressedDeals dropped={[]} currency="USD" />);
+    expect(screen.getByText("Nothing was suppressed in this run.")).toBeInTheDocument();
+    expect(screen.getByText(/Suppressed as duplicates · 0/)).toBeInTheDocument();
+  });
+});
+
+describe("ReviewQueue — a data defect is not a halt", () => {
+  const message =
+    "duplicate snapshot for tradeDate 2026-08-12 in the reading window: two rows both " +
+    "claim to close that day";
+
+  beforeEach(() => renderQueue({ pending: [], plan: null, defect: message }));
+
+  it("says the data is wrong, not that something needs classifying", () => {
+    expect(screen.getByRole("alert").textContent)
+      .toContain("The data upstream is wrong, and this is not a capital event.");
+    expect(screen.getByText(/duplicate snapshot for tradeDate 2026-08-12/)).toBeInTheDocument();
+  });
+
+  it("offers no classify control, because there is nothing to classify", () => {
+    expect(screen.queryByRole("link", { name: /Classify/ })).toBeNull();
+  });
+
+  it("warns that the duplicate date may be concealing a real event", () => {
+    expect(screen.getByText(/can be concealing a real capital event/)).toBeInTheDocument();
+  });
+
+  it("does not claim everything is fine", () => {
+    expect(screen.queryByText("Nothing waiting")).toBeNull();
+  });
+});
+
+describe("ReviewQueue — nothing pending", () => {
+  it("says readings are advancing and when the last one landed", () => {
+    renderQueue({ pending: [] });
+    expect(screen.getByText("Nothing waiting")).toBeInTheDocument();
+    expect(screen.getByText(/Readings are advancing, last posted 11 Aug 2026/))
+      .toBeInTheDocument();
+  });
+});
+
+describe("ReviewQueue — reconciliation switched off", () => {
+  it("explains the offset, and does not pretend the queue is clear", () => {
+    renderQueue({ pending: [], plan: null, notConfigured: true });
+    expect(screen.getByText(/broker's UTC offset is not set/)).toBeInTheDocument();
+    expect(screen.getByText(/can hide a real capital event/)).toBeInTheDocument();
+    expect(screen.queryByText("Nothing waiting")).toBeNull();
+  });
+});
+
+describe("ReviewQueue — a plan that halted", () => {
+  it("still renders the suppressed list, because halt carries droppedDeals too", () => {
+    const halt: ReadingPlan = {
+      kind: "halt", readings: [], newCursorDate: "2026-08-11",
+      candidate: {
+        tradeDate: "2026-08-12", previousDate: "2026-08-11",
+        balanceDeltaCents: 500_000n, explainedCents: 0n, unexplainedCents: 500_000n,
+      },
+      droppedDeals: DROPPED,
+    };
+    renderQueue({ plan: halt });
+    expect(screen.getByRole("row", { name: /90019999/ })).toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 7: Write `lib/compound/ui/classify-sheet.test.tsx`**
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import type { CapitalEventCandidateRow } from "@/lib/compound/db/compound";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import { ADA_ID, MANAGER_ID } from "@/lib/compound/present/fixture";
+import { ClassifySheet } from "./classify-sheet";
+
+const HOLDERS: HolderRow[] = [
+  { id: MANAGER_ID, accountId: 7, name: "J. Marsh", email: null, userId: null,
+    isManager: true, splitBps: 0, joinedAt: "2026-03-02", status: "active" },
+  { id: ADA_ID, accountId: 7, name: "Ada Lovelace", email: null, userId: null,
+    isManager: false, splitBps: 4000, joinedAt: "2026-05-04", status: "active" },
+];
+const FP = { accountId: 7, seq: 6, equityCents: "5574391", units: "402224547963043" };
+const noop = async () => {};
+
+function candidate(over: Partial<CapitalEventCandidateRow> = {}): CapitalEventCandidateRow {
+  return {
+    id: 12, accountId: 7, tradeDate: "2026-08-12",
+    balanceDeltaCents: 500_000n, explainedCents: 0n, unexplainedCents: 500_000n,
+    status: "pending", detectedAt: "2026-08-13T02:00:00.000Z", ...over,
+  };
+}
+
+function renderSheet(
+  k = candidate(),
+  matchable: Parameters<typeof ClassifySheet>[0]["matchable"] = [],
+) {
+  return render(
+    <ClassifySheet
+      accountId={7} candidate={k} holders={HOLDERS} matchable={matchable}
+      fingerprint={FP} currency="USD" form={{}} backHref="/a/7/review"
+      commitAction={noop}
+    />,
+  );
+}
+
+describe("ClassifySheet — a positive move", () => {
+  beforeEach(() => renderSheet());
+
+  it("restates the arithmetic before asking for a decision", () => {
+    expect(screen.getByLabelText("Nobody has accounted for").textContent).toBe("+$5,000.00");
+  });
+
+  it("offers all three outcomes", () => {
+    expect(screen.getByRole("radio", { name: /A deposit/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Already recorded here/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Not a capital event/ })).toBeInTheDocument();
+  });
+
+  it("defaults the deposit amount to the unexplained figure", () => {
+    expect(screen.getByLabelText(/Amount, USD/)).toHaveValue("5000.00");
+  });
+
+  it("says units are issued at the NAV of the event's own day", () => {
+    expect(screen.getByText(/Units are issued to them at the NAV on 12 Aug 2026/))
+      .toBeInTheDocument();
+  });
+
+  it("disables matching when nothing in the ledger could account for it", () => {
+    expect(screen.getByRole("radio", { name: /Already recorded here/ })).toBeDisabled();
+    expect(screen.getByText(/No entry in the ledger has a cash movement/)).toBeInTheDocument();
+  });
+
+  it("requires a note to ignore, and says why", () => {
+    expect(screen.getByLabelText("Why (required)")).toBeInTheDocument();
+    expect(screen.getByText(/only record of the decision/)).toBeInTheDocument();
+  });
+
+  it("says what ignoring actually does to the money", () => {
+    expect(screen.getByText(/absorbed into NAV pro-rata/)).toBeInTheDocument();
+    expect(screen.getByText(/right for money that belongs to every holder, and wrong for money that belongs to one/))
+      .toBeInTheDocument();
+  });
+
+  it("carries the fingerprint so a stale classification cannot be committed", () => {
+    expect(document.querySelector<HTMLInputElement>('input[name="fpSeq"]')!.value).toBe("6");
+  });
+});
+
+describe("ClassifySheet — a negative move", () => {
+  beforeEach(() => renderSheet(candidate({
+    balanceDeltaCents: -500_000n, explainedCents: 0n, unexplainedCents: -500_000n,
+  })));
+
+  it("does not offer a deposit for money that left", () => {
+    expect(screen.queryByRole("radio", { name: /A deposit/ })).toBeNull();
+  });
+
+  it("says partial withdrawal is deferred, and what to do instead", () => {
+    expect(screen.getByText(/partial capital withdrawal is deferred/)).toBeInTheDocument();
+    expect(screen.getByText(/Record it as a full exit through the payout screen instead/))
+      .toBeInTheDocument();
+  });
+
+  it("warns that ignoring a withdrawal gives the loss to everyone", () => {
+    expect(screen.getByText(/would give the loss to every holder pro-rata, which is wrong/))
+      .toBeInTheDocument();
+  });
+});
+
+describe("ClassifySheet — matching an existing entry", () => {
+  it("offers the entries whose cash movement matches, with their figures", () => {
+    renderSheet(
+      candidate({ balanceDeltaCents: -157_836n, explainedCents: 0n, unexplainedCents: -157_836n }),
+      [{
+        entry: {
+          id: 7, seq: 7, holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+          amountCents: 263_060n, feeSettlement: "units", splitBpsApplied: 4000, reversesId: null,
+        },
+        cashCents: -157_836n,
+      }],
+    );
+    const option = screen.getByRole("option", { name: /#7 · 18 Aug 2026 · payout · -\$1,578\.36/ });
+    expect(option).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Already recorded here/ })).toBeEnabled();
+  });
+
+  it("explains why a recorded payout shows up here at all", () => {
+    renderSheet(
+      candidate({ unexplainedCents: -157_836n }),
+      [{
+        entry: {
+          id: 7, seq: 7, holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+          amountCents: 263_060n, feeSettlement: "units", splitBpsApplied: 4000, reversesId: null,
+        },
+        cashCents: -157_836n,
+      }],
+    );
+    expect(screen.getByText(/compares balance against closed trades and a withdrawal is neither/))
+      .toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 8: Write `lib/compound/db/write-classify.db.test.ts`**
+
+```typescript
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { getLedgerEntries, listCandidates } from "@/lib/compound/db/compound";
+import { classifyCandidate } from "@/lib/compound/db/write-classify";
+import { commitDeposit } from "@/lib/compound/db/write-deposit";
+import { MANAGER_USER_ID, seedTwoAccounts } from "@/lib/compound/db/test-harness";
+
+const rollback = (e: Error) => { if (e.message !== "rollback") throw e; };
+
+async function withCandidate(c: Parameters<typeof classifyCandidate>[0], accountId: number, unexplained = 500_000n) {
+  const { rows } = await c.query<{ id: string }>(
+    `insert into public.compound_capital_event_candidate
+       (account_id, trade_date, balance_delta_cents, explained_cents, unexplained_cents)
+     values ($1, '2026-08-12', $2, 0, $2) returning id`,
+    [accountId, unexplained.toString()],
+  );
+  return Number(rows[0]!.id);
+}
+
+describe("classifyCandidate", () => {
+  it("as a deposit, writes an entry dated on the event's own day", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId, occurredOn: "2026-03-02",
+        amountCents: 2_500_000n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const candidateId = await withCandidate(c, mine.accountId);
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+
+      const { ledgerEntryId } = await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "deposit",
+        holderId: mine.managerHolderId, amountCents: 500_000n, matchEntryId: null,
+        note: "Late-recorded transfer", expectedSeq: maxSeq, actorUserId: MANAGER_USER_ID,
+      });
+
+      const entry = (await getLedgerEntries(c, mine.accountId)).find((e) => e.id === ledgerEntryId)!;
+      expect(entry.type).toBe("deposit");
+      expect(entry.occurredOn).toBe("2026-08-12");    // the event's day, not today
+      expect(entry.amountCents).toBe(500_000n);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("resolves the candidate and points it at the entry it created", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const candidateId = await withCandidate(c, mine.accountId);
+      const { ledgerEntryId } = await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "deposit",
+        holderId: mine.managerHolderId, amountCents: 500_000n, matchEntryId: null,
+        note: null, expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      });
+      expect(await listCandidates(c, mine.accountId, "pending")).toEqual([]);
+      const { rows } = await c.query<{ status: string; resolved_ledger_entry_id: string | null }>(
+        `select status, resolved_ledger_entry_id
+           from public.compound_capital_event_candidate where id = $1`, [candidateId],
+      );
+      expect(rows[0]!.status).toBe("classified");
+      expect(Number(rows[0]!.resolved_ledger_entry_id)).toBe(ledgerEntryId);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses to classify the same candidate twice, with CX203", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const candidateId = await withCandidate(c, mine.accountId);
+      await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "deposit",
+        holderId: mine.managerHolderId, amountCents: 500_000n, matchEntryId: null,
+        note: null, expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      });
+      await expect(classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "deposit",
+        holderId: mine.managerHolderId, amountCents: 500_000n, matchEntryId: null,
+        note: null, expectedSeq: 1, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/is already classified/);
+      // And exactly one deposit exists for it, not two.
+      const deposits = (await getLedgerEntries(c, mine.accountId))
+        .filter((e) => e.type === "deposit" && e.occurredOn === "2026-08-12");
+      expect(deposits).toHaveLength(1);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("as ignore, writes no entry and requires a note", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const candidateId = await withCandidate(c, mine.accountId);
+      await expect(classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "ignore",
+        holderId: null, amountCents: null, matchEntryId: null,
+        note: "   ", expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/requires a note/);
+
+      const { ledgerEntryId } = await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "ignore",
+        holderId: null, amountCents: null, matchEntryId: null,
+        note: "Broker rebate, confirmed by support ticket 4471",
+        expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      });
+      expect(ledgerEntryId).toBeNull();
+      expect(await getLedgerEntries(c, mine.accountId)).toEqual([]);
+      const { rows } = await c.query<{ status: string }>(
+        `select status from public.compound_capital_event_candidate where id = $1`, [candidateId],
+      );
+      expect(rows[0]!.status).toBe("ignored");
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("as match, writes no entry and points at the existing one", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const { ledgerEntryId: existing } = await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId, occurredOn: "2026-03-02",
+        amountCents: 2_500_000n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const candidateId = await withCandidate(c, mine.accountId);
+      const before = (await getLedgerEntries(c, mine.accountId)).length;
+      const r = await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "match",
+        holderId: null, amountCents: null, matchEntryId: existing,
+        note: null, expectedSeq: 1, actorUserId: MANAGER_USER_ID,
+      });
+      expect(r.ledgerEntryId).toBe(existing);
+      expect((await getLedgerEntries(c, mine.accountId)).length).toBe(before);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses to match an entry belonging to another account, with CX210", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      const { ledgerEntryId: theirEntry } = await commitDeposit(c, {
+        accountId: theirs.accountId, holderId: theirs.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const candidateId = await withCandidate(c, mine.accountId);
+      await expect(classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "match",
+        holderId: null, amountCents: null, matchEntryId: theirEntry,
+        note: null, expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/is not on account/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("unfreezes the interlock: a reading past the event is accepted afterwards", async () => {
+    // The point of the whole task. Before classification a deposit dated on
+    // that day is refused; after it, it is accepted.
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const candidateId = await withCandidate(c, mine.accountId);
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId, occurredOn: "2026-08-13",
+        amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/on or after the unclassified capital event/);
+
+      await classifyCandidate(c, {
+        accountId: mine.accountId, candidateId, outcome: "ignore",
+        holderId: null, amountCents: null, matchEntryId: null,
+        note: "Broker rebate", expectedSeq: 0, actorUserId: MANAGER_USER_ID,
+      });
+
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId, occurredOn: "2026-08-13",
+        amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      })).resolves.toBeDefined();
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+```
+
+- [ ] **Step 9: Run the gates and prove three probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `ReviewQueue`, render the `defect` case using the same markup as a candidate. Expect the four "a data defect is not a halt" assertions to fail. That block exists because the two states look alike on screen and are opposites in meaning.
+2. In `ReviewQueue`, hide `SuppressedDeals` when `pending.length === 0`. Expect "shows the panel even when nothing is pending" to fail. The audit is most valuable exactly when the queue looks clear — a masked capital event produces no candidate at all.
+3. In `compound_classify_candidate`, drop the `v_status <> 'pending'` check. Expect the twice-classified test to fail on `toHaveLength(1)` — two deposits for the same money, which is the concrete harm.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the capital-event queue and classification
+
+Renders what the interlock produces and provides the only way past it: deposit,
+match an entry already in the ledger, or not-a-capital-event with a required
+note. A negative unexplained move that is not an already-recorded payout is a
+partial withdrawal, which is deferred, and the queue says so rather than
+offering a control that would record it wrongly.
+
+Also surfaces droppedDeals. A duplicate wrongly kept masks a real capital event
+silently; every suppressed pair is now something the manager can check.
+
+A duplicate-trade-date RangeError renders as a data defect, not as a halt.
+Telling a manager to classify an event that does not exist sends them looking in
+the wrong place while the real one stays hidden.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
