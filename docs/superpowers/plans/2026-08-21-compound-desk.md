@@ -8893,3 +8893,1298 @@ MSG
 )"
 ```
 
+---
+
+### Task 13: The payout receipt
+
+**The screen this product exists for.** An investor reads these figures back in a dispute, so every one of them is on the page, named in words a non-accountant can check, and produced by the same reducer that will write the entry.
+
+The receipt shows, in this order: units held, value at NAV, what they have put in, profit above that, their share, the manager's fee, units given up, units kept and what those are worth, and what they actually receive.
+
+> **A payout writes its own settlement reading and does not move the reconcile cursor.**
+>
+> Spec §5.2: a payout may never settle against a drifting intraday figure, so it writes an equity reading capturing the exact equity used and the payout entry **in one transaction**. That reading pins the equity this payout settled against, at this payout's `seq`, permanently.
+>
+> The cursor stays where it was. When CopyTraderX's snapshot for that day arrives, the reconciler posts its own reading for the same date at a higher `seq`, which supersedes the settlement reading going forward. Neither disturbs the other, because `fold` applies entries in `seq` order and the payout took its figures from the totals at its own position. Moving the cursor would leave the payout's day permanently unreconciled — and a capital event on that day would then never be seen.
+
+> **The freshness check is enforced in the database, not only in the action.** `compound_commit_payout` takes `p_expected_seq` and refuses under the account row lock when `max(seq)` no longer matches. The action's fingerprint check catches the common case with a good message; this catches the race between that check and the insert, which no amount of application code can close.
+
+**Files:**
+- Create: `supabase/migrations/<generated>_compound_commit_payout.sql`
+- Create: `lib/compound/db/write-payout.ts`
+- Create: `lib/compound/ui/payout-sheet.tsx`
+- Create: `app/a/[id]/actions/payout/[hid]/page.tsx`
+- Modify: `app/a/[id]/actions/actions.ts`, `app/a/[id]/page.tsx`, `app/a/[id]/holders/[hid]/page.tsx`
+- Test: `lib/compound/db/write-payout.db.test.ts`
+- Test: `lib/compound/ui/payout-sheet.test.tsx`
+
+**Interfaces:**
+- Consumes: `quote` from `@/lib/compound/engine/quote`; `holderPosition` from `@/lib/compound/present/holder`; `previewEntry` from `@/lib/compound/present/derive`; `PAYOUT_WORDS`
+- Produces:
+  - `public.compound_commit_payout(...) returns jsonb`
+  - `commitPayout(c, input): Promise<{ readingEntryId; payoutEntryId; seq }>`
+  - `PayoutSheet` component
+
+- [ ] **Step 1: The payout writer**
+
+```bash
+supabase migration new compound_commit_payout
+```
+
+```sql
+-- ============================================================================
+-- Pay out. The settlement reading and the payout, together or not at all.
+-- ============================================================================
+--
+-- Spec 5.2: "A payout may never settle against a drifting intraday figure --
+-- it writes an equity reading capturing the exact equity used, then the payout
+-- entry, in one transaction." Both inserts are in this function body, which IS
+-- one transaction. If the reading landed without the payout the account would
+-- be revalued for no reason; if the payout landed without the reading it would
+-- have settled against whatever equity happened to be current, which is the
+-- figure nobody can reproduce afterwards.
+--
+-- The cursor is NOT moved. That is deliberate and it is not an oversight: the
+-- settlement reading pins the equity for THIS payout at THIS seq, and the
+-- reconciler's own reading for the same day arrives later at a higher seq and
+-- supersedes it going forward. Moving the cursor would leave the payout's day
+-- permanently unreconciled, and a capital event on it would never be seen.
+--
+-- p_expected_seq closes a race the application cannot. The caller re-folds and
+-- checks a fingerprint before submitting, and between that check and this
+-- insert another session can commit. Under the row lock, max(seq) is the
+-- authoritative answer.
+--
+-- No units_delta and no nav_at_entry: both derived (spec 6.1). amount_cents
+-- carries the gross the caller quoted, as a record of what was asked for;
+-- replay.ts recomputes the payout from quote() and never reads it.
+--
+-- Custom SQLSTATEs:
+--   CX001  no such account
+--   CX002  dated on or after an unclassified capital event
+--   CX204  the account moved since the receipt was worked out
+--   CX205  no such holder on this account
+--   CX207  settlement equity must be positive
+-- ============================================================================
+
+create or replace function public.compound_commit_payout(
+  p_account_id              bigint,
+  p_holder_id               bigint,
+  p_occurred_on             date,
+  p_settlement_equity_cents bigint,
+  p_mode                    text,     -- 'payout' | 'exit'
+  p_fee_settlement          text,     -- 'units' | 'cash'
+  p_split_bps_applied       int,
+  p_gross_cents             bigint,
+  p_expected_seq            bigint,
+  p_note                    text,
+  p_actor                   uuid
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_locked     bigint;
+  v_max_seq    bigint;
+  v_reading_id bigint;
+  v_payout_id  bigint;
+  v_blocker    date;
+begin
+  if p_mode not in ('payout', 'exit') then
+    raise exception 'compound: mode must be payout or exit, got %', p_mode using errcode = 'CX208';
+  end if;
+  if p_fee_settlement not in ('units', 'cash') then
+    raise exception 'compound: fee settlement must be units or cash, got %', p_fee_settlement
+      using errcode = 'CX208';
+  end if;
+  if p_settlement_equity_cents <= 0 then
+    raise exception 'compound: settlement equity must be positive, got %',
+      p_settlement_equity_cents using errcode = 'CX207';
+  end if;
+
+  select a.id into v_locked
+    from public.compound_account a where a.id = p_account_id for update;
+  if v_locked is null then
+    raise exception 'compound: no account %', p_account_id using errcode = 'CX001';
+  end if;
+
+  if not exists (
+    select 1 from public.compound_holder h
+     where h.id = p_holder_id and h.account_id = p_account_id
+  ) then
+    raise exception 'compound: holder % is not on account %', p_holder_id, p_account_id
+      using errcode = 'CX205';
+  end if;
+
+  select min(k.trade_date) into v_blocker
+    from public.compound_capital_event_candidate k
+   where k.account_id = p_account_id and k.status = 'pending';
+  if v_blocker is not null and p_occurred_on >= v_blocker then
+    raise exception
+      'compound: payout dated % is on or after the unclassified capital event on %',
+      p_occurred_on, v_blocker using errcode = 'CX002';
+  end if;
+
+  select coalesce(max(l.seq), 0) into v_max_seq
+    from public.compound_ledger_entry l where l.account_id = p_account_id;
+
+  if v_max_seq <> p_expected_seq then
+    raise exception
+      'compound: account is at entry % and the receipt was worked out at entry %',
+      v_max_seq, p_expected_seq using errcode = 'CX204';
+  end if;
+
+  insert into public.compound_ledger_entry
+    (account_id, holder_id, seq, occurred_on, type, amount_cents, note, created_by)
+  values
+    (p_account_id, null, v_max_seq + 1, p_occurred_on, 'equity_reading',
+     p_settlement_equity_cents,
+     'Settlement reading for the payout at seq ' || (v_max_seq + 2)::text, p_actor)
+  returning id into v_reading_id;
+
+  insert into public.compound_ledger_entry
+    (account_id, holder_id, seq, occurred_on, type, amount_cents,
+     fee_settlement, split_bps_applied, note, created_by)
+  values
+    (p_account_id, p_holder_id, v_max_seq + 2, p_occurred_on, p_mode, p_gross_cents,
+     p_fee_settlement, p_split_bps_applied, nullif(p_note, ''), p_actor)
+  returning id into v_payout_id;
+
+  -- Decision D-M: the stored status is kept in step with what fold derives, so
+  -- the database is not misleading to anyone reading it directly. Nothing in
+  -- the application reads it.
+  if p_mode = 'exit' then
+    update public.compound_holder set status = 'closed' where id = p_holder_id;
+  end if;
+
+  insert into public.compound_audit (actor, action, entity, entity_id, account_id, prior_state)
+  values (p_actor, 'commit_' || p_mode, 'compound_ledger_entry', v_payout_id, p_account_id,
+          jsonb_build_object('expected_seq', p_expected_seq,
+                             'settlement_equity_cents', p_settlement_equity_cents));
+
+  return jsonb_build_object(
+    'reading_entry_id', v_reading_id,
+    'payout_entry_id',  v_payout_id,
+    'seq',              v_max_seq + 2
+  );
+end;
+$$;
+```
+
+```typescript
+// lib/compound/db/write-payout.ts
+/**
+ * Committing a payout. Money crosses as decimal strings; see write-deposit.ts.
+ */
+import type { Cents } from "@/lib/compound/engine/money";
+import type { Queryable } from "./types";
+import { toId } from "./sql";
+
+export interface CommitPayoutInput {
+  accountId: number;
+  holderId: number;
+  /** YYYY-MM-DD, broker-server date. */
+  occurredOn: string;
+  /** The exact equity this payout settles against. Written as a reading. */
+  settlementEquityCents: Cents;
+  mode: "payout" | "exit";
+  feeSettlement: "units" | "cash";
+  splitBpsApplied: number;
+  /** What quote() computed. Recorded, never re-read by fold. */
+  grossCents: Cents;
+  /** max(seq) at the moment the receipt was rendered. */
+  expectedSeq: number;
+  note: string | null;
+  actorUserId: string;
+}
+
+export async function commitPayout(
+  c: Queryable,
+  input: CommitPayoutInput,
+): Promise<{ readingEntryId: number; payoutEntryId: number; seq: number }> {
+  if (!Number.isInteger(input.splitBpsApplied) ||
+      input.splitBpsApplied < 0 || input.splitBpsApplied > 10_000) {
+    throw new RangeError(`splitBpsApplied must be an integer 0..10000, got ${input.splitBpsApplied}`);
+  }
+  if (input.settlementEquityCents <= 0n) {
+    throw new RangeError(`settlement equity must be positive, got ${input.settlementEquityCents}`);
+  }
+  const { rows } = await c.query<{
+    result: { reading_entry_id: string; payout_entry_id: string; seq: string };
+  }>(
+    `select public.compound_commit_payout(
+       $1,$2,$3::date,$4::bigint,$5,$6,$7,$8::bigint,$9::bigint,$10,$11::uuid) as result`,
+    [
+      input.accountId, input.holderId, input.occurredOn,
+      input.settlementEquityCents.toString(), input.mode, input.feeSettlement,
+      input.splitBpsApplied, input.grossCents.toString(), String(input.expectedSeq),
+      input.note ?? "", input.actorUserId,
+    ],
+  );
+  const r = rows[0]!.result;
+  return {
+    readingEntryId: toId(r.reading_entry_id, "compound_commit_payout.reading_entry_id"),
+    payoutEntryId: toId(r.payout_entry_id, "compound_commit_payout.payout_entry_id"),
+    seq: toId(r.seq, "compound_commit_payout.seq"),
+  };
+}
+```
+
+- [ ] **Step 2: Create `lib/compound/ui/payout-sheet.tsx`**
+
+```tsx
+/**
+ * The payout receipt.
+ *
+ * This is the screen an investor reads back in a dispute, so:
+ *
+ *  - Every figure that goes into the answer is on the page. Not a summary of
+ *    them, not a total with the workings hidden behind a disclosure.
+ *  - Every accounting term appears with the sentence that defines it. "Cost
+ *    basis, their high-water mark" is precise and is jargon; what is rendered
+ *    is "What Ada has put in", with the mechanism underneath.
+ *  - The fee line is the only amber on the page, per spec section 8.2, and it
+ *    uses --fee-ink rather than --fee, which is 2.15:1 and cannot carry text.
+ *  - Below the high-water mark, profit-only is DISABLED WITH THE RECOVERY
+ *    FIGURE STATED, and exit stays available at current value with zero fee.
+ *    A disabled control with no number is a dead end; a disabled control that
+ *    says "$1,364.84 of recovery is needed" is an answer.
+ *
+ * Every figure comes from quote() and from previewEntry()'s fold. Nothing on
+ * this page is computed here.
+ */
+import type { Cents } from "@/lib/compound/engine/money";
+import { valueOfUnits } from "@/lib/compound/engine/nav";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import type { Preview } from "@/lib/compound/present/derive";
+import type { HolderPosition } from "@/lib/compound/present/holder";
+import {
+  formatDate, formatMoney, formatNav, formatSplit, formatUnitsDp,
+} from "@/lib/compound/present/format";
+import { fingerprintToFields } from "@/lib/compound/present/fingerprint";
+import { PAYOUT_WORDS as W } from "@/lib/compound/present/wording";
+import { DeltaMoney, FeeMoney, Money } from "./primitives";
+import { Receipt, ReceiptLine, ReceiptTotal } from "./receipt";
+import { Field, FieldError, Sheet, SheetActions } from "./sheet";
+
+export interface PayoutForm {
+  mode?: "payout" | "exit";
+  fee?: "units" | "cash";
+  occurredOn?: string;
+  equity?: string;
+  note?: string;
+}
+
+export function PayoutSheet({
+  accountId, holder, position, preview, form, currency, error, backHref, commitAction,
+  liveEquityCents, blocked,
+}: {
+  accountId: number;
+  holder: HolderRow;
+  position: HolderPosition;
+  /** Null on step one. */
+  preview: Preview | null;
+  form: PayoutForm;
+  currency: string;
+  error?: string;
+  backHref: string;
+  commitAction: (formData: FormData) => Promise<void>;
+  liveEquityCents: Cents | null;
+  blocked?: { candidateDate: string; reviewHref: string };
+}) {
+  const name = holder.name;
+  const money = (c: Cents) => formatMoney(c, { currency });
+  const managerPct = formatSplit(holder.splitBps).split(" / ")[1]!;
+  const holderPct = formatSplit(holder.splitBps).split(" / ")[0]!;
+  const mode = form.mode ?? "payout";
+  const feeSettlement = form.fee ?? "units";
+
+  if (blocked) {
+    return (
+      <Sheet title={`Pay out — ${name}`} backHref={backHref}>
+        <div className="banner-halt" role="status">
+          <strong>Not while a capital event is unclassified.</strong>
+          <p style={{ margin: "6px 0 0" }}>
+            There is an unexplained balance move on {formatDate(blocked.candidateDate)}. NAV
+            must not cross it, and a payout settles at NAV.
+          </p>
+          <p style={{ margin: "6px 0 0" }}><a href={blocked.reviewHref}>Review it</a></p>
+        </div>
+      </Sheet>
+    );
+  }
+
+  if (position.holder.units === 0n) {
+    return (
+      <Sheet title={`Pay out — ${name}`} backHref={backHref}>
+        <div className="banner-halt" role="status">
+          <strong>{name} holds no units.</strong>
+          <p style={{ margin: "6px 0 0" }}>
+            There is nothing to pay out. Add capital for {name} first, or check you picked
+            the right holder.
+          </p>
+        </div>
+      </Sheet>
+    );
+  }
+
+  // --- step one -------------------------------------------------------------
+  if (preview === null) {
+    const canTakeProfit = position.markState === "above";
+    return (
+      <Sheet
+        title={`Pay out — ${name}`}
+        lede={`This payout settles at the equity you enter below, and that figure is written into the ledger as a reading in the same transaction. Nothing settles against a number that can drift.`}
+        backHref={backHref}
+      >
+        {error ? <FieldError>{error}</FieldError> : null}
+
+        {canTakeProfit ? null : (
+          <div className="banner-halt" role="status">
+            <strong>
+              {position.markState === "below" ? W.belowMarkTitle : W.atMarkTitle}
+            </strong>
+            <p style={{ margin: "6px 0 0" }}>
+              {position.markState === "below"
+                ? W.belowMark(
+                    name,
+                    money(position.holder.basisCents),
+                    money(position.settlementValueCents),
+                    money(position.recoveryCents),
+                  )
+                : W.atMark(name)}
+            </p>
+            <p style={{ margin: "6px 0 0" }}>
+              {W.exitStillAvailable(money(position.exitQuote.toHolderCents))}
+            </p>
+          </div>
+        )}
+
+        <form method="get">
+          <input type="hidden" name="step" value="confirm" />
+          <fieldset className="field" style={{ border: 0, padding: 0, margin: "0 0 14px" }}>
+            <legend><span className="eyebrow">What kind of withdrawal</span></legend>
+            <label style={{ display: "block", margin: "8px 0" }}>
+              <input
+                type="radio" name="mode" value="payout"
+                defaultChecked={mode === "payout"} disabled={!canTakeProfit}
+                aria-describedby="profit-only-hint"
+              />{" "}
+              {W.profitOnly}
+              {canTakeProfit ? null : " — unavailable"}
+              <small id="profit-only-hint" className="muted" style={{ display: "block", marginLeft: 22 }}>
+                {canTakeProfit
+                  ? W.profitOnlyHint(name)
+                  : position.markState === "below"
+                  ? `${money(position.recoveryCents)} of recovery is needed first.`
+                  : `There is no profit above what ${name} has put in.`}
+              </small>
+            </label>
+            <label style={{ display: "block", margin: "8px 0" }}>
+              <input type="radio" name="mode" value="exit" defaultChecked={mode === "exit" || !canTakeProfit} />{" "}
+              {W.exitInFull}
+              <small className="muted" style={{ display: "block", marginLeft: 22 }}>
+                {W.exitInFullHint(name)}
+              </small>
+            </label>
+          </fieldset>
+
+          <Field name="occurredOn" label="Date" hint="The broker-server date this settles on.">
+            <input id="occurredOn" name="occurredOn" type="date" required defaultValue={form.occurredOn} />
+          </Field>
+          <Field
+            name="equity"
+            label={`Settlement equity, ${currency}`}
+            hint={liveEquityCents === null
+              ? "Account equity at the moment this settles. Written into the ledger as a reading."
+              : `Account equity at the moment this settles. CopyTraderX's latest live figure is ${money(liveEquityCents)}. Written into the ledger as a reading.`}
+          >
+            <input
+              id="equity" name="equity" inputMode="decimal" required
+              defaultValue={form.equity ?? (liveEquityCents === null ? undefined : formatMoney(liveEquityCents).replace(/[^0-9.]/g, ""))}
+            />
+          </Field>
+          <Field name="note" label="Note" hint="Optional. Appears on the ledger.">
+            <input id="note" name="note" defaultValue={form.note} />
+          </Field>
+          <SheetActions>
+            <button className="btn btn-primary" type="submit">Work out the figures</button>
+          </SheetActions>
+        </form>
+      </Sheet>
+    );
+  }
+
+  // --- step two: the receipt -----------------------------------------------
+  const q = mode === "exit" ? position.exitQuote : position.profitQuote;
+  const idx = preview.after.holders.findIndex((h) => h.holderId === holder.id);
+  const unitsKept = preview.after.holders[idx]!.units;
+  const keptWorth = valueOfUnits(totalsOf(preview.after), unitsKept);
+  const fields = fingerprintToFields(preview.fingerprint);
+  const settlementNav = formatNav(totalsOf(preview.before));
+  const toggleHref = (over: Partial<PayoutForm>) => {
+    const p = new URLSearchParams({
+      step: "confirm",
+      mode: over.mode ?? mode,
+      fee: over.fee ?? feeSettlement,
+      occurredOn: form.occurredOn ?? "",
+      equity: form.equity ?? "",
+      note: form.note ?? "",
+    });
+    return `?${p.toString()}`;
+  };
+
+  return (
+    <Sheet
+      title={`Pay out — ${name}`}
+      lede={`${mode === "exit" ? W.exitInFull : W.profitOnly}. Settling at NAV ${settlementNav} on ${formatDate(form.occurredOn ?? "")}.`}
+      backHref={`${backHref}`}
+      backLabel="Back"
+    >
+      {error ? <FieldError>{error}</FieldError> : null}
+
+      <p className="actions" style={{ marginTop: 0 }}>
+        <a
+          className={`btn${mode === "payout" ? " btn-primary" : ""}`}
+          href={toggleHref({ mode: "payout" })}
+          aria-disabled={position.markState !== "above" ? "true" : undefined}
+          aria-current={mode === "payout" ? "true" : undefined}
+        >
+          {W.profitOnly}
+        </a>
+        <a
+          className={`btn${mode === "exit" ? " btn-primary" : ""}`}
+          href={toggleHref({ mode: "exit" })}
+          aria-current={mode === "exit" ? "true" : undefined}
+        >
+          {W.exitInFull}
+        </a>
+      </p>
+
+      <Receipt label={`Payout receipt for ${name}`}>
+        <ReceiptLine label={W.unitsHeld} hint={W.unitsHeldHint}>
+          <span className="num">{formatUnitsDp(position.holder.units)}</span>
+        </ReceiptLine>
+        <ReceiptLine label={`${W.valueNow} (${settlementNav})`} hint={W.valueNowHint}>
+          <span className="num">{money(q.valueCents)}</span>
+        </ReceiptLine>
+        <ReceiptLine label={W.capitalIn(name)} hint={W.capitalInHint(name)}>
+          <span className="num">{money(position.holder.basisCents)}</span>
+        </ReceiptLine>
+        <ReceiptLine label={W.profit} hint={W.profitHint}>
+          <DeltaMoney cents={q.profitCents} currency={currency} />
+        </ReceiptLine>
+
+        <ReceiptLine label={W.holderShare(name, holderPct)}>
+          <span className="num">{money(q.profitCents > 0n ? q.profitCents - q.feeCents : 0n)}</span>
+        </ReceiptLine>
+        <ReceiptLine label={W.managerFee(managerPct)} hint={W.managerFeeHint} tone="fee">
+          <FeeMoney cents={q.feeCents} currency={currency} />
+        </ReceiptLine>
+
+        <ReceiptLine label={W.unitsRedeemed(name)}>
+          <span className="num">
+            {formatUnitsDp(q.unitsRedeemed)}
+            {mode === "exit" ? <span className="muted"> (all of them)</span> : null}
+          </span>
+        </ReceiptLine>
+        <ReceiptLine
+          label={W.unitsKept(name)}
+          hint={`${W.unitsKeptHint} ${money(keptWorth)}`}
+        >
+          <span className="num">{formatUnitsDp(unitsKept)}</span>
+        </ReceiptLine>
+
+        <ReceiptTotal label={W.receives(name)}>
+          <span className="num">{money(q.toHolderCents)}</span>
+        </ReceiptTotal>
+      </Receipt>
+
+      <fieldset style={{ border: 0, padding: 0, margin: "18px 0 0" }}>
+        <legend><span className="eyebrow">{W.feeSettlement}</span></legend>
+        <p className="actions" style={{ marginTop: 8 }}>
+          <a
+            className={`btn${feeSettlement === "units" ? " btn-primary" : ""}`}
+            href={toggleHref({ fee: "units" })}
+            aria-current={feeSettlement === "units" ? "true" : undefined}
+          >
+            {W.feeSettlementUnits}
+          </a>
+          <a
+            className={`btn${feeSettlement === "cash" ? " btn-primary" : ""}`}
+            href={toggleHref({ fee: "cash" })}
+            aria-current={feeSettlement === "cash" ? "true" : undefined}
+          >
+            {W.feeSettlementCash}
+          </a>
+        </p>
+        <p className="split-note">
+          {feeSettlement === "units" ? W.feeSettlementUnitsHint : W.feeSettlementCashHint}
+        </p>
+      </fieldset>
+
+      <Receipt label="What this does to the account">
+        <ReceiptLine label="Account equity" hint="Before, then after.">
+          <span className="num">
+            {money(preview.before.equityCents)} → {money(preview.after.equityCents)}
+          </span>
+        </ReceiptLine>
+        <ReceiptLine label="Units in issue" hint="Before, then after.">
+          <span className="num">
+            {formatUnitsDp(preview.before.units)} → {formatUnitsDp(preview.after.units)}
+          </span>
+        </ReceiptLine>
+        <ReceiptLine label="NAV per unit" hint="A payout settles at constant NAV. It takes value out; it does not move the price of a unit.">
+          <span className="num">
+            {formatNav(totalsOf(preview.before))} → {formatNav(totalsOf(preview.after))}
+          </span>
+        </ReceiptLine>
+      </Receipt>
+
+      <form action={commitAction}>
+        <input type="hidden" name="accountId" value={accountId} />
+        <input type="hidden" name="holderId" value={holder.id} />
+        <input type="hidden" name="mode" value={mode === "exit" ? "exit" : "payout"} />
+        <input type="hidden" name="fee" value={feeSettlement} />
+        <input type="hidden" name="occurredOn" value={form.occurredOn ?? ""} />
+        <input type="hidden" name="equity" value={form.equity ?? ""} />
+        <input type="hidden" name="note" value={form.note ?? ""} />
+        <input type="hidden" name="grossCents" value={q.grossCents.toString()} />
+        <input type="hidden" name="splitBpsApplied" value={String(q.splitBpsApplied)} />
+        {Object.entries(fields).map(([k, v]) => (
+          <input key={k} type="hidden" name={k} value={v} />
+        ))}
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">
+            Pay {name} {money(q.toHolderCents)}
+          </button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 3: The page and the action**
+
+```tsx
+// app/a/[id]/actions/payout/[hid]/page.tsx
+import { notFound } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { listHolders } from "@/lib/compound/db/holders";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { fold } from "@/lib/compound/engine/replay";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadInterlock } from "@/lib/compound/load/interlock";
+import { loadLedger, loadLive, loadSeeds } from "@/lib/compound/load/ledger";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { holderPosition } from "@/lib/compound/present/holder";
+import { PayoutSheet } from "@/lib/compound/ui/payout-sheet";
+import { holderHref, reviewHref } from "@/lib/compound/ui/routes";
+import { payOut } from "../../actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function PayoutPage({
+  params, searchParams,
+}: {
+  params: Promise<{ id: string; hid: string }>;
+  searchParams: Promise<Record<string, string | undefined>>;
+}) {
+  const { id, hid } = await params;
+  const account = await requireAccount(id);
+  if (!/^[1-9][0-9]{0,17}$/.test(hid)) notFound();
+  const holderId = Number(hid);
+  const q = await searchParams;
+
+  const [holders, entries, seeds, live, interlock] = await Promise.all([
+    withDb((c) => listHolders(c, account.id)),
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    loadLive(account.mt5Account),
+    loadInterlock(account.id),
+  ]);
+  const holder = holders.find((h) => h.id === holderId);
+  if (holder === undefined) notFound();
+
+  const mode = q.mode === "exit" ? "exit" : "payout";
+  const fee = q.fee === "cash" ? "cash" : "units";
+
+  // The position is quoted against the SETTLEMENT equity, not against the last
+  // committed reading — the settlement reading is what this payout will apply
+  // at, so the receipt must be worked out at that NAV.
+  let preview = null;
+  let position = holderPosition(fold(entries, seeds), holderId);
+
+  if (q.step === "confirm" && q.occurredOn && q.equity) {
+    try {
+      const settlement = centsFromDecimal(q.equity);
+      const withReading = [
+        ...entries,
+        {
+          id: Math.max(0, ...entries.map((e) => e.id)) + 1,
+          seq: Math.max(0, ...entries.map((e) => e.seq)) + 1,
+          holderId: null, occurredOn: q.occurredOn, type: "equity_reading" as const,
+          amountCents: settlement, feeSettlement: null, splitBpsApplied: null, reversesId: null,
+        },
+      ];
+      position = holderPosition(fold(withReading, seeds), holderId);
+      const quoted = mode === "exit" ? position.exitQuote : position.profitQuote;
+      preview = previewEntry({
+        accountId: account.id,
+        entries: withReading,
+        seeds,
+        proposed: {
+          holderId, occurredOn: q.occurredOn, type: mode,
+          amountCents: quoted.grossCents, feeSettlement: fee,
+          splitBpsApplied: quoted.splitBpsApplied,
+        },
+      });
+    } catch {
+      preview = null;
+    }
+  }
+
+  return (
+    <PayoutSheet
+      accountId={account.id}
+      holder={holder}
+      position={position}
+      preview={preview}
+      form={{ mode, fee, occurredOn: q.occurredOn, equity: q.equity, note: q.note }}
+      currency={account.currency}
+      error={q.error}
+      backHref={holderHref(account.id, holderId)}
+      commitAction={payOut}
+      liveEquityCents={live?.equityCents ?? null}
+      blocked={interlock.pendingCandidateDate === null ? undefined : {
+        candidateDate: interlock.pendingCandidateDate,
+        reviewHref: reviewHref(account.id),
+      }}
+    />
+  );
+}
+```
+
+> **Note on the fingerprint here.** `previewEntry` is called with `withReading`, so its fingerprint carries the *pre-reading* state's `seq` — the settlement reading is not in the ledger yet. That is exactly right: `expectedSeq` must be `max(seq)` as the database will find it, and the writer inserts the reading itself at `max(seq) + 1`. Do not "fix" this to include the synthetic reading's seq; the CX204 test in Step 5 fails if you do.
+
+Append to `app/a/[id]/actions/actions.ts`:
+
+```typescript
+export async function payOut(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const holderId = Number(formData.get("holderId"));
+  const back = payoutHref(account.id, holderId);
+
+  const stale = await staleness(account.id, formData);
+  if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
+
+  const shown = fingerprintFromFields((k) => {
+    const v = formData.get(k);
+    return typeof v === "string" ? v : null;
+  })!;
+
+  let settlementEquityCents: bigint;
+  try {
+    settlementEquityCents = centsFromDecimal(String(formData.get("equity")));
+  } catch {
+    redirect(`${back}?error=${encodeURIComponent("That is not an amount. Use digits and at most two decimal places.")}`);
+    return;
+  }
+
+  try {
+    await withDbTransaction((c) =>
+      commitPayout(c, {
+        accountId: account.id,
+        holderId,
+        occurredOn: String(formData.get("occurredOn")),
+        settlementEquityCents,
+        mode: formData.get("mode") === "exit" ? "exit" : "payout",
+        feeSettlement: formData.get("fee") === "cash" ? "cash" : "units",
+        splitBpsApplied: Number(formData.get("splitBpsApplied")),
+        grossCents: BigInt(String(formData.get("grossCents"))),
+        expectedSeq: shown.seq,
+        note: String(formData.get("note") ?? "") || null,
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(holderHref(account.id, holderId));
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+```
+
+Turn on the holder actions: pass `holderActions` on the desk, and pass `withdrawAction` on the holder statement page.
+
+- [ ] **Step 4: Write `lib/compound/ui/payout-sheet.test.tsx`**
+
+The most important test file in the plan. Every figure the brief names is asserted, in all four settlement combinations.
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { fold } from "@/lib/compound/engine/replay";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { holderPosition } from "@/lib/compound/present/holder";
+import { ADA_ID, LEDGER, LEDGER_UNDERWATER, SEEDS } from "@/lib/compound/present/fixture";
+import { PayoutSheet, type PayoutForm } from "./payout-sheet";
+
+const ADA: HolderRow = {
+  id: ADA_ID, accountId: 7, name: "Ada Lovelace", email: null, userId: null,
+  isManager: false, splitBps: 4000, joinedAt: "2026-05-04", status: "active",
+};
+const noop = async () => {};
+
+function build(ledger = LEDGER, mode: "payout" | "exit" = "payout", fee: "units" | "cash" = "units") {
+  const state = fold(ledger, SEEDS);
+  const position = holderPosition(state, ADA_ID);
+  const q = mode === "exit" ? position.exitQuote : position.profitQuote;
+  const preview = previewEntry({
+    accountId: 7, entries: ledger, seeds: SEEDS,
+    proposed: {
+      holderId: ADA_ID, occurredOn: "2026-08-18", type: mode,
+      amountCents: q.grossCents, feeSettlement: fee, splitBpsApplied: q.splitBpsApplied,
+    },
+  });
+  return { position, preview };
+}
+
+function renderSheet(
+  ledger = LEDGER,
+  form: PayoutForm = { mode: "payout", fee: "units", occurredOn: "2026-08-18", equity: "55743.91" },
+  step2 = true,
+) {
+  const { position, preview } = build(ledger, form.mode ?? "payout", form.fee ?? "units");
+  return render(
+    <PayoutSheet
+      accountId={7} holder={ADA} position={position}
+      preview={step2 ? preview : null} form={form} currency="USD"
+      backHref="/a/7/holders/2" commitAction={noop}
+      liveEquityCents={centsFromDecimal("55930.00")}
+    />,
+  );
+}
+
+describe("the receipt — profit only, fee retained as units", () => {
+  beforeEach(() => renderSheet());
+
+  it("shows the units held", () => {
+    expect(screen.getByLabelText("Units held").textContent).toBe("9,113.7132");
+  });
+
+  it("shows the value at the NAV this settles against", () => {
+    expect(screen.getByLabelText("Value at today's NAV (1.3858)").textContent)
+      .toBe("$12,630.60");
+  });
+
+  it("shows what Ada has put in, by that name", () => {
+    expect(screen.getByLabelText("What Ada Lovelace has put in").textContent)
+      .toBe("$10,000.00");
+  });
+
+  it("explains the high-water mark without using the term as a label", () => {
+    expect(screen.getByText(/rises when Ada Lovelace adds capital/)).toBeInTheDocument();
+    expect(screen.getByText(/resets to zero on a full exit/)).toBeInTheDocument();
+  });
+
+  it("shows profit above that, signed", () => {
+    expect(screen.getByLabelText("Profit above that").textContent).toBe("+$2,630.60");
+  });
+
+  it("shows Ada's share and the manager's fee, and they sum to the profit", () => {
+    const share = screen.getByLabelText("Ada Lovelace's share of the profit (60%)").textContent!;
+    const fee = screen.getByLabelText("Your fee (40%)").textContent!;
+    expect(share).toBe("$1,578.36");
+    expect(fee).toBe("$1,052.24");
+    const n = (s: string) => BigInt(s.replace(/\D/g, ""));
+    expect(n(share) + n(fee)).toBe(263_060n);
+  });
+
+  it("uses Ada's own split in the labels, not the account default", () => {
+    // Grace is 37%. A hard-coded 40 would still pass on Ada, which is why the
+    // Grace case below exists.
+    expect(screen.getByLabelText(/share of the profit \(60%\)/)).toBeInTheDocument();
+  });
+
+  it("shows the units given up and the units kept, with what they are worth", () => {
+    expect(screen.getByLabelText("Units Ada Lovelace gives up").textContent).toBe("1,898.1300");
+    expect(screen.getByLabelText("Units Ada Lovelace keeps").textContent).toBe("7,215.5832");
+    expect(screen.getByText(/immediately after this payout: \$10,000\.00/)).toBeInTheDocument();
+  });
+
+  it("shows what Ada actually receives, as the total", () => {
+    expect(screen.getByLabelText("Ada Lovelace receives").textContent).toBe("$1,578.36");
+  });
+
+  it("names the amount on the button, so the confirm click is not blind", () => {
+    expect(screen.getByRole("button", { name: "Pay Ada Lovelace $1,578.36" }))
+      .toBeInTheDocument();
+  });
+
+  it("puts exactly one line in amber, and it is the fee", () => {
+    const amber = document.querySelectorAll(".receipt-line.is-fee");
+    expect(amber).toHaveLength(1);
+    expect(amber[0]!.textContent).toContain("Your fee (40%)");
+  });
+
+  it("shows what it does to the account, at constant NAV", () => {
+    expect(screen.getByLabelText("Account equity").textContent)
+      .toBe("$55,743.91 → $54,165.55");
+    expect(screen.getByLabelText("Units in issue").textContent)
+      .toBe("40,222.4547 → 39,083.5767");
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.3858");
+  });
+
+  it("explains that the fee stays in the pool as units", () => {
+    expect(screen.getByText(/cash stays in the pool and you are issued units/))
+      .toBeInTheDocument();
+    expect(screen.getByText(/capital in rises by the fee/)).toBeInTheDocument();
+  });
+});
+
+describe("the receipt — profit only, fee taken as cash", () => {
+  beforeEach(() => renderSheet(LEDGER, { mode: "payout", fee: "cash", occurredOn: "2026-08-18", equity: "55743.91" }));
+
+  it("pays Ada the same figure — the settlement choice is yours, not hers", () => {
+    expect(screen.getByLabelText("Ada Lovelace receives").textContent).toBe("$1,578.36");
+    expect(screen.getByLabelText("Your fee (40%)").textContent).toBe("$1,052.24");
+  });
+
+  it("takes the fee out of the account as well as Ada's cash", () => {
+    expect(screen.getByLabelText("Account equity").textContent)
+      .toBe("$55,743.91 → $53,113.31");
+    expect(screen.getByLabelText("Units in issue").textContent)
+      .toBe("40,222.4547 → 38,324.3247");
+  });
+
+  it("still settles at constant NAV", () => {
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.3858");
+  });
+});
+
+describe("the receipt — exit in full", () => {
+  beforeEach(() => renderSheet(LEDGER, { mode: "exit", fee: "units", occurredOn: "2026-08-18", equity: "55743.91" }));
+
+  it("pays the whole value less the fee", () => {
+    expect(screen.getByLabelText("Ada Lovelace receives").textContent).toBe("$11,578.36");
+  });
+
+  it("charges the same fee — a fee is on profit, not on the amount withdrawn", () => {
+    expect(screen.getByLabelText("Your fee (40%)").textContent).toBe("$1,052.24");
+  });
+
+  it("surrenders every unit, and says so", () => {
+    expect(screen.getByLabelText("Units Ada Lovelace gives up").textContent)
+      .toBe("9,113.7132 (all of them)");
+    expect(screen.getByLabelText("Units Ada Lovelace keeps").textContent).toBe("0.0000");
+  });
+
+  it("still settles at constant NAV", () => {
+    expect(screen.getByLabelText("Account equity").textContent)
+      .toBe("$55,743.91 → $44,165.55");
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.3858");
+  });
+});
+
+describe("below the high-water mark", () => {
+  beforeEach(() =>
+    renderSheet(LEDGER_UNDERWATER, { mode: "payout", occurredOn: "2026-08-18", equity: "38110.44" }, false));
+
+  it("says so, and states the recovery figure", () => {
+    expect(screen.getByText("Below the high-water mark")).toBeInTheDocument();
+    expect(screen.getByText(/\$1,364\.84 of recovery is needed before any profit can be withdrawn/))
+      .toBeInTheDocument();
+  });
+
+  it("disables profit-only and repeats the recovery figure on the control itself", () => {
+    const profitOnly = screen.getByRole("radio", { name: /Profit only/ });
+    expect(profitOnly).toBeDisabled();
+    expect(screen.getByText("$1,364.84 of recovery is needed first.")).toBeInTheDocument();
+  });
+
+  it("keeps exit available, at current value, with no fee", () => {
+    expect(screen.getByRole("radio", { name: /Exit in full/ })).toBeEnabled();
+    expect(screen.getByRole("radio", { name: /Exit in full/ })).toBeChecked();
+    expect(screen.getByText(/still available, at today's value of \$8,635\.16, with no fee/))
+      .toBeInTheDocument();
+  });
+});
+
+describe("exactly at the high-water mark", () => {
+  it("does not claim the holder is below it", () => {
+    // A holder whose value equals their basis exactly. quote() reports
+    // belowHighWaterMark true here; the sheet must not.
+    const ledger = [...LEDGER, {
+      id: 7, seq: 7, holderId: null, occurredOn: "2026-08-18",
+      type: "equity_reading" as const,
+      // Chosen so Ada's floored value lands on her $10,000.00 basis.
+      amountCents: centsFromDecimal("44133.62"),
+      feeSettlement: null, splitBpsApplied: null, reversesId: null,
+    }];
+    const position = holderPosition(fold(ledger, SEEDS), ADA_ID);
+    render(
+      <PayoutSheet
+        accountId={7} holder={ADA} position={position} preview={null}
+        form={{ mode: "payout" }} currency="USD" backHref="/a/7/holders/2"
+        commitAction={noop} liveEquityCents={null}
+      />,
+    );
+    if (position.markState === "at") {
+      expect(screen.getByText("Exactly at the high-water mark")).toBeInTheDocument();
+      expect(screen.queryByText("Below the high-water mark")).toBeNull();
+      expect(screen.getByText(/no profit to withdraw yet/)).toBeInTheDocument();
+    } else {
+      // The reading above must be tuned until markState is "at". Do not delete
+      // this branch — make it unreachable by picking the right figure, and
+      // leave the guard so a later fixture change cannot silently skip the case.
+      throw new Error(
+        `fixture does not sit on the mark: profit is ${position.profitCents}. ` +
+          `Adjust the equity_reading amount until holderPosition reports "at".`,
+      );
+    }
+  });
+});
+
+describe("guards", () => {
+  it("refuses a holder with no units, and says what to do", () => {
+    const empty = holderPosition(fold(LEDGER, SEEDS), 1);
+    render(
+      <PayoutSheet
+        accountId={7} holder={{ ...ADA, id: 1, name: "Nobody" }}
+        position={{ ...empty, holder: { ...empty.holder, units: 0n } }}
+        preview={null} form={{}} currency="USD" backHref="/a/7"
+        commitAction={noop} liveEquityCents={null}
+      />,
+    );
+    expect(screen.getByText("Nobody holds no units.")).toBeInTheDocument();
+    expect(screen.getByText(/Add capital for Nobody first/)).toBeInTheDocument();
+  });
+
+  it("refuses while a capital event is unclassified, because a payout settles at NAV", () => {
+    const { position } = build();
+    render(
+      <PayoutSheet
+        accountId={7} holder={ADA} position={position} preview={null}
+        form={{}} currency="USD" backHref="/a/7" commitAction={noop}
+        liveEquityCents={null}
+        blocked={{ candidateDate: "2026-08-12", reviewHref: "/a/7/review" }}
+      />,
+    );
+    expect(screen.getByText(/NAV must not cross it, and a payout settles at NAV/))
+      .toBeInTheDocument();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("offers the live figure as the settlement default, labelled as CopyTraderX's", () => {
+    renderSheet(LEDGER, { mode: "payout" }, false);
+    expect(screen.getByText(/CopyTraderX's latest live figure is \$55,930\.00/))
+      .toBeInTheDocument();
+  });
+
+  it("carries the pre-reading seq in the fingerprint, not the settlement reading's", () => {
+    renderSheet();
+    expect(document.querySelector<HTMLInputElement>('input[name="fpSeq"]')!.value).toBe("6");
+  });
+});
+
+describe("a holder on a non-default split", () => {
+  it("uses their split in every label and every figure", () => {
+    const GRACE: HolderRow = { ...ADA, id: 3, name: "Grace Hopper", splitBps: 3700 };
+    const state = fold(LEDGER, SEEDS);
+    const position = holderPosition(state, 3);
+    const preview = previewEntry({
+      accountId: 7, entries: LEDGER, seeds: SEEDS,
+      proposed: {
+        holderId: 3, occurredOn: "2026-08-18", type: "payout",
+        amountCents: position.profitQuote.grossCents, feeSettlement: "units",
+        splitBpsApplied: position.profitQuote.splitBpsApplied,
+      },
+    });
+    render(
+      <PayoutSheet
+        accountId={7} holder={GRACE} position={position} preview={preview}
+        form={{ mode: "payout", fee: "units", occurredOn: "2026-08-18", equity: "55743.91" }}
+        currency="USD" backHref="/a/7" commitAction={noop} liveEquityCents={null}
+      />,
+    );
+    expect(screen.getByLabelText("Grace Hopper's share of the profit (63%)").textContent)
+      .toBe("$608.61");
+    expect(screen.getByLabelText("Your fee (37%)").textContent).toBe("$357.43");
+    expect(screen.getByLabelText("Grace Hopper receives").textContent).toBe("$608.61");
+  });
+});
+```
+
+**How these bite.** This table is the point of the task.
+
+| Change | What goes red |
+|---|---|
+| render `position.statementValueCents` instead of `q.valueCents` | value reads `$12,630.61`; share + fee no longer sums to profit |
+| use `allocateValues` for the kept-units worth | `$10,000.01` where `$10,000.00` belongs, and the high-water-mark story stops being visible |
+| charge the fee on `grossCents` instead of on profit | the exit case reads `$5,052.24`, four times the right fee |
+| hard-code 40% | every Grace assertion |
+| derive exit's `unitsRedeemed` from value rather than `holderUnits` | "all of them" no longer matches `9,113.7132`, and units kept becomes a residual fraction rather than zero |
+| render `belowHighWaterMark` instead of `markState` | the at-the-mark case claims "below" |
+| drop the recovery figure from the disabled control's hint | the disabled-control assertion — a dead end instead of an answer |
+| include the synthetic settlement reading in the fingerprint | `fpSeq` reads `7`, and the CX204 integration test in Step 5 refuses every payout |
+| paint the fee with `--fee` instead of `--fee-ink` | `tokens.test.ts`'s amber rule, from Task 1 |
+
+- [ ] **Step 5: Write `lib/compound/db/write-payout.db.test.ts`**
+
+```typescript
+import { withDb, withDbTransaction } from "@/lib/compound/db/client";
+import { getHolderSeeds, getLedgerEntries } from "@/lib/compound/db/compound";
+import { listHolders } from "@/lib/compound/db/holders";
+import { commitDeposit } from "@/lib/compound/db/write-deposit";
+import { commitPayout } from "@/lib/compound/db/write-payout";
+import { assertInvariants } from "@/lib/compound/engine/invariants";
+import { fold } from "@/lib/compound/engine/replay";
+import { addHolder } from "@/lib/compound/db/write-holder";
+import { MANAGER_USER_ID, seedTwoAccounts } from "@/lib/compound/db/test-harness";
+
+const rollback = (e: Error) => { if (e.message !== "rollback") throw e; };
+
+/** A funded account: manager in for 25,000, Ada in for 10,000, equity 55,743.91. */
+async function funded(c: Parameters<typeof commitDeposit>[0], accountId: number, managerHolderId: number) {
+  await commitDeposit(c, {
+    accountId, holderId: managerHolderId, occurredOn: "2026-03-02",
+    amountCents: 2_500_000n, note: null, actorUserId: MANAGER_USER_ID,
+  });
+  const adaId = await addHolder(c, {
+    accountId, name: "Ada Lovelace", email: null, splitBps: 4000,
+    joinedAt: "2026-05-04", actorUserId: MANAGER_USER_ID,
+  });
+  await commitDeposit(c, {
+    accountId, holderId: adaId, occurredOn: "2026-05-04",
+    amountCents: 1_000_000n, note: null, actorUserId: MANAGER_USER_ID,
+  });
+  return adaId;
+}
+
+describe("commitPayout", () => {
+  it("writes the settlement reading and the payout, in that order, adjacent", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const before = await getLedgerEntries(c, mine.accountId);
+      const maxSeq = Math.max(...before.map((e) => e.seq));
+
+      const r = await commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      });
+
+      const after = await getLedgerEntries(c, mine.accountId);
+      const reading = after.find((e) => e.id === r.readingEntryId)!;
+      const payout = after.find((e) => e.id === r.payoutEntryId)!;
+      expect(reading.type).toBe("equity_reading");
+      expect(reading.seq).toBe(maxSeq + 1);
+      expect(reading.amountCents).toBe(5_574_391n);
+      expect(payout.type).toBe("payout");
+      expect(payout.seq).toBe(maxSeq + 2);
+      expect(payout.splitBpsApplied).toBe(4000);
+      expect(payout.feeSettlement).toBe("units");
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("folds to a state that satisfies every invariant", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      await commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const state = fold(
+        await getLedgerEntries(c, mine.accountId),
+        await getHolderSeeds(c, mine.accountId),
+      );
+      expect(() => assertInvariants(state)).not.toThrow();
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses when the account has moved since the receipt, with CX204", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      await expect(commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n,
+        expectedSeq: maxSeq - 1,   // a receipt worked out one entry ago
+        note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/the receipt was worked out at entry/);
+
+      // And the correct seq still works, so the guard is not "refuse everything".
+      await expect(commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      })).resolves.toBeDefined();
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("writes nothing at all when the seq check fails", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const before = (await getLedgerEntries(c, mine.accountId)).length;
+      await expect(commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: 0,
+        note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow();
+      // The reading must not survive without its payout. The seq guard fires
+      // before either insert, so this is a weak assertion on its own — the
+      // atomicity that matters is tested next, where the SECOND insert fails.
+      expect((await getLedgerEntries(c, mine.accountId)).length).toBe(before);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("leaves no orphan reading when the payout insert fails", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const before = (await getLedgerEntries(c, mine.accountId)).length;
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      // split_bps_applied out of range fails the CHECK on the SECOND insert,
+      // after the reading has already been written. If the two were separate
+      // client calls, the reading would survive.
+      await expect(c.query(
+        `select public.compound_commit_payout($1,$2,'2026-08-18'::date,$3::bigint,
+           'payout','units',$4,$5::bigint,$6::bigint,'',$7::uuid)`,
+        [mine.accountId, adaId, "5574391", 99_999, "263060", String(maxSeq), MANAGER_USER_ID],
+      )).rejects.toThrow();
+      expect((await getLedgerEntries(c, mine.accountId)).length).toBe(before);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("closes the holder's stored status on exit, in step with what fold derives", async () => {
+    // Decision D-M, and the test plan 3 could not write because none of its
+    // fixtures had a payout in them.
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      await commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "exit", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 1_263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const stored = (await listHolders(c, mine.accountId)).find((h) => h.id === adaId)!;
+      const derived = fold(
+        await getLedgerEntries(c, mine.accountId),
+        await getHolderSeeds(c, mine.accountId),
+      ).holders.find((h) => h.holderId === adaId)!;
+      expect(stored.status).toBe("closed");
+      expect(derived.status).toBe("closed");
+      expect(stored.status).toBe(derived.status);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("does not move the reconcile cursor", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      await c.query(
+        `insert into public.compound_reconcile_cursor (account_id, last_reading_date)
+         values ($1, '2026-08-14')
+         on conflict (account_id) do update set last_reading_date = excluded.last_reading_date`,
+        [mine.accountId],
+      );
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      await commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const { rows } = await c.query<{ last_reading_date: string }>(
+        `select last_reading_date::text from public.compound_reconcile_cursor where account_id = $1`,
+        [mine.accountId],
+      );
+      expect(rows[0]!.last_reading_date).toBe("2026-08-14");
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a payout dated on or after an unclassified capital event", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const adaId = await funded(c, mine.accountId, mine.managerHolderId);
+      await c.query(
+        `insert into public.compound_capital_event_candidate
+           (account_id, trade_date, balance_delta_cents, explained_cents, unexplained_cents)
+         values ($1, '2026-08-12', 500000, 0, 500000)`, [mine.accountId],
+      );
+      const maxSeq = Math.max(...(await getLedgerEntries(c, mine.accountId)).map((e) => e.seq));
+      await expect(commitPayout(c, {
+        accountId: mine.accountId, holderId: adaId, occurredOn: "2026-08-18",
+        settlementEquityCents: 5_574_391n, mode: "payout", feeSettlement: "units",
+        splitBpsApplied: 4000, grossCents: 263_060n, expectedSeq: maxSeq,
+        note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/on or after the unclassified capital event/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+```
+
+- [ ] **Step 6: Run the gates and prove three probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `quote.ts`, change `mulDivFloor(feeableCents, ...)` to `mulDivCeil`. Expect Ada's fee to move from `$1,052.24` and at least four receipt assertions to fail, plus the engine's own suite. Rounding a fee up favours the manager over the investor, which is the direction spec §4 forbids.
+2. In `compound_commit_payout`, move the reading insert after the payout insert. Expect the seq assertions to fail — and note *why they matter*: `fold` applies in `seq` order, so a payout at a lower `seq` than its own settlement reading would settle at the previous NAV, and the receipt would have been right about a transaction that did not happen.
+3. In `compound_commit_payout`, delete the `v_max_seq <> p_expected_seq` check. Expect the CX204 test to fail. Confirm the second half of that test still passes, or the guard has become "refuse everything" and proves nothing.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the payout receipt
+
+The screen this product exists for. Units held, value at NAV, what they have
+put in, profit above that, their share, the fee, units given up, units kept and
+what those are worth, and what they actually receive — every one of them on the
+page, in words a non-accountant can check.
+
+Below the high-water mark, profit-only is disabled WITH THE RECOVERY FIGURE
+STATED, and exit stays available at current value with no fee. A disabled
+control with no number is a dead end.
+
+The writer puts the settlement reading and the payout in one function body, per
+spec 5.2, and refuses under the row lock when the account has moved since the
+receipt was worked out.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
