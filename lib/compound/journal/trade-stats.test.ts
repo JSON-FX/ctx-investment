@@ -93,18 +93,67 @@ describe("computeTradeStats", () => {
 
   // THE DEDUPE ASSERTION. Every headline figure moves if the planted twin
   // survives. Mutation caught: any change that skips dedupeDeals.
-  it("differs from the undeduplicated answer on every headline figure", () => {
+  // THE DEDUPE ASSERTION. Ticket 5092 is a WIN clone of ticket 5008, so it
+  // can only move win-side and total-based figures. Every field of TradeStats
+  // is checked here, explicitly, against both directions:
+  //
+  //   MOVES (asserted .not.toBe below): totalTrades, wins, winRateBps,
+  //   grossProfitCents, netProfitCents, netAfterFeesCents, totalFeesCents,
+  //   profitFactorMilli, avgWinCents, expectedPayoffCents.
+  //
+  //   DOES NOT MOVE, and cannot, given a win-side duplicate on this fixture
+  //   (documented rather than silently skipped — an identical figure has no
+  //   dedupe protection from this test, whatever moves elsewhere):
+  //     - losses, flat: the duplicate is a win, so neither counter is
+  //       touched.
+  //     - grossLossCents, avgLossCents: pure functions of the loss side,
+  //       which is untouched.
+  //     - bestTradeCents: the duplicate's profit (1409) does not exceed the
+  //       fixture's genuine best (2903), so the max is unaffected. This
+  //       fixture cannot exercise dedupe protection for bestTradeCents; that
+  //       would need a duplicate planted on the best trade itself.
+  //     - worstTradeCents: the duplicate is not a loss, so the min over
+  //       losses is untouched.
+  //
+  // Mutation caught: any change that skips dedupeDeals — every MOVES field
+  // reverts to its raw-fixture value, which every .not.toBe below catches
+  // independently of the others.
+  it("differs from the undeduplicated answer on every headline figure that a win-side duplicate can move", () => {
     const bad = computeTradeStats(fixtureHistoryUnguarded().deals);
+
     expect(bad.totalTrades).toBe(10);
     expect(bad.wins).toBe(6);
     expect(bad.winRateBps).toBe(6000);
     expect(bad.grossProfitCents).toBe(7640n);
+    expect(bad.netProfitCents).toBe(4867n);
     expect(bad.netAfterFeesCents).toBe(4516n);
+    expect(bad.totalFeesCents).toBe(-351n);
     expect(bad.profitFactorMilli).toBe(2755n);
+    expect(bad.avgWinCents).toBe(1273n);
+    expect(bad.expectedPayoffCents).toBe(451n);
 
     expect(bad.totalTrades).not.toBe(s.totalTrades);
+    expect(bad.wins).not.toBe(s.wins);
     expect(bad.winRateBps).not.toBe(s.winRateBps);
+    expect(bad.grossProfitCents).not.toBe(s.grossProfitCents);
+    expect(bad.netProfitCents).not.toBe(s.netProfitCents);
     expect(bad.netAfterFeesCents).not.toBe(s.netAfterFeesCents);
+    expect(bad.totalFeesCents).not.toBe(s.totalFeesCents);
+    expect(bad.profitFactorMilli).not.toBe(s.profitFactorMilli);
+    expect(bad.avgWinCents).not.toBe(s.avgWinCents);
+    expect(bad.expectedPayoffCents).not.toBe(s.expectedPayoffCents);
+
+    // The complement, made explicit rather than left as an absence: these
+    // four are identical whether or not the duplicate is dropped, because a
+    // win-side duplicate cannot reach the loss side or the fixture's true
+    // extremes. That is a property of this fixture's duplicate, not a claim
+    // that dedupe is unnecessary for these fields in general.
+    expect(bad.losses).toBe(s.losses);
+    expect(bad.flat).toBe(s.flat);
+    expect(bad.grossLossCents).toBe(s.grossLossCents);
+    expect(bad.avgLossCents).toBe(s.avgLossCents);
+    expect(bad.bestTradeCents).toBe(s.bestTradeCents);
+    expect(bad.worstTradeCents).toBe(s.worstTradeCents);
   });
 
   it("returns zeros for an empty list without dividing by zero", () => {
