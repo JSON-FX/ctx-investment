@@ -14,7 +14,7 @@
  * a streak label is not exercised by anything else in the suite.
  */
 import { render } from "@testing-library/react";
-import type { DailySnapshot } from "@/lib/compound/reconcile/types";
+import type { ClosedDeal, DailySnapshot } from "@/lib/compound/reconcile/types";
 import { buildAccountEquitySeries, type CapitalMarkInput } from "@/lib/compound/journal/equity-series";
 import { binNetPnl } from "@/lib/compound/journal/histogram";
 import { computeStreaks } from "@/lib/compound/journal/streaks";
@@ -308,5 +308,125 @@ describe("StatsPanel", () => {
     ).container.innerHTML;
     expect(emptyOut).not.toContain("NaN");
     expect(emptyOut).toContain("None"); // current streak, none
+  });
+});
+
+/**
+ * The task's own signature fixture: two separate drawdowns on the trading
+ * curve, the LATER one narrower on the page (one sharp step, versus the
+ * first one's gradual three-step bleed) but LARGER in absolute cents — plus
+ * one capital event roughly mid-series, so equity, contributed capital and
+ * trading P/L are all exercised together and visibly diverge.
+ *
+ * A monotonic (only-rising) curve makes every implementation's
+ * maxDrawdownCents zero, correct or not — it cannot discriminate "running
+ * peak" from "peak fixed at the first high" from "drawdown from the final
+ * point only". This fixture can, and does: see the mutation probes in the
+ * task report.
+ *
+ * netCents delta per deal (closeTime order, 2026-06-01 .. 2026-06-10):
+ *   +4000 +2200 -1100 -1050 -1000 +4350 +2250 -6775 +2655 +2385
+ * Running cum:
+ *   4000  6200  5100  4050  3050  7400  9650  2875  5530  7915
+ *                            ^dd1 trough (peak 6200, dd=3150)     ^dd2 trough (peak 9650, dd=6775)
+ * dd1 = 6200-3050 = 3150 (a gradual 3-step decline, deals 3-5).
+ * dd2 = 9650-2875 = 6775 (one sharp step, deal 8) — LARGER than dd1 despite
+ * the narrower, "smaller-looking" footprint on the page.
+ * peakCents = 9650 (the running maximum, reached at deal 7 — after dd1, not
+ * before it: a "first peak" bug that stops updating after 6200 would report
+ * dd1 as the max and go negative-then-stuck once cum passes 6200 again).
+ * currentDrawdownCents = 9650-7915 = 1735 (the final point, smaller than
+ * maxDrawdownCents — the two must stay distinct figures).
+ *
+ * Array order and ticket numbers are deliberately NOT in closeTime order
+ * (same discipline as __fixtures__/deals.ts): computeTradeEquity sorts by
+ * closeTime itself, so a fixture already in order could pass against a
+ * missing or wrong sort by accident.
+ */
+const TWO_DRAWDOWN_DEALS: ClosedDeal[] = [
+  { ticket: 9106, symbol: "EURUSD", side: "buy", volumeMilliLots: 100, openTime: "2026-06-06T07:00:00.000Z", closeTime: "2026-06-06T09:00:00.000Z", profitCents: 4350n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9101, symbol: "GBPUSD", side: "sell", volumeMilliLots: 50, openTime: "2026-06-01T07:00:00.000Z", closeTime: "2026-06-01T09:00:00.000Z", profitCents: 4000n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9108, symbol: "XAUUSD", side: "sell", volumeMilliLots: 30, openTime: "2026-06-08T07:00:00.000Z", closeTime: "2026-06-08T09:00:00.000Z", profitCents: -6775n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9103, symbol: "EURUSD", side: "sell", volumeMilliLots: 100, openTime: "2026-06-03T07:00:00.000Z", closeTime: "2026-06-03T09:00:00.000Z", profitCents: -1100n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9110, symbol: "EURUSD", side: "buy", volumeMilliLots: 100, openTime: "2026-06-10T07:00:00.000Z", closeTime: "2026-06-10T09:00:00.000Z", profitCents: 2385n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9102, symbol: "GBPUSD", side: "buy", volumeMilliLots: 50, openTime: "2026-06-02T07:00:00.000Z", closeTime: "2026-06-02T09:00:00.000Z", profitCents: 2200n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9109, symbol: "XAUUSD", side: "buy", volumeMilliLots: 30, openTime: "2026-06-09T07:00:00.000Z", closeTime: "2026-06-09T09:00:00.000Z", profitCents: 2655n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9104, symbol: "EURUSD", side: "sell", volumeMilliLots: 100, openTime: "2026-06-04T07:00:00.000Z", closeTime: "2026-06-04T09:00:00.000Z", profitCents: -1050n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9107, symbol: "XAUUSD", side: "sell", volumeMilliLots: 30, openTime: "2026-06-07T07:00:00.000Z", closeTime: "2026-06-07T09:00:00.000Z", profitCents: 2250n, swapCents: 0n, commissionCents: 0n },
+  { ticket: 9105, symbol: "EURUSD", side: "sell", volumeMilliLots: 100, openTime: "2026-06-05T07:00:00.000Z", closeTime: "2026-06-05T09:00:00.000Z", profitCents: -1000n, swapCents: 0n, commissionCents: 0n },
+];
+
+// Equity snapshots for the SAME window, from an independent source (a real
+// account's equity reflects floating positions and is never derived from
+// closed-deal P/L alone) — except across 06-04..06-06, chosen so equity's
+// ENTIRE step is the 25,000c deposit and nothing else, which is the cleanest
+// possible demonstration of R4: the gap (performance) is exactly unchanged
+// across that one step, then resumes moving normally on both sides of it.
+const TWO_DRAWDOWN_SNAPSHOTS: DailySnapshot[] = [
+  { tradeDate: "2026-06-02", balanceCloseCents: 502_400n, equityCloseCents: 502_400n },
+  { tradeDate: "2026-06-04", balanceCloseCents: 498_900n, equityCloseCents: 498_900n },
+  { tradeDate: "2026-06-06", balanceCloseCents: 523_900n, equityCloseCents: 523_900n },
+  { tradeDate: "2026-06-08", balanceCloseCents: 528_760n, equityCloseCents: 528_760n },
+  { tradeDate: "2026-06-10", balanceCloseCents: 536_415n, equityCloseCents: 536_415n },
+];
+const TWO_DRAWDOWN_MARKS: CapitalMarkInput[] = [
+  { occurredOn: "2026-06-05", amountCents: 25_000n, direction: "in" },
+];
+
+describe("the two-drawdown, mid-series capital event fixture (task report)", () => {
+  const deals = buildTradeHistory(TWO_DRAWDOWN_DEALS, null).deals;
+  const equity = computeTradeEquity(deals);
+  const series = buildAccountEquitySeries({
+    snapshots: TWO_DRAWDOWN_SNAPSHOTS,
+    marks: TWO_DRAWDOWN_MARKS,
+    marksCompleteThrough: "2026-06-10",
+  });
+
+  it("finds all ten deals and orders the curve by close time, not ticket or array order", () => {
+    expect(equity.curve).toHaveLength(10);
+    expect(equity.curve.map((p) => p.ticket)).toEqual([
+      9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108, 9109, 9110,
+    ]);
+  });
+
+  // The signature assertion: the SECOND, narrower drawdown is the maximum,
+  // not the first, wider-looking one — and neither equals the drawdown at
+  // the final point, which is smaller than both peaks' declines.
+  it("measures the maximum drawdown from the later, higher peak", () => {
+    expect(equity.curve.map((p) => p.cumCents)).toEqual([
+      4000n, 6200n, 5100n, 4050n, 3050n, 7400n, 9650n, 2875n, 5530n, 7915n,
+    ]);
+    expect(equity.peakCents).toBe(9650n);
+    expect(equity.maxDrawdownCents).toBe(6775n); // dd2, not dd1's 3150n
+    expect(equity.currentDrawdownCents).toBe(1735n);
+    expect(equity.netCents).toBe(7915n);
+    // Named so a future edit cannot quietly swap maxDrawdownCents for dd1's
+    // value and still pass: dd1 must remain the SMALLER of the two.
+    expect(6775n).toBeGreaterThan(3150n);
+  });
+
+  it("renders the peak, net and max-drawdown figures on the chart with no NaN", () => {
+    const out = render(<PnlCurve result={equity} />).container.innerHTML;
+    expect(out).not.toContain("NaN");
+    expect(out).toContain("+79.15"); // net
+    expect(out).toContain("96.50"); // peak
+    expect(out).toContain("67.75"); // max drawdown — NOT 31.50 (dd1)
+    expect(out).not.toContain("31.50");
+  });
+
+  // R4 in one number: across the ONE step where equity's entire move is the
+  // deposit (06-04 -> 06-06: +25,000 equity, +25,000 contributed), the
+  // performance gap is EXACTLY the same figure on both sides — 4,989.00 —
+  // appearing twice. Before and after that step it moves normally (the
+  // hidden table also carries 06-02's and 06-08's distinct performance
+  // figures), so this is not a fixture where nothing ever changes.
+  it("holds performance exactly flat across the one step that is pure deposit", () => {
+    expect(series.points.map((p) => p.performanceCents)).toEqual([
+      502_400n, 498_900n, 498_900n, 503_760n, 511_415n,
+    ]);
+    const html = render(<EquityChart series={series} />).container.innerHTML;
+    expect(html).not.toContain("NaN");
+    expect((html.match(/\+4,989\.00/g) ?? []).length).toBe(2);
+    expect(html).toContain("capital in 250.00");
   });
 });
