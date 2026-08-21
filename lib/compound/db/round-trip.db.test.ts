@@ -212,7 +212,23 @@ describe("Part A: the seeded account, end to end", () => {
       // mistake a caller could make by passing it raw, undeduped deals.
       const withRaw = await runOnce(false);
       const withKept = await runOnce(true);
-      expect(withRaw).toEqual(withKept);
+
+      // The DECISION must be identical either way — same kind, same readings,
+      // same cursor, same candidate. droppedDeals is deliberately excluded
+      // from that comparison: it reports what planReadings itself removed, so
+      // it is empty when the caller already deduped and non-empty when it did
+      // not. Asserting the two agree on it would assert the opposite of the
+      // property under test.
+      const { droppedDeals: rawDropped, ...rawDecision } = withRaw;
+      const { droppedDeals: keptDropped, ...keptDecision } = withKept;
+      expect(rawDecision).toEqual(keptDecision);
+
+      // And prove the dedupe actually ran inside planReadings, rather than the
+      // two runs agreeing because neither dropped anything. Without this pair
+      // the test above passes with dedupe removed entirely.
+      expect(rawDropped.length).toBeGreaterThan(0);
+      expect(keptDropped).toEqual([]);
+
       if (withRaw.kind !== "halt") throw new Error("expected halt");
       expect(withRaw.candidate.tradeDate).toBe("2026-08-12");
     });

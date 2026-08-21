@@ -31,6 +31,7 @@ function advance(readings: Array<{ occurredOn: string; equityCents: bigint }>): 
     kind: "advance",
     readings,
     newCursorDate: readings[readings.length - 1]!.occurredOn,
+    droppedDeals: [],
   };
 }
 
@@ -59,7 +60,7 @@ afterAll(async () => {
 describe("an idle plan", () => {
   it("writes nothing and reports nothing", async () => {
     const result = await withTestClient((c) =>
-      commitReadingPlan(c, { accountId: accountA, plan: { kind: "idle" }, actorUserId: MANAGER }),
+      commitReadingPlan(c, { accountId: accountA, plan: { kind: "idle", droppedDeals: [] }, actorUserId: MANAGER }),
     );
     expect(result).toEqual({
       readingsInserted: 0,
@@ -75,7 +76,7 @@ describe("an idle plan", () => {
     const fake = { query: jest.fn() } as unknown as Parameters<typeof commitReadingPlan>[0];
     await commitReadingPlan(fake, {
       accountId: accountA,
-      plan: { kind: "idle" },
+      plan: { kind: "idle", droppedDeals: [] },
       actorUserId: MANAGER,
     });
     expect((fake as unknown as { query: jest.Mock }).query).not.toHaveBeenCalled();
@@ -217,6 +218,7 @@ describe("an advancing plan", () => {
           accountId: accountA,
           plan: {
             kind: "advance",
+            droppedDeals: [],
             readings: [reading("2026-08-05", 100n), reading("2026-08-03", 200n)],
             newCursorDate: "2026-08-03",
           },
@@ -249,6 +251,7 @@ describe("a halting plan", () => {
     newCursorDate: string | null,
   ): ReadingPlan => ({
     kind: "halt",
+    droppedDeals: [],
     readings,
     newCursorDate,
     candidate: {
@@ -339,6 +342,7 @@ describe("ATOMICITY — the whole point of this task", () => {
    */
   const badPlan: ReadingPlan = {
     kind: "halt",
+    droppedDeals: [],
     readings: [
       reading("2026-08-08", 100n),
       reading("2026-08-09", 200n),
