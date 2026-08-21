@@ -168,3 +168,48 @@ export function monthSummary(
   }
   return out;
 }
+
+/**
+ * The month the calendar opens on: the latest month containing a trade, or
+ * the fallback when there are none. Deliberately not "this month" — a clock
+ * read makes the render non-deterministic, and an account that has been quiet
+ * for a fortnight would open on an empty grid.
+ */
+export function latestMonth(days: Map<string, CalendarDay>, fallback: string): string {
+  let latest: string | null = null;
+  for (const key of days.keys()) {
+    const month = key.slice(0, 7);
+    if (latest === null || month > latest) latest = month;
+  }
+  return latest ?? fallback;
+}
+
+/**
+ * Shading tier for a day cell: 0 ordinary, 1 notable, 2 strong.
+ *
+ * The threshold is the month's upper-quartile magnitude, so shading is
+ * relative to the month being looked at rather than to a fixed cash figure
+ * that means nothing across accounts of different sizes. Shading is never the
+ * only signal — every cell carries its figure as text.
+ */
+export function dayIntensity(
+  days: Map<string, CalendarDay>,
+  month: string,
+): (day: CalendarDay) => 0 | 1 | 2 {
+  const magnitudes: bigint[] = [];
+  for (const [key, day] of days) {
+    if (key.startsWith(`${month}-`)) {
+      magnitudes.push(day.netCents < 0n ? -day.netCents : day.netCents);
+    }
+  }
+  if (magnitudes.length === 0) return () => 0;
+  magnitudes.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const upper = magnitudes[Math.floor((magnitudes.length * 3) / 4)] ?? magnitudes[magnitudes.length - 1]!;
+  const median = magnitudes[Math.floor(magnitudes.length / 2)] ?? 0n;
+  return (day) => {
+    const mag = day.netCents < 0n ? -day.netCents : day.netCents;
+    if (mag >= upper && upper > 0n) return 2;
+    if (mag >= median && median > 0n) return 1;
+    return 0;
+  };
+}
