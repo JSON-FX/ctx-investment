@@ -109,6 +109,7 @@ describe("reconciler properties", () => {
           cursor: { lastReadingDate: null },
           brokerOffsetHours: OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
         if (plan.kind !== "halt") return true;
         for (const r of plan.readings) {
@@ -133,6 +134,7 @@ describe("reconciler properties", () => {
           cursor: { lastReadingDate: null },
           brokerOffsetHours: OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
         if (plan.kind === "idle") return true;
         const dates = plan.readings.map((r) => r.occurredOn);
@@ -157,6 +159,7 @@ describe("reconciler properties", () => {
           cursor: { lastReadingDate: null },
           brokerOffsetHours: OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
         if (plan.kind !== "advance") {
           throw new Error(`expected advance with no capital events, got ${plan.kind}`);
@@ -174,7 +177,10 @@ describe("reconciler properties", () => {
     fc.assert(
       fc.property(fc.array(dayArb, { minLength: 1, maxLength: 30 }), (days) => {
         const { snapshots, deals } = build(days);
-        const args = { snapshots, deals, brokerOffsetHours: OFFSET_HOURS, toleranceCents: 0n };
+        const args = {
+          snapshots, deals, brokerOffsetHours: OFFSET_HOURS, toleranceCents: 0n,
+          classifiedDates: [] as readonly string[],
+        };
 
         const first = planReadings({ ...args, cursor: { lastReadingDate: null } });
         if (first.kind === "idle") return true;
@@ -252,6 +258,7 @@ describe("reconciler properties", () => {
           cursor: { lastReadingDate: null },
           brokerOffsetHours: OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
         if (plan.kind === "idle") return true;
         const byDate = new Map(snapshots.map((s) => [s.tradeDate, s]));
@@ -280,6 +287,7 @@ describe("reconciler properties", () => {
           cursor: { lastReadingDate: null },
           brokerOffsetHours: OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
 
         // Fold capital forward across skipped days: a move on a day with no

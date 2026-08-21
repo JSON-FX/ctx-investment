@@ -143,6 +143,7 @@ describe("Part A: the seeded account, end to end", () => {
           cursor,
           brokerOffsetHours: BROKER_OFFSET_HOURS,
           toleranceCents: 0n,
+          classifiedDates: [],
         });
         return plan;
       });
@@ -449,6 +450,7 @@ describe("Part B: readings carry equity, and the fold reproduces it", () => {
         cursor,
         brokerOffsetHours: BROKER_OFFSET_HOURS,
         toleranceCents: 0n,
+        classifiedDates: [],
       });
     });
     expect(plan.kind).toBe("advance");
@@ -465,6 +467,7 @@ describe("Part B: readings carry equity, and the fold reproduces it", () => {
         cursor,
         brokerOffsetHours: BROKER_OFFSET_HOURS,
         toleranceCents: 0n,
+        classifiedDates: [],
       });
       await commitReadingPlan(c, { accountId, plan, actorUserId: MANAGER });
       return getLedgerEntries(c, accountId);
@@ -496,6 +499,7 @@ describe("Part B: readings carry equity, and the fold reproduces it", () => {
         cursor,
         brokerOffsetHours: BROKER_OFFSET_HOURS,
         toleranceCents: 0n,
+        classifiedDates: [],
       });
       await commitReadingPlan(c, { accountId, plan, actorUserId: MANAGER });
       return { entries: await getLedgerEntries(c, accountId), snapshots };
@@ -520,6 +524,7 @@ describe("Part B: readings carry equity, and the fold reproduces it", () => {
         cursor,
         brokerOffsetHours: BROKER_OFFSET_HOURS,
         toleranceCents: 0n,
+        classifiedDates: [],
       });
       await commitReadingPlan(c, { accountId, plan, actorUserId: MANAGER });
       const entries = await getLedgerEntries(c, accountId);

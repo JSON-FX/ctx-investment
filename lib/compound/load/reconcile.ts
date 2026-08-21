@@ -20,10 +20,27 @@
  * defects above are exceptions, and only RangeError is caught here; anything
  * else escapes, because a plain Error from this path is a bug this function
  * has no business turning into a quiet outcome value.
+ *
+ * classifiedDates — closing the classified-cursor deadlock. planReadings is
+ * pure and knows nothing of the ledger, so on its own it re-derives the same
+ * unexplained balance move from snapshots and deals every single run, even
+ * after a manager has classified it — it has no way to learn that a human
+ * already resolved that day. compound_classify_candidate deliberately never
+ * touches the cursor (only compound_commit_reading_plan does, and only when
+ * it has readings to post), so without this, nothing ever tells the planner
+ * the day stopped being unclassified: refresh, classify, refresh again halts
+ * on the exact same day forever. This is the one place that can tell it —
+ * every non-pending candidate (status 'classified' from a deposit/match, or
+ * 'ignored' — both are a human decision, recorded either in the ledger or in
+ * the candidate row's own audit trail) is read alongside the cursor, on every
+ * call, and handed through unchanged. All-time and unfiltered by the snapshot
+ * window on purpose: a candidate outside that window cannot match any `day`
+ * planReadings evaluates, so an unfiltered read costs nothing and needs no
+ * synchronised date-range logic to get wrong.
  */
 import { cache } from "react";
 import { withDb } from "@/lib/compound/db/client";
-import { getReconcileCursor } from "@/lib/compound/db/compound";
+import { getReconcileCursor, listCandidates } from "@/lib/compound/db/compound";
 import { getClosedDeals, getDailySnapshots } from "@/lib/compound/db/copytraderx";
 import type { DroppedDeal } from "@/lib/compound/reconcile/dedupe";
 import { planReadings, type ReadingPlan } from "@/lib/compound/reconcile/interlock";
@@ -40,7 +57,7 @@ export type ReconcileOutcome =
 export const planFor = cache(async (account: ResolvedAccount): Promise<ReconcileOutcome> => {
   if (account.brokerOffsetHours === null) return { kind: "not-configured" };
 
-  const [cursor, snapshots, deals] = await withDb(async (c) => {
+  const [cursor, snapshots, deals, candidates] = await withDb(async (c) => {
     const cur = await getReconcileCursor(c, account.id);
     // The window must INCLUDE the cursor date: the first day's balance move is
     // reconciled against the balance at the cursor, and planReadings throws if
@@ -51,8 +68,16 @@ export const planFor = cache(async (account: ResolvedAccount): Promise<Reconcile
       cur,
       await getDailySnapshots(c, account.mt5Account, { from }),
       await getClosedDeals(c, account.mt5Account, { from }),
+      // Unfiltered by status: every outcome classifyCandidate can reach
+      // ('classified' or 'ignored') resolves the day, and planReadings does
+      // its own filtering by date. See the module doc above.
+      await listCandidates(c, account.id),
     ] as const;
   });
+
+  const classifiedDates = candidates
+    .filter((k) => k.status !== "pending")
+    .map((k) => k.tradeDate);
 
   try {
     return {
@@ -63,6 +88,7 @@ export const planFor = cache(async (account: ResolvedAccount): Promise<Reconcile
         cursor,
         brokerOffsetHours: account.brokerOffsetHours,
         toleranceCents: TOLERANCE_CENTS,
+        classifiedDates,
       }),
       lastSnapshotDate: snapshots.length === 0
         ? null
