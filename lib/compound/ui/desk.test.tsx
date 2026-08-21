@@ -21,6 +21,7 @@ function renderDesk(over: Partial<Parameters<typeof Desk>[0]> = {}) {
       entryCount={over.entryCount ?? LEDGER.length}
       live={over.live === undefined ? LIVE : over.live}
       actions={over.actions}
+      holderActions={over.holderActions}
     />,
   );
 }
@@ -106,8 +107,16 @@ describe("Desk — the holder table", () => {
     expect(screen.queryByRole("link", { name: "Pay out" })).toBeNull();
   });
 
-  it("offers one once actions are wired", () => {
+  it("stays off merely because the action bar is wired — Task 13 owns turning it on", () => {
     renderDesk({ actions: <a className="btn" href="/a/7/actions/reading">Post a reading</a> });
+    expect(screen.queryByRole("link", { name: "Pay out" })).toBeNull();
+  });
+
+  it("offers one once holderActions is on", () => {
+    renderDesk({
+      actions: <a className="btn" href="/a/7/actions/reading">Post a reading</a>,
+      holderActions: true,
+    });
     expect(screen.getAllByRole("link", { name: "Pay out" }).length).toBeGreaterThan(0);
   });
 
@@ -212,11 +221,12 @@ describe("Desk — a holder who has fully exited", () => {
     expect(legend.textContent).not.toContain("Grace Hopper");
   });
 
-  it("still lists the closed holder in the table, tagged Closed, with no payout link even once actions are wired", () => {
+  it("still lists the closed holder in the table, tagged Closed, with no payout link even once holderActions is on", () => {
     renderDesk({
       state: closedState,
       entryCount: entries.length,
       actions: <a className="btn" href="/a/7/actions/reading">Post a reading</a>,
+      holderActions: true,
     });
     const row = screen.getByRole("row", { name: /Grace Hopper/ });
     expect(within(row).getByText("Closed")).toBeInTheDocument();
