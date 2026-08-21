@@ -64,8 +64,13 @@ export function AccountSwitcher({
 }
 
 export function Masthead({
-  current, accounts,
-}: { current: MastheadAccount; accounts: MastheadAccount[] }) {
+  current, accounts, signOutAction,
+}: {
+  current: MastheadAccount;
+  accounts: MastheadAccount[];
+  /** A Server Action: clears the session, then redirects to /sign-in. */
+  signOutAction: (formData: FormData) => Promise<void>;
+}) {
   return (
     <header className="mast">
       <div>
@@ -75,6 +80,9 @@ export function Masthead({
         <span className="sub">Investor Desk</span>
       </div>
       <AccountSwitcher current={current} accounts={accounts} />
+      <form action={signOutAction}>
+        <button className="btn" type="submit">Sign out</button>
+      </form>
     </header>
   );
 }

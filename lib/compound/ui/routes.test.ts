@@ -30,6 +30,7 @@ describe("activeNavKey", () => {
     ["/a/7/review/12", "review"],
     ["/a/7/journal", "journal"],
     ["/a/7/holders/2", "desk"],
+    ["/a/7/holders/2/edit", "desk"],
     ["/a/7/actions/payout/2", "desk"],
   ])("maps %s to %s", (path, key) => {
     expect(activeNavKey(path, 7)).toBe(key);

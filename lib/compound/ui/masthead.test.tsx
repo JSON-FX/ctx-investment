@@ -17,6 +17,7 @@ const A: ResolvedAccount = {
   managerUserId: "u1", brokerOffsetHours: 3,
 };
 const B: ResolvedAccount = { ...A, id: 8, mt5Account: 90_000_002, label: "Pooled — second", currency: "EUR" };
+const noop = async () => {};
 
 describe("AccountSwitcher — one account", () => {
   it("shows the account without offering a menu there is nothing in", () => {
@@ -65,8 +66,28 @@ describe("AccountSwitcher — several accounts", () => {
 
 describe("Masthead", () => {
   it("puts the brand mark in the display face and links it home", () => {
-    const { container } = render(<Masthead current={A} accounts={[A]} />);
+    const { container } = render(
+      <Masthead current={A} accounts={[A]} signOutAction={noop} />,
+    );
     expect(screen.getByText("Compound").closest("a")).toHaveAttribute("href", "/");
     expect(container.querySelector(".mark")?.textContent).toBe("Compound");
+  });
+
+  it("offers a way to sign out, wired to whatever action the layout hands it", () => {
+    render(<Masthead current={A} accounts={[A]} signOutAction={noop} />);
+    const button = screen.getByRole("button", { name: "Sign out" });
+    // A Server Action prop is a function, not a URL — the only thing this
+    // layer can prove is that the control is a real submit button inside a
+    // <form>, so activating it actually invokes whatever action the caller
+    // passed rather than being a dead label. What that action DOES (clear
+    // the session, redirect to /sign-in) is proved separately: session.ts's
+    // SIGN_IN_PATH and its own real, unmocked redirect() test.
+    expect(button).toHaveAttribute("type", "submit");
+    expect(button.closest("form")).not.toBeNull();
+  });
+
+  it("keeps sign-out present regardless of how many accounts there are", () => {
+    render(<Masthead current={A} accounts={[A, B]} signOutAction={noop} />);
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
   });
 });

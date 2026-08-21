@@ -34,6 +34,13 @@
  *          reused across Tasks 12-14 for the same underlying refusal
  *          (not-pending / stale seq / no such holder / bad enum value)
  *          rather than re-allocated per task.
+ *   CX3xx  editing an existing holder (compound_update_holder). A new block
+ *          of its own rather than new numbers inside CX1xx — CX1xx and CX2xx
+ *          are already spoken for by add-holder and the capital-event
+ *          writers, and this is a fourth, independent writer, not a variant
+ *          of either. CX001 (no such account) is reused here too, matching
+ *          every other writer in this table — see the CX1xx/CX2xx note
+ *          above for why that one code is the exception that crosses blocks.
  */
 const MESSAGES: Record<string, string> = {
   // CX0xx — the reading writer (compound_commit_reading_plan) and the
@@ -78,6 +85,12 @@ const MESSAGES: Record<string, string> = {
     "why the balance moved and nobody is going to remember by the time it matters.",
   CX210: "That entry does not belong to this account.",
   CX211: "A deposit needs a positive amount.",
+
+  // CX3xx — editing an existing holder (compound_update_holder).
+  CX301: "That holder is not on this account. Check you picked the right holder.",
+  CX302: "A holder needs a name.",
+  CX303: "Split must be a percentage between 0 and 100.",
+  CX304: "The manager's split is fixed at 0 — you never charge yourself a fee.",
 };
 
 export function explainCommitError(e: unknown): string {

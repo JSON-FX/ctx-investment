@@ -28,6 +28,23 @@ export interface SessionUser {
 }
 
 /**
+ * Where a request with no valid session lands — both the one requireManager
+ * issues below and the one the sign-out action (app/a/[id]/layout.tsx)
+ * issues after clearing the session. One constant, not two matching
+ * strings, so "sign out, then the next request redirects to /sign-in" is
+ * true by construction rather than by two literals someone could let drift.
+ *
+ * requireManager calls into a live Supabase session (next/headers cookies,
+ * the Auth server) that does not exist in a Jest process — see this file's
+ * own module doc and gate.db.test.ts's — so the redirect itself cannot be
+ * exercised end to end here. This constant, and the real, unmocked
+ * next/navigation redirect() call session.test.ts makes against it, are the
+ * seam that stays testable: change where this points, or break what
+ * redirect() does with it, and that test goes red.
+ */
+export const SIGN_IN_PATH = "/sign-in";
+
+/**
  * The role half of spec section 9's AND gate: does this identity carry the
  * admin claim?
  *
@@ -59,13 +76,13 @@ export function resolveIsAdmin(claimedRole: string | null, storedRole: string | 
 export const requireManager = cache(async (): Promise<SessionUser> => {
   const supabase = await authClient();
   const { data, error } = await supabase.auth.getUser();
-  if (error || !data.user) redirect("/sign-in");
+  if (error || !data.user) redirect(SIGN_IN_PATH);
 
   const claim = (data.user.app_metadata as { role?: unknown } | null)?.role;
   const claimed = typeof claim === "string" ? claim : null;
   const stored = await withDb((c) => getUserRole(c, data.user!.id));
 
-  if (!resolveIsAdmin(claimed, stored)) redirect("/sign-in?denied=1");
+  if (!resolveIsAdmin(claimed, stored)) redirect(`${SIGN_IN_PATH}?denied=1`);
 
   return { id: data.user.id, email: data.user.email ?? null };
 });

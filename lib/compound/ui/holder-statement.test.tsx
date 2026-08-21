@@ -266,3 +266,27 @@ describe("HolderStatement — Phase A", () => {
     expect(screen.queryByRole("link", { name: /Pay out/ })).toBeNull();
   });
 });
+
+describe("HolderStatement — editing", () => {
+  it("offers no way to edit when the page does not pass one", () => {
+    renderFor();
+    expect(screen.queryByRole("link", { name: /Edit/ })).toBeNull();
+  });
+
+  it("renders whatever edit control the page hands it", () => {
+    const state = fold(LEDGER, SEEDS);
+    render(
+      <HolderStatement
+        holder={ADA}
+        position={holderPosition(state, ADA.id)}
+        rows={holderStatement(ledgerSteps(LEDGER, SEEDS), ADA.id)}
+        totals={totalsOf(state)}
+        currency="USD"
+        editAction={<a className="btn" href="/a/7/holders/2/edit">Edit</a>}
+      />,
+    );
+    expect(screen.getByRole("link", { name: "Edit" })).toHaveAttribute(
+      "href", "/a/7/holders/2/edit",
+    );
+  });
+});

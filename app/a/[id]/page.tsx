@@ -5,7 +5,7 @@ import { deskFigures } from "@/lib/compound/present/derive";
 import { railSegments } from "@/lib/compound/present/rail";
 import { Notice } from "@/lib/compound/ui/banner";
 import { Desk } from "@/lib/compound/ui/desk";
-import { readingHref } from "@/lib/compound/ui/routes";
+import { capitalHref, readingHref } from "@/lib/compound/ui/routes";
 import { refreshReadings } from "./actions/actions";
 
 export const dynamic = "force-dynamic";
@@ -82,6 +82,7 @@ export default async function DeskPage({
               <button className="btn" type="submit">Refresh readings</button>
             </form>
             <a className="btn" href={readingHref(account.id)}>Post a reading by hand</a>
+            <a className="btn" href={capitalHref(account.id)}>Add capital (yours or a holder&apos;s)</a>
           </>
         }
       />
