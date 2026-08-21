@@ -33,7 +33,9 @@
  *          sections specify them; CX203/CX204/CX205/CX208 are deliberately
  *          reused across Tasks 12-14 for the same underlying refusal
  *          (not-pending / stale seq / no such holder / bad enum value)
- *          rather than re-allocated per task.
+ *          rather than re-allocated per task. CX212/CX213 are new, for P6's
+ *          compound_commit_withdrawal — no prior code means the same thing,
+ *          so they are not reused from elsewhere in this block.
  */
 const MESSAGES: Record<string, string> = {
   // CX0xx — the reading writer (compound_commit_reading_plan) and the
@@ -78,6 +80,10 @@ const MESSAGES: Record<string, string> = {
     "why the balance moved and nobody is going to remember by the time it matters.",
   CX210: "That entry does not belong to this account.",
   CX211: "A deposit needs a positive amount.",
+  CX212: "A withdrawal needs a positive amount.",
+  CX213:
+    "That is more than this holder's current value. Check the figure you entered — the " +
+    "most they can withdraw is what the receipt shows as their value today.",
 };
 
 export function explainCommitError(e: unknown): string {

@@ -1,4 +1,6 @@
-import { SUBNAV, activeNavKey, deskHref, holderHref, payoutHref } from "./routes";
+import {
+  SUBNAV, activeNavKey, deskHref, holderHref, payoutHref, withdrawHref,
+} from "./routes";
 
 describe("SUBNAV", () => {
   it("carries the six agreed entries in the agreed order", () => {
@@ -55,5 +57,6 @@ describe("href builders", () => {
     expect(deskHref(7)).toBe("/a/7");
     expect(holderHref(7, 2)).toBe("/a/7/holders/2");
     expect(payoutHref(7, 2)).toBe("/a/7/actions/payout/2");
+    expect(withdrawHref(7, 2)).toBe("/a/7/actions/withdraw/2");
   });
 });

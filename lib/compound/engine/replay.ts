@@ -14,12 +14,13 @@
  */
 import type { Cents, Units } from "./money";
 import { unitsForDeposit, unitsForFee, type PoolTotals } from "./nav";
-import { quote } from "./quote";
+import { quote, type PayoutMode } from "./quote";
 
 export type LedgerEntryType =
   | "deposit"
   | "payout"
   | "exit"
+  | "withdrawal"
   | "equity_reading"
   | "adjustment";
 
@@ -32,7 +33,15 @@ export interface LedgerEntry {
   /** Broker-server date, YYYY-MM-DD. */
   occurredOn: string;
   type: LedgerEntryType;
-  /** Signed for adjustment; positive otherwise. */
+  /**
+   * Signed for adjustment; positive otherwise.
+   *
+   * For "withdrawal" this is a genuine INPUT that fold() reads, exactly like
+   * a deposit's amount — the arbitrary requested figure cannot be derived
+   * from anything else. That is unlike "payout" and "exit", whose
+   * amountCents is a redundant record of what quote() already computed from
+   * holder state alone; fold() never reads it back for those two.
+   */
   amountCents: Cents;
   feeSettlement: "units" | "cash" | null;
   splitBpsApplied: number | null;
@@ -133,7 +142,8 @@ export function fold(
         break;
       }
       case "payout":
-      case "exit": {
+      case "exit":
+      case "withdrawal": {
         const h = holderOf(e.holderId);
         if (e.splitBpsApplied === null) {
           throw new Error(
@@ -145,18 +155,31 @@ export function fold(
         // Every figure is taken against the PRE-payout totals. That is what
         // keeps NAV from decreasing across the operation.
         const totals: PoolTotals = { equityCents, units };
+        const mode: PayoutMode =
+          e.type === "exit" ? "exit" : e.type === "withdrawal" ? "partial" : "profit";
         const q = quote({
           totals,
           holderUnits: h.units,
           basisCents: h.basisCents,
           splitBps: e.splitBpsApplied,
           isManager: h.isManager,
-          mode: e.type === "exit" ? "exit" : "profit",
+          mode,
+          // amountCents is the requested figure ONLY for "withdrawal" — see
+          // the field doc on LedgerEntry.amountCents. quote() ignores this
+          // input for every other mode.
+          amountCents: e.type === "withdrawal" ? e.amountCents : undefined,
         });
 
         h.units -= q.unitsRedeemed;
         units -= q.unitsRedeemed;
         equityCents -= q.toHolderCents;
+        // Uniform across all three types: 0 net change for "payout" (its
+        // capitalPortionCents is always 0), a full reset to 0 for "exit"
+        // (capitalPortionCents === basisCents always), and the proportional
+        // reduction for "withdrawal". One assignment replaces what used to
+        // be an exit-only special case, because quote() now derives the
+        // right answer for every mode rather than fold() hard-coding one.
+        h.basisCents = q.newBasisCents;
 
         if (q.feeCents > 0n) {
           const manager = [...holders.values()].find((x) => x.isManager);
@@ -175,8 +198,12 @@ export function fold(
           }
         }
 
-        if (e.type === "exit") {
-          h.basisCents = 0n;
+        // A withdrawal that drains a holder to zero units closes them for
+        // the same reason exit always does: a holder with nothing left
+        // cannot be "active" in any sense the desk shows, and a later
+        // re-deposit reactivating them (case "deposit", below) already
+        // starts their basis fresh either way.
+        if (e.type === "exit" || (e.type === "withdrawal" && h.units === 0n)) {
           h.status = "closed";
         }
         break;

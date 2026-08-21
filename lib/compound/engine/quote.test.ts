@@ -179,3 +179,133 @@ describe("quote — units redeemed on an awkward NAV", () => {
     expect(q.unitsRedeemed).toBe(unitsFromDecimal("2"));
   });
 });
+
+// P6 — partial withdrawal. A holder takes an arbitrary amount, capped at
+// their current value. The proportional rule: this withdrawal carries the
+// same profit/capital mix as the whole position, because units are fungible.
+describe("quote — partial withdrawal, proportional rule", () => {
+  it("splits the withdrawal proportionally to the holder's profit/capital mix", () => {
+    // Whole position: value $250, basis $100, profit $150 (60% of value).
+    // Withdraw exactly half the value ($125): capital and profit both halve.
+    const q = quote(input({ mode: "partial", amountCents: centsFromDecimal("125") }));
+    expect(q.grossCents).toBe(centsFromDecimal("125"));
+    expect(q.capitalPortionCents).toBe(centsFromDecimal("50"));       // 125 * 100/250
+    expect(q.withdrawalProfitCents).toBe(centsFromDecimal("75"));     // 125 * 150/250
+    expect(q.capitalPortionCents + q.withdrawalProfitCents).toBe(q.grossCents);
+    expect(q.feeCents).toBe(centsFromDecimal("30"));                  // 75 * 40%
+    expect(q.toHolderCents).toBe(centsFromDecimal("95"));             // 125 - 30
+    expect(q.newBasisCents).toBe(centsFromDecimal("50"));             // 100 - 50
+  });
+
+  it("floors the profit slice on a division that does not land evenly, favouring the investor", () => {
+    // AWKWARD-style pool, so the split itself has a genuine remainder, not
+    // just unitsRedeemed. holderUnits 3, basis $6.00, value $7.00 (profit
+    // $1.00). Withdraw $3.33.
+    //   exact profit slice = 333 * 100/700 = 47.571... -> floor 47
+    //   capital slice (complement) = 333 - 47 = 286, NOT floor(333*600/700)=285
+    // Flooring the PROFIT side (not the capital side) is the direction that
+    // charges no more fee than the exact proportional split would — flooring
+    // capital instead would inflate the fee base and charge the holder more
+    // than the exact split, which is the wrong direction per the fee-amount
+    // rule ("floor — favours the investor").
+    const AWKWARD: PoolTotals = { equityCents: 700n, units: unitsFromDecimal("3") };
+    const q = quote({
+      totals: AWKWARD,
+      holderUnits: unitsFromDecimal("3"),
+      basisCents: 600n,
+      splitBps: 4000,
+      isManager: false,
+      mode: "partial",
+      amountCents: 333n,
+    });
+    expect(q.withdrawalProfitCents).toBe(47n);
+    expect(q.capitalPortionCents).toBe(286n);
+    expect(q.capitalPortionCents + q.withdrawalProfitCents).toBe(333n);
+    expect(q.feeCents).toBe(18n);          // floor(47 * 40%) = floor(18.8)
+    expect(q.toHolderCents).toBe(315n);    // 333 - 18
+    expect(q.newBasisCents).toBe(314n);    // 600 - 286
+    // Ceils, same direction as every other unitsRedeemed — lands on an
+    // awkward, non-terminating fraction of a unit here (not a half-unit;
+    // the NAV-2.00 fixture below covers the half-unit case).
+    expect(q.unitsRedeemed).toBe(14_271_428_572n);
+  });
+
+  it("lands exactly on a half-unit at a flat NAV", () => {
+    // NAV $2.00 flat: $125 buys exactly 62.5 units.
+    const q = quote(input({ mode: "partial", amountCents: centsFromDecimal("125") }));
+    expect(q.unitsRedeemed).toBe(unitsFromDecimal("62.5"));
+  });
+
+  it("charges no fee at all below the high-water mark — there is no profit to split", () => {
+    const under = input({ basisCents: centsFromDecimal("400") }); // value $250 < basis $400
+    const q = quote({ ...under, mode: "partial", amountCents: centsFromDecimal("100") });
+    expect(q.withdrawalProfitCents).toBe(0n);
+    expect(q.capitalPortionCents).toBe(centsFromDecimal("100"));
+    expect(q.feeCents).toBe(0n);
+    expect(q.toHolderCents).toBe(centsFromDecimal("100"));
+    expect(q.newBasisCents).toBe(centsFromDecimal("300")); // 400 - 100
+  });
+
+  it("never charges the manager a fee on their own partial withdrawal", () => {
+    const q = quote(input({ mode: "partial", amountCents: centsFromDecimal("125"), isManager: true }));
+    expect(q.feeCents).toBe(0n);
+    expect(q.splitBpsApplied).toBe(0);
+    expect(q.toHolderCents).toBe(centsFromDecimal("125"));
+  });
+
+  describe("the cap — a holder may never withdraw more than they hold", () => {
+    // Deliberately NOT a round fraction of value (basis $90 of value $250,
+    // a 36% ratio) so the boundary isn't hiding behind a fixture where the
+    // arithmetic happens to land cleanly regardless of which cent is at play.
+    const common = {
+      totals: POOL,
+      holderUnits: unitsFromDecimal("125"),   // value $250
+      basisCents: centsFromDecimal("90"),
+      splitBps: 4000,
+      isManager: false,
+    } as const;
+    const cap = centsFromDecimal("250");
+
+    it("succeeds at exactly the cap, and is equivalent to an exit", () => {
+      const partial = quote({ ...common, mode: "partial", amountCents: cap });
+      const exit = quote({ ...common, mode: "exit" });
+      expect(partial.grossCents).toBe(exit.grossCents);
+      expect(partial.feeCents).toBe(exit.feeCents);
+      expect(partial.toHolderCents).toBe(exit.toHolderCents);
+      expect(partial.capitalPortionCents).toBe(exit.capitalPortionCents);
+      expect(partial.newBasisCents).toBe(exit.newBasisCents);
+      // The whole point: redeems the holder's EXACT unit balance, not a
+      // value-derived figure that can strand a fraction of a unit.
+      expect(partial.unitsRedeemed).toBe(common.holderUnits);
+      expect(partial.unitsRedeemed).toBe(exit.unitsRedeemed);
+      expect(partial.newBasisCents).toBe(0n);
+    });
+
+    it("succeeds one cent under the cap", () => {
+      // Provably exact, not fixture luck: at A = cap-1, floor((cap-1)*P/V)
+      // always equals P-1 for integer 0<P<V (since 0 < P/V < 1 puts
+      // P - P/V strictly between P-1 and P), so capitalPortion always comes
+      // out to exactly (cap-1)-(P-1) = V-P = B, and newBasisCents is exactly
+      // zero at this boundary regardless of the fixture's numbers.
+      const q = quote({ ...common, mode: "partial", amountCents: cap - 1n });
+      expect(q.newBasisCents).toBe(0n);
+      expect(() => q).not.toThrow();
+    });
+
+    it("refuses one cent over the cap, naming the cap in the message", () => {
+      expect(() => quote({ ...common, mode: "partial", amountCents: cap + 1n }))
+        .toThrow(/exceeds the holder's value of 25000 cents/);
+      expect(() => quote({ ...common, mode: "partial", amountCents: cap + 1n }))
+        .toThrow(RangeError);
+    });
+
+    it("refuses a non-positive amount", () => {
+      expect(() => quote({ ...common, mode: "partial", amountCents: 0n })).toThrow(RangeError);
+      expect(() => quote({ ...common, mode: "partial", amountCents: -1n })).toThrow(RangeError);
+    });
+
+    it("requires amountCents at all for partial mode", () => {
+      expect(() => quote({ ...common, mode: "partial" })).toThrow(RangeError);
+    });
+  });
+});

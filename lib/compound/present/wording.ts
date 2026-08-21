@@ -78,3 +78,63 @@ export const PAYOUT_WORDS = {
     `account equity. A payout settles at ${settlement}, rounded down to the cent so the ` +
     `pool is never short. The difference is at most one cent and it stays in the pool.`,
 } as const;
+
+/**
+ * The words on a PARTIAL withdrawal receipt (P6). A different shape from
+ * PAYOUT_WORDS, on purpose: "profit" and "exit" ask "how much of what you're
+ * ENTITLED TO do you want", but a partial withdrawal asks "how much do you
+ * want", and THEN has to say how much of THAT is capital and how much is
+ * profit. Reusing PAYOUT_WORDS' "Profit above that" (the whole position's
+ * profit, whether or not any of it is being withdrawn right now) for what is
+ * actually a per-withdrawal split would be the exact confusion this receipt
+ * exists to prevent — see quote.ts's profitCents vs withdrawalProfitCents.
+ */
+export const WITHDRAW_WORDS = {
+  unitsHeld: "Units held",
+  unitsHeldHint: "Their share of the pool, in units, before this withdrawal.",
+
+  valueNow: "Value at today's NAV",
+  valueNowHint: "Units held, at the NAV this withdrawal settles against. The most they can take out.",
+
+  requested: (name: string) => `What ${name} is asking for`,
+  requestedHint: "Capped at the value above — a holder can never take out more than they hold.",
+
+  capitalReturned: (name: string) => `Capital returned`,
+  capitalReturnedHint: (name: string) =>
+    `The fee-free share of this withdrawal. ${name}'s put-in capital and profit are both ` +
+    `spread evenly across every unit they hold, so a partial withdrawal takes the same mix ` +
+    `of each as the whole position — this is not the whole of what ${name} has put in, only ` +
+    `this withdrawal's share of it.`,
+
+  profitPortion: "Profit in this withdrawal",
+  profitPortionHint: "The fee-bearing share of this withdrawal. Zero below the high-water mark.",
+
+  managerFee: (pct: string) => `Your fee (${pct}%)`,
+  managerFeeHint: "Charged only on the profit portion above, never on the capital returned.",
+
+  unitsRedeemed: (name: string) => `Units ${name} gives up`,
+  unitsKept: (name: string) => `Units ${name} keeps`,
+  unitsKeptHint: "And what they are worth immediately after this withdrawal.",
+
+  receives: (name: string) => `${name} receives`,
+
+  newBasis: (name: string) => `${name}'s capital in, after this`,
+  newBasisHint:
+    "Reduced by the capital returned above, not by the whole withdrawal — this is what " +
+    "future profit is measured against, so the high-water mark moves by exactly the " +
+    "capital share and no more.",
+
+  feeSettlement: "How your fee settles",
+  feeSettlementUnits: "Keep it in the account, as units",
+  feeSettlementUnitsHint:
+    "The cash stays in the pool and you are issued units for it. NAV does not move.",
+  feeSettlementCash: "Take it out, as cash",
+  feeSettlementCashHint: "Equity falls by the fee and no units are issued. NAV does not move.",
+
+  atCapTitle: "Withdrawing everything",
+  atCap: (name: string) =>
+    `This is ${name}'s entire value — every unit is redeemed and their capital in resets ` +
+    `to zero, the same as a full exit.`,
+
+  fullValueHint: (worth: string) => `The most that can be requested is ${worth}.`,
+} as const;
