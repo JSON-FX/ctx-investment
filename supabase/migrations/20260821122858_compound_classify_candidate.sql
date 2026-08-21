@@ -68,18 +68,23 @@
 --   CX205  no such holder on this account                (reused: Task 12's
 --          compound_commit_deposit and Task 13's compound_commit_payout both
 --          already use CX205 for this exact check)
+--   CX208  outcome must be deposit, match or ignore
+--          (reused: this migration first used CX212 here, reasoning that
+--          Task 13's compound_commit_payout already raises CX208 for its own
+--          "mode must be payout or exit" / "fee settlement must be units or
+--          cash" checks, and explainCommitError maps a code to one message
+--          with no knowledge of which function raised it — so a third,
+--          unrelated meaning on the same code looked like it would surface
+--          the wrong sentence. That assumption was checked against the
+--          seam's actual, merged lib/compound/present/errors.ts rather than
+--          left as a guess: CX208's real, registered message is the generic
+--          "That is not a valid choice for this form. Nothing was
+--          committed." — deliberately reused across Tasks 12-14 for exactly
+--          this class of refusal, confirmed directly by the seam owner
+--          (Task 11). Switched back to CX208 to match.)
 --   CX209  the ignore outcome requires a note             (new, Task 14 only)
 --   CX210  the matched entry is not on this account        (new, Task 14 only)
 --   CX211  a deposit classification needs a positive amount (new, Task 14 only)
---   CX212  outcome must be deposit, match or ignore
---          (NOT CX208 — Task 13's compound_commit_payout already claims
---          CX208 for two of its own checks, "mode must be payout or exit"
---          and "fee settlement must be units or cash". explainCommitError
---          maps a code to ONE message regardless of which function raised
---          it, so reusing CX208 here for a third, unrelated meaning would
---          show a payout-mode sentence to a manager who typed a bad
---          classification outcome. CX212 is the next number not claimed
---          anywhere else in the plan as of this migration.)
 -- ============================================================================
 
 create or replace function public.compound_classify_candidate(
@@ -106,7 +111,7 @@ declare
 begin
   if p_outcome not in ('deposit', 'match', 'ignore') then
     raise exception 'compound: outcome must be deposit, match or ignore, got %', p_outcome
-      using errcode = 'CX212';
+      using errcode = 'CX208';
   end if;
 
   select a.id into v_locked

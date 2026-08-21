@@ -35,16 +35,19 @@
  *      exercising the same role and connection the app actually uses, the
  *      same reasoning write-account.db.test.ts gives for the identical split.
  *
- *   4. CX208 is NOT used for the bad-outcome check, unlike the plan's draft.
- *      Task 13's compound_commit_payout (read directly from the plan's own
- *      Task 13 section) already claims CX208 for two of its own checks
+ *   4. CX208 IS used for the bad-outcome check, same as the plan's draft —
+ *      but only after checking, not by trusting the draft. Task 13's
+ *      compound_commit_payout also raises CX208 for two of its own checks
  *      ("mode must be payout or exit", "fee settlement must be units or
- *      cash"). explainCommitError (Task 11) maps a code to one message with
- *      no knowledge of which function raised it, so a third meaning on the
- *      same code would show a payout sentence to a manager who typed a bad
- *      classification outcome. This migration uses CX212 instead — see the
- *      migration file's own header for the full cross-check against every
- *      other writer this plan drafts.
+ *      cash"), which first looked like a real collision: explainCommitError
+ *      maps a code to one message with no knowledge of which function
+ *      raised it, so a third meaning on the same code seemed like it would
+ *      surface the wrong sentence, and this file briefly used CX212
+ *      instead. The seam's actual, merged errors.ts settled it: CX208's
+ *      registered message is the deliberately generic "That is not a valid
+ *      choice for this form. Nothing was committed.", reused across Tasks
+ *      12-14 for exactly this class of refusal — confirmed directly by the
+ *      seam owner. Back to CX208, matching the migration.
  */
 import { closePool, withDb, withDbTransaction } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
@@ -337,10 +340,12 @@ describe("classifyCandidate — matching an existing entry, without double-count
 });
 
 describe("classifyCandidate — input validation reaching the database", () => {
-  it("refuses an outcome that is not deposit, match or ignore, with CX212 (not CX208)", async () => {
-    // CX208 is already spoken for by compound_commit_payout (Task 13) for
-    // two unrelated checks. This is the test that would have caught reusing
-    // it here: expectPgError fails on the CODE, not just on "it threw".
+  it("refuses an outcome that is not deposit, match or ignore, with CX208", async () => {
+    // CX208 is deliberately shared with compound_commit_payout's two enum
+    // checks — errors.ts registers one generic "not a valid choice" message
+    // for the code, not a per-function one. This is still the test that
+    // would catch reusing the WRONG code here: expectPgError fails on the
+    // CODE, not just on "it threw".
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
     await expectPgError(
@@ -353,7 +358,7 @@ describe("classifyCandidate — input validation reaching the database", () => {
           outcome: "typo" as unknown as ClassifyInput["outcome"], expectedSeq: 0,
         })),
       ),
-      "CX212",
+      "CX208",
       /outcome must be deposit, match or ignore/,
     );
   });
@@ -490,7 +495,7 @@ describe("classifyCandidate — several pending candidates, one whose classifica
   });
 });
 
-describe("the persistence-boundary gap this task found: hand-posting a reading has no independent pending-candidate check", () => {
+describe("the persistence-boundary gap this task found: compound_commit_reading_plan has no independent pending-candidate check", () => {
   // compound_commit_deposit (Task 12) and compound_commit_payout (Task 13),
   // read directly from the plan, both run an independent query —
   //   select min(trade_date) from compound_capital_event_candidate
@@ -498,20 +503,33 @@ describe("the persistence-boundary gap this task found: hand-posting a reading h
   // — before allowing a write, so a NEW pending candidate that call did not
   // create still blocks it. compound_commit_reading_plan (Task 5, already
   // merged, "finished" — not modified here) does not: its CX002 check only
-  // fires when the CALLER passes p_candidate in that same call, which is
-  // exactly what a hand-posted reading (postReading's draft: a plain
-  // { kind: "advance", ... } plan, candidate always null) never does. This
+  // fires when the CALLER passes p_candidate in that same call. A hand-built
+  // advance plan (candidate always null) reaches it with nothing to check
+  // against, regardless of what else is pending on the account. This
   // describe block proves that gap empirically, using only already-merged
-  // code (commitReadingPlan) plus this task's own classifyCandidate — no
-  // dependency on Task 11's unmerged postReading.
+  // code (commitReadingPlan) plus this task's own classifyCandidate.
   //
-  // The two tests below also answer this task's central question directly:
-  // classifying one candidate cannot, by itself, move any reading past
-  // another (compound_classify_candidate never touches the cursor or any
-  // OTHER candidate row — see the describe block above). What CAN move a
-  // reading past a still-pending candidate is a hand-built advance plan
-  // reaching compound_commit_reading_plan with no candidate attached — a
-  // property of Task 5's writer, not of classification.
+  // This was flagged to the seam owner (Task 11) while both were still in
+  // progress, before either side had this proof: postReading's draft built
+  // exactly this kind of plan and had nothing standing between it and the
+  // gap below. The seam owner confirmed it by reading the same SQL and
+  // fixed it at the CALLER level — postReading now re-runs planFor at
+  // commit time and refuses unless the outcome is idle, closing the door
+  // this describe block walks through. The underlying gap in
+  // compound_commit_reading_plan itself is unchanged (Task 5's file, out of
+  // both tasks' scope to modify) — what changed is that nothing in this
+  // product still reaches it with a plan built the way this test builds
+  // one. The tests below are kept as regression coverage for that
+  // boundary, not as a report of a currently-live hole.
+  //
+  // They also answer this task's central question directly: classifying
+  // one candidate cannot, by itself, move any reading past another
+  // (compound_classify_candidate never touches the cursor or any OTHER
+  // candidate row — see the describe block above). What CAN move a reading
+  // past a still-pending candidate is a hand-built advance plan reaching
+  // compound_commit_reading_plan with no candidate attached — a property of
+  // Task 5's writer, not of classification, and (as of the seam's fix) no
+  // longer reachable through this product's own UI.
 
   it("classifying the earlier of two pending candidates does not, by itself, let a reading commit dated after the later one", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
@@ -585,12 +603,16 @@ describe("the persistence-boundary gap this task found: hand-posting a reading h
     expect(stillPending.map((k) => k.tradeDate)).toEqual(["2026-08-12"]);
   });
 
-  it("by contrast, compound_commit_payout's independent check (Task 13's draft) would have refused the equivalent — confirmed by reading its SQL, not re-implemented here", () => {
-    // No executable assertion: compound_commit_payout does not exist in this
-    // worktree (Task 13 is a sibling, in progress). This test names the
-    // comparison in one place so it shows up in the suite rather than only
-    // in a comment, and is here to be deleted once Task 13's migration lands
-    // and a real cross-check becomes possible.
-    expect(true).toBe(true);
-  });
+  // it.todo, not a body that always passes: compound_commit_payout does not
+  // exist in this worktree yet (Task 13 is a sibling, still in progress),
+  // so there is nothing to call. An `expect(true).toBe(true)` here would be
+  // exactly the shape of assertion this plan's own lessons table warns
+  // against — it would stay green forever regardless of what Task 13 ships.
+  // Once compound_commit_payout lands, replace this with a real call proving
+  // it refuses a payout dated on/after a pending candidate THAT CALL did not
+  // create, via its own independent query — the property this describe
+  // block shows compound_commit_reading_plan lacks.
+  it.todo(
+    "compound_commit_payout's independent pending-candidate check (Task 13) refuses the equivalent case — verify once Task 13 lands",
+  );
 });
