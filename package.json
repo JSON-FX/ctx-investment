@@ -9,7 +9,8 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "jest",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "check:secrets": "bash scripts/check-secrets.sh"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
