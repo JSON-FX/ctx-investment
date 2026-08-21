@@ -14,9 +14,15 @@
  * This module composes dedupe and detect, and is the entry point callers
  * should use. Reconciling without deduplicating first inflates the explained
  * figure and can hide a real capital event.
+ *
+ * dedupeDeals' own module doc warns that dropping a genuine trade "destroys
+ * real P/L silently." Every plan therefore carries the deals dedupe judged as
+ * duplicates back out in `droppedDeals`, so a run is auditable — a manager
+ * can see exactly which tickets were suppressed and what each was judged a
+ * duplicate of, instead of that decision vanishing inside this function.
  */
 import type { Cents } from "@/lib/compound/engine/money";
-import { dedupeDeals } from "./dedupe";
+import { dedupeDeals, type DroppedDeal } from "./dedupe";
 import { reconcileDays } from "./detect";
 import type { ClosedDeal, DailySnapshot } from "./types";
 
@@ -38,14 +44,22 @@ export interface CapitalEventCandidate {
   unexplainedCents: Cents;
 }
 
+/**
+ * Every variant carries `droppedDeals`: the deals dedupeDeals judged as
+ * duplicates and excluded from reconciliation, regardless of what the plan
+ * otherwise did. It is `[]`, not omitted, when nothing was dropped — the
+ * field is always present so a caller never has to guess whether the absence
+ * of dropped deals means "none" or "not computed."
+ */
 export type ReadingPlan =
-  | { kind: "idle" }
-  | { kind: "advance"; readings: PlannedReading[]; newCursorDate: string }
+  | { kind: "idle"; droppedDeals: DroppedDeal[] }
+  | { kind: "advance"; readings: PlannedReading[]; newCursorDate: string; droppedDeals: DroppedDeal[] }
   | {
       kind: "halt";
       readings: PlannedReading[];
       newCursorDate: string | null;
       candidate: CapitalEventCandidate;
+      droppedDeals: DroppedDeal[];
     };
 
 export interface PlanInput {
@@ -64,7 +78,7 @@ export interface PlanInput {
 
 export function planReadings(input: PlanInput): ReadingPlan {
   const { snapshots, deals, cursor, brokerOffsetHours, toleranceCents } = input;
-  if (snapshots.length === 0) return { kind: "idle" };
+  if (snapshots.length === 0) return { kind: "idle", droppedDeals: [] };
 
   const ordered = [...snapshots].sort((a, b) =>
     a.tradeDate < b.tradeDate ? -1 : a.tradeDate > b.tradeDate ? 1 : 0,
@@ -85,9 +99,29 @@ export function planReadings(input: PlanInput): ReadingPlan {
     );
   }
 
+  // A duplicated tradeDate is silent poison here specifically: the baseline
+  // branch below picks ordered[0] and sets cursorDate to its date, so the
+  // cursor skip a few lines down (`day.tradeDate <= cursorDate`) discards
+  // ANY later row sharing that same date — including a halt-worthy
+  // unexplained interval reconcileDays correctly detected. The candidate the
+  // caller sees ends up dated a day later than reality, carrying whatever
+  // smaller figure that day's move happens to be, while the true unexplained
+  // amount is silently absorbed below the cursor. Refuse before that can
+  // happen, rather than let the interlock look like it fired when it did not.
+  for (let i = 1; i < ordered.length; i += 1) {
+    if (ordered[i]!.tradeDate === ordered[i - 1]!.tradeDate) {
+      throw new RangeError(
+        `duplicate snapshot for tradeDate ${ordered[i]!.tradeDate} in the reading window: ` +
+          `two rows both claim to close that day, and the interlock cannot tell which ` +
+          `balance is authoritative. Collapse to one snapshot per trade date before ` +
+          `calling planReadings.`,
+      );
+    }
+  }
+
   const equityByDate = new Map(ordered.map((s) => [s.tradeDate, s.equityCloseCents]));
 
-  const { kept } = dedupeDeals(deals, brokerOffsetHours);
+  const { kept, dropped } = dedupeDeals(deals, brokerOffsetHours);
   const days = reconcileDays(ordered, kept, toleranceCents);
 
   const readings: PlannedReading[] = [];
@@ -119,6 +153,7 @@ export function planReadings(input: PlanInput): ReadingPlan {
           explainedCents: day.explainedCents,
           unexplainedCents: day.unexplainedCents,
         },
+        droppedDeals: dropped,
       };
     }
 
@@ -128,10 +163,11 @@ export function planReadings(input: PlanInput): ReadingPlan {
     });
   }
 
-  if (readings.length === 0) return { kind: "idle" };
+  if (readings.length === 0) return { kind: "idle", droppedDeals: dropped };
   return {
     kind: "advance",
     readings,
     newCursorDate: readings[readings.length - 1]!.occurredOn,
+    droppedDeals: dropped,
   };
 }
