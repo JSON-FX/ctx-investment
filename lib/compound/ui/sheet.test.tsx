@@ -65,17 +65,33 @@ describe("SheetActions", () => {
 });
 
 describe("Field", () => {
-  it("associates the label with its control by htmlFor/id, not just by adjacency", () => {
+  it("associates the label with its control, so the control is reachable by its label text", () => {
     render(
       <Field name="amount" label="Amount">
         <input id="amount" type="text" />
       </Field>,
     );
-    // getByLabelText resolves the real label-for-control association. If
-    // Field only positioned the label near the input without wiring
-    // htmlFor/id, this lookup fails even though the text is visibly next to
-    // the field — the exact gap between "looks right" and "is right".
     expect(screen.getByLabelText("Amount")).toBe(document.getElementById("amount"));
+  });
+
+  it("wires htmlFor to the control's id explicitly, not only by wrapping it", () => {
+    // Field's <label> both wraps its children AND sets htmlFor — belt and
+    // suspenders. The test above alone does not prove the belt is there: a
+    // <label> that merely WRAPS its control is already a valid association
+    // (the "implicit" pattern), so getByLabelText keeps working even if
+    // htmlFor is dropped entirely — confirmed by probing it: removing
+    // htmlFor left every test in this file green. A caller that pulls the
+    // control out of the label visually (e.g. via a CSS wrapper Field does
+    // not control) would silently lose the association at that point unless
+    // htmlFor genuinely targets the same id. Checking the attribute
+    // directly is what actually pins the explicit half of the pattern.
+    render(
+      <Field name="amount" label="Amount">
+        <input id="amount" type="text" />
+      </Field>,
+    );
+    const label = screen.getByText("Amount").closest("label")!;
+    expect(label).toHaveAttribute("for", "amount");
   });
 
   it("shows its hint when one is given", () => {

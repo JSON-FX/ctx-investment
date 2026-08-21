@@ -47,11 +47,27 @@ export const SUBNAV: NavEntry[] = [
  * A holder statement and an action sheet both belong to "desk", because that
  * is where the reader came from and where Back should feel like it leads.
  *
- * Compares path SEGMENTS, not a string prefix. The plan's first draft used
- * `pathname.startsWith(`/a/${accountId}`)`, which is true for
- * `"/a/71/ledger".startsWith("/a/7")` — account 71's ledger page would have
- * highlighted account 7's tab. Splitting into segments and comparing the
- * account-id segment exactly is what keeps /a/71 and /a/7 apart.
+ * Compares path SEGMENTS, not a string prefix. The plan's Step 1 draft used
+ * `pathname.startsWith(`/a/${accountId}`)` and its own text claims that fails
+ * the prefix-collision case — `"/a/71/ledger".startsWith("/a/7")` is `true`,
+ * so it says `activeNavKey` returns `"ledger"` for account 7.
+ *
+ * That claim does not reproduce: probed by reverting to the startsWith
+ * version and running routes.test.ts, all cases including the prefix
+ * collision still passed. The plan's own reasoning stops at the startsWith
+ * check and never traces the rest of the function — after stripping "/a/7",
+ * "/a/71/ledger" leaves "1/ledger", and `"1/ledger".split("/")[0]` is "1",
+ * not "ledger", which matches no SUBNAV key and correctly falls through to
+ * "". Since every account id is all-digits and Next.js's `usePathname()`
+ * always puts a literal "/" between the id segment and the next one, the
+ * leftover fragment after a false-prefix match can never land mid-word, so
+ * the startsWith version turns out to be safe for every reachable pathname,
+ * not just the ones this file's tests happen to cover.
+ *
+ * Kept the segment comparison anyway: it is correct by direct inspection of
+ * the id segment rather than by an invariant about the shape of SUBNAV's
+ * keys (all-alphabetic, none digit-leading) continuing to hold, which is a
+ * steadier property to depend on than a proof that has to be re-derived.
  */
 export function activeNavKey(pathname: string, accountId: number): string {
   const parts = pathname.split("/").filter((p) => p !== "");
