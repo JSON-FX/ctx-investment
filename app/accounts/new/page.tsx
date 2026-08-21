@@ -85,8 +85,8 @@ export default async function NewAccountPage({
           <Field name="currency" label="Currency">
             <input id="currency" name="currency" defaultValue={p.currency ?? "USD"} required />
           </Field>
-          <Field name="split" label="Default manager split, percent" hint="60 / 40 is written as 40 here. Each investor can override it.">
-            <input id="split" name="split" inputMode="decimal" defaultValue={p.split ?? "40"} required />
+          <Field name="split" label="Default manager split, percent" hint="30 / 70 is written as 70 here — the manager's share of an investor's profit. Each investor can override it, and changing it later never rewrites a payout already taken.">
+            <input id="split" name="split" inputMode="decimal" defaultValue={p.split ?? "70"} required />
           </Field>
           <Field name="inception" label="Inception date">
             <input id="inception" name="inception" type="date" required defaultValue={p.inception} />
