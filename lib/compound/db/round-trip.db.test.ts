@@ -461,6 +461,38 @@ describe("Part B: readings carry equity, and the fold reproduces it", () => {
     expect(readings.map((e) => e.amountCents)).not.toContain(1025013n);
   });
 
+  it("posts exactly the fixture's own equity_close, independent of its literal values", async () => {
+    // The test above pins the shipped fixture's specific numbers — good
+    // evidence, but it can only stay green for THIS fixture. This one derives
+    // its expectation from account_snapshots_daily directly (a second,
+    // independent read, not the one the interlock itself used), so it keeps
+    // discriminating even if the fixture's numbers ever change — including
+    // under the "flatten equity_close to balance_close" probe in this task's
+    // report, where the test above necessarily goes red because its literals
+    // no longer match, and this one is the one that is SUPPOSED to survive.
+    const { entries, snapshots } = await withTestClient(async (c) => {
+      const snapshots = await getDailySnapshots(c, MT5);
+      const deals = dedupeDeals(await getClosedDeals(c, MT5), BROKER_OFFSET_HOURS).kept;
+      const cursor = await getReconcileCursor(c, accountId);
+      const plan = planReadings({
+        snapshots,
+        deals,
+        cursor,
+        brokerOffsetHours: BROKER_OFFSET_HOURS,
+        toleranceCents: 0n,
+      });
+      await commitReadingPlan(c, { accountId, plan, actorUserId: MANAGER });
+      return { entries: await getLedgerEntries(c, accountId), snapshots };
+    });
+
+    const byDate = new Map(snapshots.map((s) => [s.tradeDate, s]));
+    const readings = entries.filter((e) => e.type === "equity_reading");
+    expect(readings.length).toBeGreaterThan(0);
+    expect(readings.map((e) => e.amountCents)).toEqual(
+      readings.map((e) => byDate.get(e.occurredOn)!.equityCloseCents),
+    );
+  });
+
   it("folds to a PoolState that satisfies every invariant", async () => {
     const state = await withTestClient(async (c) => {
       const snapshots = await getDailySnapshots(c, MT5);
