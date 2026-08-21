@@ -15,7 +15,7 @@
  * but sits at any other gap is two genuine trades, and dropping one would
  * destroy real P/L — a far worse outcome than leaving a duplicate in.
  */
-import { absGapMs } from "./date-key";
+import { signedGapMs } from "./date-key";
 import type { ClosedDeal } from "./types";
 
 export interface DroppedDeal {
@@ -79,11 +79,17 @@ export function dedupeDeals(
     const survivors: ClosedDeal[] = [];
 
     for (const candidate of ordered) {
-      const twinOf = survivors.find(
-        (s) =>
-          absGapMs(s.closeTime, candidate.closeTime) === offsetMs &&
-          absGapMs(s.openTime, candidate.openTime) === offsetMs,
-      );
+      const twinOf = survivors.find((s) => {
+        // A timezone reinterpretation moves BOTH ends by the same signed
+        // amount, so it preserves the trade's duration. Comparing absolute
+        // gaps independently would also accept a pair shifted +offset at one
+        // end and −offset at the other — which changes duration and cannot
+        // come from one push read two ways. That is two genuine trades, and
+        // dropping one destroys real P/L silently.
+        const openShift = signedGapMs(s.openTime, candidate.openTime);
+        const closeShift = signedGapMs(s.closeTime, candidate.closeTime);
+        return openShift === closeShift && Math.abs(openShift) === offsetMs;
+      });
       if (twinOf) dropped.push({ deal: candidate, duplicateOfTicket: twinOf.ticket });
       else survivors.push(candidate);
     }

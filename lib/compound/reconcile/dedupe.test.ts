@@ -43,7 +43,7 @@ describe("dedupeDeals — the duplicate shape", () => {
     const genuine = deal({ ticket: 1000 });
     const r = dedupeDeals([genuine, shifted(genuine, 3, 9000), shifted(genuine, -3, 9001)], 3);
     expect(r.kept.map((d) => d.ticket)).toEqual([1000]);
-    expect(r.dropped.map((x) => x.deal.ticket).sort()).toEqual([9000, 9001]);
+    expect(r.dropped.map((x) => x.deal.ticket).sort((x, y) => x - y)).toEqual([9000, 9001]);
   });
 });
 
@@ -90,6 +90,23 @@ describe("dedupeDeals — what it must NOT drop", () => {
 
   it("returns empty for no deals", () => {
     expect(dedupeDeals([], 3)).toEqual({ kept: [], dropped: [] });
+  });
+
+  it("keeps a pair shifted in opposite directions at each end", () => {
+    // +3h at the open, −3h at the close: six hours shorter than its partner.
+    // A timezone reinterpretation preserves duration, so this shape cannot be
+    // one push read two ways — it is two genuine trades that happen to match
+    // on every value field.
+    const a = deal({ ticket: 1000 });
+    const b: ClosedDeal = {
+      ...a,
+      ticket: 4000,
+      openTime: new Date(Date.parse(a.openTime) + 3 * 3_600_000).toISOString(),
+      closeTime: new Date(Date.parse(a.closeTime) - 3 * 3_600_000).toISOString(),
+    };
+    const r = dedupeDeals([a, b], 3);
+    expect(r.kept.map((d) => d.ticket).sort((x, y) => x - y)).toEqual([1000, 4000]);
+    expect(r.dropped).toHaveLength(0);
   });
 });
 
