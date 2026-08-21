@@ -3382,9 +3382,16 @@ supabase migration new compound_account_broker_offset
 -- is set. Reconciling undeduplicated inflates the explained figure and can hide
 -- a real capital event, which is the most expensive failure this product has.
 --
--- Range is -12..14, the real span of UTC offsets. Brokers are commonly at +2 or
--- +3; the sign is kept because the column describes the server, not the
--- correction, and dedupeDeals is passed the magnitude.
+-- Range is 1..14, MATCHING dedupeDeals' own MIN_OFFSET_HOURS..MAX_OFFSET_HOURS.
+-- The column holds the MAGNITUDE of the broker server's UTC offset, because
+-- that is all dedupeDeals uses: it looks for pairs whose close times differ by
+-- exactly that many hours, in either direction.
+--
+-- The range deliberately excludes 0. dedupeDeals throws a RangeError on 0, so a
+-- column that permitted it would store a value the engine refuses, and the
+-- failure would surface as a crash inside a reconcile run rather than as a
+-- refused edit. A broker genuinely running on UTC is therefore not supported;
+-- see the note below the migration for what that would take.
 -- ============================================================================
 
 alter table public.compound_account
@@ -3392,12 +3399,15 @@ alter table public.compound_account
 
 alter table public.compound_account
   add constraint compound_account_broker_offset_hours_range
-  check (broker_offset_hours is null or broker_offset_hours between -12 and 14);
+  check (broker_offset_hours is null or broker_offset_hours between 1 and 14);
 
 comment on column public.compound_account.broker_offset_hours is
-  'Broker server UTC offset in hours. NULL means not configured, and disables '
-  'reconciliation rather than running the duplicate-deal guard as a no-op.';
+  'Magnitude of the broker server UTC offset, in hours, 1..14. NULL means not '
+  'configured, and disables reconciliation rather than running the duplicate-deal '
+  'guard as a no-op. Matches dedupeDeals MIN_OFFSET_HOURS..MAX_OFFSET_HOURS.';
 ```
+
+> **A limitation, stated rather than discovered later.** `dedupe.ts` sets `MIN_OFFSET_HOURS = 1`, so an account whose broker runs on UTC exactly cannot be reconciled: there is no legal value to store. That is correct as far as it goes — at a zero offset the duplicate class this guard exists for cannot arise, so dedupe would be a no-op — but the product's answer is currently "you cannot configure this account" rather than "no dedupe is needed here". Fixing it means widening `MIN_OFFSET_HOURS` to `0` in the reconciler and letting `dedupeDeals` return everything untouched, which is a reconciler change and does not belong in this plan. **Carried forward, not fixed here.** No broker in use has a zero offset.
 
 - [ ] **Step 2: Carry the column through plan 3's account reader**
 
@@ -4043,13 +4053,18 @@ describe("resolveOwnedAccount", () => {
     }).catch((e) => { if (e.message !== "rollback") throw e; });
   });
 
-  it("refuses an offset outside the real range of UTC offsets", async () => {
+  it("refuses every offset dedupeDeals would throw on", async () => {
+    // 1..14 here matches MIN_OFFSET_HOURS..MAX_OFFSET_HOURS in dedupe.ts. If
+    // the column let 0 or 15 through, the failure would surface as a crash
+    // inside a reconcile run instead of as a refused edit.
     await withDbTransaction(async (c) => {
       const { mine } = await seedTwoAccounts(c);
-      await expect(
-        c.query(`update public.compound_account set broker_offset_hours = 15 where id = $1`,
-          [mine.accountId]),
-      ).rejects.toThrow(/compound_account_broker_offset_hours_range/);
+      for (const bad of [0, 15, -3]) {
+        await expect(
+          c.query(`update public.compound_account set broker_offset_hours = $2 where id = $1`,
+            [mine.accountId, bad]),
+        ).rejects.toThrow(/compound_account_broker_offset_hours_range/);
+      }
       throw new Error("rollback");
     }).catch((e) => { if (e.message !== "rollback") throw e; });
   });
@@ -4305,7 +4320,7 @@ export function AccountList({ accounts }: { accounts: ResolvedAccount[] }) {
                 <td>
                   {a.brokerOffsetHours === null
                     ? <Chip tone="fee">Broker offset not set</Chip>
-                    : <span className="num">UTC{a.brokerOffsetHours >= 0 ? "+" : ""}{a.brokerOffsetHours}</span>}
+                    : <span className="num">±{a.brokerOffsetHours}h</span>}
                 </td>
               </tr>
             ))}
@@ -4457,7 +4472,7 @@ export default async function NewAccountPage({
           </Field>
           <Field
             name="offset"
-            label="Broker server UTC offset, hours"
+            label="Broker server UTC offset, hours (1–14)"
             hint="Leave blank if you do not know it. Reconciliation stays switched off until it is set, because the duplicate-deal guard needs it and running it at a zero offset does nothing."
           >
             <input id="offset" name="offset" inputMode="numeric" defaultValue={p.offset} />
@@ -4511,7 +4526,7 @@ export default async function NewAccountPage({
           label="Broker UTC offset"
           hint={p.offset ? undefined : "Not set — reconciliation stays off."}
         >
-          <span className="num">{p.offset ? `UTC${Number(p.offset) >= 0 ? "+" : ""}${p.offset}` : "—"}</span>
+          <span className="num">{p.offset ? `±${p.offset}h` : "—"}</span>
         </ReceiptLine>
         <ReceiptLine label="Daily snapshots CopyTraderX has">
           <span className="num">{snapshots.length}</span>
@@ -4702,7 +4717,7 @@ describe("AccountList", () => {
 
   it("shows a configured offset with its sign", () => {
     expect(within(screen.getByRole("row", { name: /Pooled — live/ }))
-      .getByText("UTC+3")).toBeInTheDocument();
+      .getByText("±3h")).toBeInTheDocument();
   });
 
   it("renders a dash where a broker is unknown, not the word null", () => {
