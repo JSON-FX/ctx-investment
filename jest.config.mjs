@@ -26,4 +26,6 @@ export default {
   transform: {
     "^.+\\.tsx?$": ["ts-jest", { tsconfig: { target: "ES2022", module: "CommonJS" } }],
   },
+  // Integration tests need a live Postgres. pnpm test must stay runnable offline.
+  testPathIgnorePatterns: ["/node_modules/", "\\.db\\.test\\.ts$"],
 };
