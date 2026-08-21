@@ -19,6 +19,10 @@ services:
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://ctxinvestment.lan}
     labels:
       - "traefik.enable=true"
+      # The container sits on two networks in local development — dev-net for
+      # Traefik and Supabase's own for the database. Without this, Traefik
+      # cannot tell which one to reach the backend on and every route 404s.
+      - "traefik.docker.network=dev-net"
 
       # ─── Dev tier ─────────────────────────────────────────────
       #   http://ctxinvestment.test
