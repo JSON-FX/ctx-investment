@@ -6883,7 +6883,7 @@ The plumbing every sheet in Phase B reuses, proved out on the flow that needs no
 
 **The reconciler is the primary way readings advance.** A manual reading is the exception, and it is fenced: it may only be dated after the last snapshot CopyTraderX has, and only when the reconciler has nothing left to post. Without that fence a manual reading dated today moves the cursor past days nobody has reconciled, and any capital event in them is absorbed into NAV — the exact loss §5.3 exists to prevent, arriving through the one door the interlock does not watch.
 
-> **Decision D-O: `toleranceCents` is `0n`.** Spec §6.3 verified that with dedup applied, summed closed-trade P/L reconciles against the balance series to a residual of **exactly zero** across the whole period. A non-zero tolerance is a capital event small enough to hide, permanently. If zero produces false candidates in practice, the manager sees a review item and classifies it "not a capital event" — a visible, cheap, safe failure, where the alternative is a silent, expensive one.
+> **Decision D-N: `toleranceCents` is `0n`.** Spec §6.3 verified that with dedup applied, summed closed-trade P/L reconciles against the balance series to a residual of **exactly zero** across the whole period. A non-zero tolerance is a capital event small enough to hide, permanently. If zero produces false candidates in practice, the manager sees a review item and classifies it "not a capital event" — a visible, cheap, safe failure, where the alternative is a silent, expensive one.
 
 **Files:**
 - Create: `lib/compound/present/errors.ts`
@@ -7074,7 +7074,7 @@ import { getClosedDeals, getDailySnapshots } from "@/lib/compound/db/copytraderx
 import { planReadings, type ReadingPlan } from "@/lib/compound/reconcile/interlock";
 import type { ResolvedAccount } from "./account";
 
-/** Spec 6.3: with dedup applied the residual is exactly zero. Decision D-O. */
+/** Spec 6.3: with dedup applied the residual is exactly zero. Decision D-N. */
 export const TOLERANCE_CENTS = 0n;
 
 export type ReconcileOutcome =
@@ -11803,7 +11803,7 @@ Fold these back into the spec before executing.
 
 7. **Classification offers three outcomes, and partial withdrawal is named as absent (D-J).** §7 says "classify capital event" without saying into what. A negative unexplained move that is not an already-recorded payout is P6, which §12 defers; the queue says so rather than offering a control that would record it wrongly.
 
-8. **`toleranceCents` is `0n` (D-O).** §6.3 verified a residual of exactly zero on real history and §5.3 does not name a tolerance. Any non-zero value is a capital event small enough to hide permanently.
+8. **`toleranceCents` is `0n` (D-N).** §6.3 verified a residual of exactly zero on real history and §5.3 does not name a tolerance. Any non-zero value is a capital event small enough to hide permanently.
 
 9. **A payout does not move the reconcile cursor.** §5.2 requires the settlement reading and the payout in one transaction and says nothing about the cursor. Moving it would leave the payout's own day permanently unreconciled.
 
