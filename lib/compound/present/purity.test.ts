@@ -95,9 +95,10 @@ describe("present/ purity", () => {
   // miss, where the filter silently drops one file out of several rather
   // than all of them. The floor is raised as present/ grows: Task 2 added
   // format.ts and fixture.ts (2); Task 3 added rail.ts and derive.ts, taking
-  // it to 4; Task 9 adds figures.ts, taking it to 5.
+  // it to 4; Task 9 adds figures.ts, taking it to 5; Task 10 adds wording.ts
+  // and holder.ts, taking it to 7.
   it("scans every source file in present/", () => {
-    expect(files.length).toBeGreaterThanOrEqual(5);
+    expect(files.length).toBeGreaterThanOrEqual(7);
   });
 
   // Comments are stripped before matching, the same as db/'s and journal's
