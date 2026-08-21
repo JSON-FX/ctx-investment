@@ -1,20 +1,20 @@
 /**
  * One holder's position and history.
  *
- * markState exists because quote()'s belowHighWaterMark is `profitCents <= 0n`,
- * which reports a holder sitting EXACTLY on their mark as below it. That is
- * defensible inside the engine — zero profit and negative profit both mean no
- * fee — and it is wrong on a screen, where "below the high-water mark, $0.00 of
- * recovery needed" reads as a glitch. Branching on the sign of profitCents here
- * fixes the presentation without touching an engine that 125 tests agree with.
+ * markState exists because quote()'s belowHighWaterMark is `profitCents <=
+ * 0n`, which reports a holder sitting EXACTLY on their mark as below it.
+ * That is defensible inside the engine — zero profit and negative profit
+ * both mean no fee — and it is wrong on a screen, where "below the
+ * high-water mark, $0.00 of recovery needed" reads as a glitch. Branching on
+ * the sign of profitCents here fixes the presentation without touching an
+ * engine 125 tests already agree with.
  *
- * BOOTSTRAPPED FOR TASK 13: this file is plan 4's Task 10 deliverable
- * (docs/superpowers/plans/2026-08-21-compound-desk.md, ~line 6096). At the
- * time Task 13 was built, `.worktrees/holder` (feat/desk-holder) had no
- * commits yet, so this is a verbatim transcription of the plan's reference
- * source, not an original design — it exists so Task 13 can compile and be
- * gated on its own. Delete this note (and reconcile with whatever Task 10
- * actually ships) once feat/desk-holder merges.
+ * profitCents here is measured against settlementValueCents (FLOORED), not
+ * statementValueCents (ALLOCATED) — deliberately: quote()'s own profitCents
+ * is what a fee is charged on, and quote() values a holding by flooring
+ * (engine/nav.ts's valueOfUnits). Measuring profit against the allocated
+ * figure instead would let this presenter disagree with the fee the engine
+ * itself would charge on the same holder, on the same screen.
  */
 import type { Cents, Units } from "@/lib/compound/engine/money";
 import { allocateValues, valueOfUnits } from "@/lib/compound/engine/nav";
@@ -27,14 +27,15 @@ import { allocateShares } from "./rail";
 
 export interface HolderPosition {
   holder: HolderState;
+  /** Parts per million, largest-remainder allocated — sums to 1,000,000 across holders. */
   ppm: number;
-  /** ALLOCATED. Sums with the other holders to equity exactly. */
+  /** ALLOCATED (decision D-A). Sums with the other holders to equity exactly. */
   statementValueCents: Cents;
-  /** FLOORED. What a payout settles at. Can be one cent lower. */
+  /** FLOORED (decision D-A). What a payout actually settles at. Can be one cent lower. */
   settlementValueCents: Cents;
   /** Against the SETTLEMENT value, because that is what a fee is charged on. */
   profitCents: Cents;
-  /** Positive only when below the mark. Zero otherwise. */
+  /** Positive only when below the mark. Zero at or above it. */
   recoveryCents: Cents;
   markState: "above" | "at" | "below";
   profitQuote: Quote;
@@ -78,15 +79,15 @@ export interface HolderStatementRow {
   occurredOn: string;
   type: LedgerEntryType;
   voided: boolean;
-  /** True when the entry is this holder's own. A reading is nobody's. */
+  /** True when the entry is this holder's own. A reading or another holder's entry is not. */
   own: boolean;
   /** Signed. Zero for an entry that does not move this holder's units. */
   unitsDelta: Units;
   unitsAfter: Units;
   basisAfter: Cents;
-  /** Allocated, so a row here agrees with the desk on the same date. */
+  /** ALLOCATED, so a row here agrees with the desk and the statement head on the same date. */
   valueAfter: Cents;
-  /** Signed. What this entry did to their value. */
+  /** Signed. What this entry did to this holder's value. */
   valueDelta: Cents;
 }
 
@@ -95,8 +96,10 @@ export interface HolderStatementRow {
  *
  * Readings are included even though they are nobody's entry, because a
  * statement that showed only a holder's own deposits could not explain why
- * their value changed between them — which is the single most likely question
- * a statement has to answer.
+ * their value changed between them — which is the single most likely
+ * question a statement has to answer. Filtering to `entry.holderId ===
+ * holderId` is the obvious optimisation and it is exactly the one that would
+ * make a statement unable to explain itself.
  */
 export function holderStatement(
   steps: readonly LedgerStep[],

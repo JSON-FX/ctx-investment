@@ -1,26 +1,24 @@
 /**
  * The words on a payout receipt.
  *
- * They live here rather than inside the component because two screens render
- * them: the holder statement's "if you withdrew today" block and the payout
- * sheet itself. A holder who reads "Capital in" on one and "Cost basis" on the
- * other has been given two names for one number, and will reasonably ask which
- * is which at exactly the wrong moment.
+ * They live here, rather than inside a component, because two screens render
+ * them: the holder statement's "if you withdrew today" block (Task 10) and
+ * the payout sheet itself (Task 13). A reader who sees "Capital in" on one
+ * screen and "Cost basis" on the other has been given two names for one
+ * number, and will reasonably ask which is which at exactly the wrong moment
+ * — mid-dispute, holding two printouts.
  *
- * "Cost basis, their high-water mark" is precise and is jargon. What a
+ * "Cost basis, their high-water mark" is precise and it is jargon. What a
  * non-accountant reads is "what they have put in", with the mechanism stated
- * underneath in a sentence: it rises when they add capital, does not move when
- * they take profit, and resets when they exit. That sentence IS the high-water
- * mark; the term is not needed to explain it, and is kept only as a
- * parenthetical for readers who already know it.
+ * underneath in one sentence: it rises when they add capital, does not move
+ * when they take profit, and resets on a full exit. That sentence IS the
+ * high-water mark; the term itself is not needed to act on it, so it appears
+ * only as a heading for a reader who already knows it (belowMarkTitle), never
+ * as something the body text requires understanding first.
  *
- * BOOTSTRAPPED FOR TASK 13: this file is plan 4's Task 10 deliverable
- * (docs/superpowers/plans/2026-08-21-compound-desk.md, ~line 6015). At the
- * time Task 13 was built, `.worktrees/holder` (feat/desk-holder) had no
- * commits yet, so this is a verbatim transcription of the plan's reference
- * source, not an original design — it exists so Task 13 can compile and be
- * gated on its own. Delete this note (and reconcile with whatever Task 10
- * actually ships) once feat/desk-holder merges.
+ * This single-tenant tool has no investor role (spec §9) — every screen that
+ * reads these words is the manager's own, which is why `managerFee` reads
+ * "Your fee" rather than naming a role.
  */
 export const PAYOUT_WORDS = {
   unitsHeld: "Units held",
