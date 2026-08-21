@@ -381,6 +381,155 @@ describe("fold — a payout carries the terms it was made under", () => {
   });
 });
 
+describe("fold — partial withdrawal (P6)", () => {
+  // Manager founds with $300. Investor deposits $300. Equity read at $1,800
+  // -> NAV 4.0000. Investor value 150*4=$600, basis $300, profit $300.
+  // Withdraw $150 (a quarter of value): capital and profit both quarter.
+  //   capital slice = 150 * 300/600 = 75, profit slice = 150 * 300/600 = 75
+  //   fee = 75 * 40% = 30, holder receives 150-30=120
+  //   units redeemed = 150/4 = 37.5
+  function ledger(amount: string) {
+    return [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("equity_reading", "600"),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1800"),
+      entry("withdrawal", amount, { holderId: 2, feeSettlement: "units", splitBpsApplied: 4000 }),
+    ];
+  }
+
+  it("pays the holder the requested amount less the fee on its profit slice", () => {
+    const before = fold(ledger("150").slice(0, 4), [MANAGER, INVESTOR]);
+    const after = fold(ledger("150"), [MANAGER, INVESTOR]);
+    expect(before.equityCents - after.equityCents).toBe(centsFromDecimal("120"));
+  });
+
+  it("redeems only the units the requested amount is worth", () => {
+    // Investor holds 150 units (deposited $300 at NAV 2.00). $150 at NAV
+    // 4.00 is 37.5 units redeemed, leaving 112.5 — checked as a delta, not
+    // the remaining balance, so a fixture where the two numbers happen to
+    // coincide can't hide a wrong redemption figure.
+    const before = fold(ledger("150").slice(0, 4), [MANAGER, INVESTOR]);
+    const after = fold(ledger("150"), [MANAGER, INVESTOR]);
+    const beforeUnits = before.holders.find((h) => h.holderId === 2)!.units;
+    const afterUnits = after.holders.find((h) => h.holderId === 2)!.units;
+    expect(beforeUnits - afterUnits).toBe(unitsFromDecimal("37.5"));
+    expect(afterUnits).toBe(unitsFromDecimal("112.5"));
+  });
+
+  it("reduces cost basis by the capital slice, not the whole withdrawal", () => {
+    const s = fold(ledger("150"), [MANAGER, INVESTOR]);
+    // basis $300 - capital slice $75 = $225. NOT $300-$150=$150 (that would
+    // be "capital first"), and NOT left at $300 (that would be "profit
+    // first" for this particular ratio, coincidentally, but see the quote.ts
+    // module doc for why that alternative is wrong in general).
+    expect(s.holders.find((h) => h.holderId === 2)!.basisCents).toBe(centsFromDecimal("225"));
+  });
+
+  it("issues the fee to the manager as units at the pre-withdrawal NAV", () => {
+    const s = fold(ledger("150"), [MANAGER, INVESTOR]);
+    const mgr = s.holders.find((h) => h.holderId === 1)!;
+    expect(mgr.units).toBe(unitsFromDecimal("307.5"));   // 300 + 30/4
+    expect(mgr.basisCents).toBe(centsFromDecimal("330")); // 300 + 30
+  });
+
+  it("leaves NAV unchanged", () => {
+    expect(navTimes1e4(totalsOf(fold(ledger("150"), [MANAGER, INVESTOR])))).toBe(40_000n);
+  });
+
+  it("leaves the holder active, still holding units", () => {
+    const h = fold(ledger("150"), [MANAGER, INVESTOR]).holders.find((x) => x.holderId === 2)!;
+    expect(h.status).toBe("active");
+    expect(h.units > 0n).toBe(true);
+  });
+
+  it("satisfies every invariant", () => {
+    expect(checkInvariants(fold(ledger("150"), [MANAGER, INVESTOR]))).toEqual([]);
+  });
+
+  it("charges no fee below the high-water mark", () => {
+    const l = [
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "300"),   // halved; investor value $150 < basis $300
+      entry("withdrawal", "100", { holderId: 2, feeSettlement: "units", splitBpsApplied: 4000 }),
+    ];
+    const s = fold(l, [MANAGER, INVESTOR]);
+    const h = s.holders.find((x) => x.holderId === 2)!;
+    // Received the full $100 requested, none of it fee.
+    expect(fold(l.slice(0, 3), [MANAGER, INVESTOR]).equityCents - s.equityCents)
+      .toBe(centsFromDecimal("100"));
+    expect(h.basisCents).toBe(centsFromDecimal("200")); // 300 - 100, all capital
+    expect(checkInvariants(s)).toEqual([]);
+  });
+
+  it("rejects a withdrawal with no splitBpsApplied", () => {
+    expect(() => fold([
+      entry("deposit", "300", { holderId: 1 }),
+      entry("deposit", "300", { holderId: 2 }),
+      entry("equity_reading", "1200"),
+      entry("withdrawal", "100", { holderId: 2, feeSettlement: "units" }),
+    ], [MANAGER, INVESTOR])).toThrow(/no splitBpsApplied/);
+  });
+
+  describe("withdrawing the full cap in one go", () => {
+    // Same ledger, but the investor withdraws their ENTIRE $600 rather than
+    // a slice of it — must behave exactly like an exit.
+    function fullLedger(settlement: "units" | "cash") {
+      return [
+        entry("deposit", "300", { holderId: 1 }),
+        entry("equity_reading", "600"),
+        entry("deposit", "300", { holderId: 2 }),
+        entry("equity_reading", "1800"),
+        entry("withdrawal", "600", { holderId: 2, feeSettlement: settlement, splitBpsApplied: 4000 }),
+      ];
+    }
+
+    it("redeems every unit the holder owns, and closes them like an exit", () => {
+      const s = fold(fullLedger("cash"), [MANAGER, INVESTOR]);
+      const h = s.holders.find((x) => x.holderId === 2)!;
+      expect(h.units).toBe(0n);
+      expect(h.basisCents).toBe(0n);
+      expect(h.status).toBe("closed");
+    });
+
+    it("pays exactly what an equivalent exit would pay", () => {
+      const viaWithdrawal = fold(fullLedger("cash"), [MANAGER, INVESTOR]);
+      const viaExit = fold([
+        entry("deposit", "300", { holderId: 1 }),
+        entry("equity_reading", "600"),
+        entry("deposit", "300", { holderId: 2 }),
+        entry("equity_reading", "1800"),
+        entry("exit", "0", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+      ], [MANAGER, INVESTOR]);
+      expect(viaWithdrawal.equityCents).toBe(viaExit.equityCents);
+      expect(viaWithdrawal.units).toBe(viaExit.units);
+    });
+
+    it("satisfies every invariant", () => {
+      expect(checkInvariants(fold(fullLedger("units"), [MANAGER, INVESTOR]))).toEqual([]);
+    });
+
+    it("does not leave a phantom basis behind when the holder is underwater", () => {
+      // Investor deposits $300, account halves to $150 for them, they cash
+      // out everything they have left ($150, their whole value — a loss).
+      // Basis must go to zero like any other exit, not to $300-$150=$150,
+      // which would overstate a later re-deposit's starting basis.
+      const s = fold([
+        entry("deposit", "300", { holderId: 1 }),
+        entry("deposit", "300", { holderId: 2 }),
+        entry("equity_reading", "300"),   // halved
+        entry("withdrawal", "150", { holderId: 2, feeSettlement: "cash", splitBpsApplied: 4000 }),
+      ], [MANAGER, INVESTOR]);
+      const h = s.holders.find((x) => x.holderId === 2)!;
+      expect(h.units).toBe(0n);
+      expect(h.basisCents).toBe(0n);
+      expect(h.status).toBe("closed");
+      expect(checkInvariants(s)).toEqual([]);
+    });
+  });
+});
+
 describe("fold — exit redeems the exact unit balance", () => {
   // valueOfUnits floors to whole cents and unitsToRedeem ceils back to units,
   // so the round trip can under-recover. Here quote() would redeem

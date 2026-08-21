@@ -1,11 +1,14 @@
 /**
  * Classifying one capital event.
  *
- * Three outcomes and no fourth (decision D-J). A negative unexplained move
- * that is not an already-recorded payout is a partial withdrawal, which spec
- * section 12 defers as P6 — so the sheet says that rather than offering a
- * control that would record it wrongly. A missing feature stated plainly
- * beats a present feature that is subtly incorrect about someone's money.
+ * Three outcomes and no fourth (decision D-J). That still holds: a withdrawal
+ * is not a classification, it is a payout, and giving the queue a fourth
+ * control would put two ways to record the same money one click apart.
+ *
+ * What changed is the advice. P6 — partial capital withdrawal — has shipped,
+ * so a negative unexplained move that is not already in the ledger can now be
+ * recorded for its exact amount through the payout screen rather than only as
+ * a full exit. The sheet points there instead of saying it cannot be done.
  *
  * Local `SheetHolder` rather than importing `HolderRow` from this plan's db
  * layer — same reason `ReviewCandidate` is declared in review-queue.tsx
@@ -77,11 +80,10 @@ export function ClassifySheet({
       {positive ? null : (
         <p className="split-note">
           Money left the account. If it was a payout you have already recorded here, match
-          it below. If it was a partial withdrawal that is not in the ledger, Compound
-          cannot record it yet — partial capital withdrawal is deferred (spec §12, P6) —
-          and marking it &ldquo;not a capital event&rdquo; would give the loss to every
-          holder pro-rata, which is wrong. Record it as a full exit through the payout
-          screen instead, or leave this pending until P6 lands.
+          it below. If it was a withdrawal that is not in the ledger, record it on the
+          payout screen — for the exact amount, or as a full exit — and then match it
+          here. Do not mark it &ldquo;not a capital event&rdquo;: that would spread the
+          loss across every holder pro-rata, charging people for money one person took.
         </p>
       )}
 

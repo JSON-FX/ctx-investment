@@ -33,7 +33,9 @@
  *          sections specify them; CX203/CX204/CX205/CX208 are deliberately
  *          reused across Tasks 12-14 for the same underlying refusal
  *          (not-pending / stale seq / no such holder / bad enum value)
- *          rather than re-allocated per task.
+ *          rather than re-allocated per task. CX212/CX213 are new, for P6's
+ *          compound_commit_withdrawal — no prior code means the same thing,
+ *          so they are not reused from elsewhere in this block.
  *   CX3xx  editing an existing holder (compound_update_holder). A new block
  *          of its own rather than new numbers inside CX1xx — CX1xx and CX2xx
  *          are already spoken for by add-holder and the capital-event
@@ -85,6 +87,10 @@ const MESSAGES: Record<string, string> = {
     "why the balance moved and nobody is going to remember by the time it matters.",
   CX210: "That entry does not belong to this account.",
   CX211: "A deposit needs a positive amount.",
+  CX212: "A withdrawal needs a positive amount.",
+  CX213:
+    "That is more than this holder's current value. Check the figure you entered — the " +
+    "most they can withdraw is what the receipt shows as their value today.",
 
   // CX3xx — editing an existing holder (compound_update_holder).
   CX301: "That holder is not on this account. Check you picked the right holder.",

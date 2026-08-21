@@ -98,14 +98,19 @@ describe("ClassifySheet — a negative move", () => {
     expect(screen.queryByRole("radio", { name: /A deposit/ })).toBeNull();
   });
 
-  it("says partial withdrawal is deferred, and what to do instead", () => {
-    expect(screen.getByText(/partial capital withdrawal is deferred/)).toBeInTheDocument();
-    expect(screen.getByText(/Record it as a full exit through the payout screen instead/))
-      .toBeInTheDocument();
+  it("sends a withdrawal to the payout screen, for its exact amount", () => {
+    // P6 shipped, so the advice is no longer "full exit only, or wait". A
+    // withdrawal is still not a classification outcome — D-J holds, and two
+    // ways to record the same money one click apart would be worse than one.
+    expect(screen.getByText(/record it on the\s+payout screen/)).toBeInTheDocument();
+    expect(screen.getByText(/for the exact amount, or as a full exit/)).toBeInTheDocument();
+    // And it must not still claim the feature is missing.
+    expect(screen.queryByText(/deferred/)).toBeNull();
+    expect(screen.queryByText(/cannot record it yet/)).toBeNull();
   });
 
   it("warns that ignoring a withdrawal gives the loss to everyone", () => {
-    expect(screen.getByText(/would give the loss to every holder pro-rata, which is wrong/))
+    expect(screen.getByText(/spread the\s+loss across every holder pro-rata/))
       .toBeInTheDocument();
   });
 

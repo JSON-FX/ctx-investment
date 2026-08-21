@@ -23,6 +23,8 @@ export const investorHref = (accountId: number) => `/a/${accountId}/actions/inve
 export const capitalHref = (accountId: number) => `/a/${accountId}/actions/capital`;
 export const payoutHref = (accountId: number, holderId: number) =>
   `/a/${accountId}/actions/payout/${holderId}`;
+export const withdrawHref = (accountId: number, holderId: number) =>
+  `/a/${accountId}/actions/withdraw/${holderId}`;
 export const classifyHref = (accountId: number, candidateId: number) =>
   `/a/${accountId}/review/${candidateId}`;
 

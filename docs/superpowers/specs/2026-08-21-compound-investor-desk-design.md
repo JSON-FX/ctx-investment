@@ -463,7 +463,9 @@ capital event. Each shows full arithmetic before commit, per PRD P2.
 
 **Requirements coverage.** v1 delivers PRD P0 in full — A1–A3, E1–E4, I1–I5,
 P1–P5, R1–R5 — plus E6 and R4's capital-event marking, which the PRD scheduled
-for later phases but which come nearly free given D3. Deferred: I6–I7, P6–P8,
+for later phases but which come nearly free given D3. **P6, partial capital
+withdrawal, was deferred here and has since shipped** — apportionment is
+proportional, and the cap is the holder's floored value. Deferred: I6–I7, P7–P8,
 R6–R8, and all of §6.6 (investor portal).
 
 ---
@@ -663,7 +665,10 @@ Carried from PRD §13, none blocking implementation.
    lands in v2, not before. Default: hidden.
 2. **Withdrawal-only crystallisation, or optional periodic?** v1 implements
    withdrawal-only — simpler and more generous to the investor.
-3. **Partial withdrawal: pro-rata basis reduction or LIFO?** Deferred with P6.
+3. **Partial withdrawal: pro-rata basis reduction or LIFO?** Settled when P6
+   shipped: pro-rata. Units are fungible, so redeeming a fraction of a value
+   redeems that fraction of the basis and that fraction of the profit; LIFO
+   would need lot tracking the ledger deliberately does not keep.
 4. **Multi-currency.** FX at deposit is straightforward; FX at payout is not.
    Deferred, not designed out.
 5. **Regulatory.** Pooling third-party capital and charging a performance fee is

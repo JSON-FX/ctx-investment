@@ -1,5 +1,7 @@
 import fc from "fast-check";
-import { fold, type HolderSeed, type LedgerEntry, type PoolState } from "./replay";
+import { mulDivFloor } from "./money";
+import { valueOfUnits } from "./nav";
+import { fold, totalsOf, type HolderSeed, type LedgerEntry, type PoolState } from "./replay";
 import { checkInvariants } from "./invariants";
 
 const MANAGER: HolderSeed = { holderId: 0, isManager: true, splitBps: 0 };
@@ -9,7 +11,16 @@ type Op =
   | { kind: "deposit"; holderId: number; amountCents: bigint }
   | { kind: "reading"; equityCents: bigint }
   | { kind: "payout"; holderId: number; feeCash: boolean }
-  | { kind: "exit"; holderId: number; feeCash: boolean };
+  | { kind: "exit"; holderId: number; feeCash: boolean }
+  /**
+   * P6. Unlike payout/exit, a withdrawal's amount is not derived from state
+   * — it is the arbitrary figure a manager types in, capped at the holder's
+   * value. fractionBps carries THAT choice instead of an absolute amountCents,
+   * because the cap is only known once buildLedger has folded the prefix; a
+   * pre-generated absolute amount could not be guaranteed legal against
+   * whatever value the holder happens to have at that point in the sequence.
+   */
+  | { kind: "withdrawal"; holderId: number; feeCash: boolean; fractionBps: number };
 
 const HOLDER_COUNT = 4; // manager (0) plus three investors
 
@@ -25,22 +36,29 @@ function seeds(): HolderSeed[] {
 /**
  * Weighted by hand rather than fc.oneof's frequency option, so this does not
  * depend on fast-check's weighted-oneof API: 0-2 deposit, 3-5 reading, 6-7
- * payout, 8 exit. Biased toward the extraction paths (payout/exit), which
- * are what the NAV-monotonicity property exists to protect. An even split
- * across the four kinds left payout/exit as a small minority of the already-
- * legal ops in a sequence, undercounting the paths that matter most.
+ * payout, 8 exit, 9-10 withdrawal. Biased toward the extraction paths
+ * (payout/exit/withdrawal), which are what the NAV-monotonicity property
+ * exists to protect. An even split across the five kinds left the extraction
+ * paths as a small minority of the already-legal ops in a sequence,
+ * undercounting the paths that matter most. Withdrawal gets the same weight
+ * as payout, on the same reasoning.
  */
 const opArb: fc.Arbitrary<Op> = fc
   .record({
-    kind: fc.integer({ min: 0, max: 8 }),
+    kind: fc.integer({ min: 0, max: 10 }),
     holderId: fc.integer({ min: 0, max: HOLDER_COUNT - 1 }),
     amountCents: fc.bigInt({ min: 100n, max: 100_000_00n }),
     equityCents: fc.bigInt({ min: 1n, max: 500_000_00n }),
     feeCash: fc.boolean(),
+    // 1..10000 basis points of the holder's CURRENT value at the point this
+    // op applies — see the Op type's own doc comment for why this is a
+    // fraction rather than an absolute amount.
+    fractionBps: fc.integer({ min: 1, max: 10_000 }),
   })
   .map((r): Op => {
-    // 0-2 deposit, 3-5 reading, 6-7 payout, 8 exit. Biased toward the
-    // extraction paths, which are what the NAV property exists to protect.
+    // 0-2 deposit, 3-5 reading, 6-7 payout, 8 exit, 9-10 withdrawal. Biased
+    // toward the extraction paths, which are what the NAV property exists to
+    // protect.
     if (r.kind <= 2) {
       return { kind: "deposit", holderId: r.holderId, amountCents: r.amountCents };
     }
@@ -52,9 +70,9 @@ const opArb: fc.Arbitrary<Op> = fc
     // out of every extraction path, so a manager exit — and a retained fee
     // landing on an exited manager — was never generated.
     const holderId = r.holderId;
-    return r.kind <= 7
-      ? { kind: "payout", holderId, feeCash: r.feeCash }
-      : { kind: "exit", holderId, feeCash: r.feeCash };
+    if (r.kind <= 7) return { kind: "payout", holderId, feeCash: r.feeCash };
+    if (r.kind === 8) return { kind: "exit", holderId, feeCash: r.feeCash };
+    return { kind: "withdrawal", holderId, feeCash: r.feeCash, fractionBps: r.fractionBps };
   });
 
 const foundingArb = fc.bigInt({ min: 10_000n, max: 1_000_000n }); // $100 .. $10,000
@@ -125,6 +143,27 @@ function buildLedger(foundingCents: bigint, ops: readonly Op[]): LedgerEntry[] {
           holderId: op.holderId,
           type: op.kind,
           amountCents: 0n,
+          feeSettlement: op.feeCash ? "cash" : "units",
+          splitBpsApplied: h.splitBps,
+        });
+        break;
+      }
+      case "withdrawal": {
+        const h = holders.get(op.holderId);
+        if (!h || h.units === 0n || state.equityCents <= 0n) continue;
+        // The cap, computed against the SAME totals fold() will use to
+        // apply this entry — quote.ts's own valueOfUnits call, not a
+        // separate derivation, so the generator can never manufacture an
+        // amount the engine itself would refuse.
+        const value = valueOfUnits(totalsOf(state), h.units);
+        if (value <= 0n) continue; // wiped out: nothing legal to withdraw
+        const amountCents = mulDivFloor(value, BigInt(op.fractionBps), 10_000n);
+        if (amountCents <= 0n) continue; // fraction too small to reach one cent
+        push({
+          ...base,
+          holderId: op.holderId,
+          type: "withdrawal",
+          amountCents,
           feeSettlement: op.feeCash ? "cash" : "units",
           splitBpsApplied: h.splitBps,
         });
