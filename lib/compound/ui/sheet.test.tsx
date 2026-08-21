@@ -102,6 +102,41 @@ describe("Field", () => {
     );
     expect(screen.getByText("In whole dollars.")).toBeInTheDocument();
   });
+
+  it("stays findable by exactly its label text once a hint is present", () => {
+    // The <label> wraps both the label span and the hint, so the browser's
+    // "name from content" computation would otherwise concatenate them with
+    // no separator and getByLabelText("Amount") — the label alone — would
+    // find nothing. Field pins the accessible name with aria-label so a
+    // hint's wording can never leak into it.
+    render(
+      <Field name="amount" label="Amount" hint="In whole dollars.">
+        <input id="amount" type="text" />
+      </Field>,
+    );
+    expect(screen.getByLabelText("Amount")).toBe(document.getElementById("amount"));
+  });
+
+  it("describes the control with the hint, for assistive tech, once a hint is present", () => {
+    render(
+      <Field name="amount" label="Amount" hint="In whole dollars.">
+        <input id="amount" type="text" />
+      </Field>,
+    );
+    const input = document.getElementById("amount")!;
+    const describedBy = input.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+    expect(document.getElementById(describedBy!)?.textContent).toBe("In whole dollars.");
+  });
+
+  it("sets no aria-describedby when there is no hint to point at", () => {
+    render(
+      <Field name="amount" label="Amount">
+        <input id="amount" type="text" />
+      </Field>,
+    );
+    expect(document.getElementById("amount")).not.toHaveAttribute("aria-describedby");
+  });
 });
 
 describe("FieldError", () => {

@@ -25,7 +25,7 @@ import { DeltaMoney, EmptyState, FeeMoney, Money, Panel } from "./primitives";
 import { KpiStrip, StatementHead, type LiveFigures } from "./statement";
 
 export function Desk({
-  accountId, state, figures, segments, currency, entryCount, live, actions,
+  accountId, state, figures, segments, currency, entryCount, live, actions, holderActions,
 }: {
   accountId: number;
   state: PoolState;
@@ -36,6 +36,9 @@ export function Desk({
   live: LiveFigures | null;
   /** Phase B fills this. Absent in Phase A, and the desk is complete without it. */
   actions?: ReactNode;
+  /** Task 13 turns this on. Separate from `actions` so the desk can carry a
+   *  reading button before a payout sheet exists to link to. */
+  holderActions?: boolean;
 }) {
   if (entryCount === 0) {
     return (
@@ -100,7 +103,7 @@ export function Desk({
           accountId={accountId}
           figures={figures}
           currency={currency}
-          showActions={actions !== undefined}
+          showActions={holderActions ?? false}
         />
       </Panel>
 
