@@ -5933,3 +5933,887 @@ MSG
 )"
 ```
 
+---
+
+### Task 10: `/a/[id]/holders/[hid]` — the per-holder statement
+
+The last surface in Phase A, and the one an investor reads. It carries the position, the history, and the figure they will ask about: what they would get if they withdrew today.
+
+**It also resolves decision D-A in words.** A holder's value has two answers — the allocated one on the statement and the floored one that settles — and they can differ by a cent. On the canonical fixture Ada reads **$12,630.61** on the desk and **$12,630.60** on her payout. Both are right. This page is where that is said out loud, so it is never discovered mid-dispute.
+
+**The wording lives in one module.** `present/wording.ts` holds the payout receipt's labels and hints, and both this page and Task 13's receipt import them. Two screens describing the same figure in two different phrasings is how a product ends up arguing with itself.
+
+**Files:**
+- Create: `lib/compound/present/wording.ts`
+- Create: `lib/compound/present/holder.ts`
+- Create: `lib/compound/ui/holder-statement.tsx`
+- Create: `app/a/[id]/holders/[hid]/page.tsx`
+- Test: `lib/compound/present/holder.test.ts`
+- Test: `lib/compound/present/wording.test.ts`
+- Test: `lib/compound/ui/holder-statement.test.tsx`
+
+**Interfaces:**
+- Consumes: `quote`, `Quote` from `@/lib/compound/engine/quote`; `valueOfUnits`, `allocateValues` from `@/lib/compound/engine/nav`; `LedgerStep`, `ledgerSteps` from `@/lib/compound/present/derive`; `listHolders` from `@/lib/compound/db/holders`
+- Produces:
+  - `PAYOUT_WORDS` — every label and hint on a payout receipt
+  - `interface HolderPosition { holder; ppm; statementValueCents; settlementValueCents; profitCents; recoveryCents; markState; profitQuote; exitQuote }`
+  - `holderPosition(state: PoolState, holderId: number): HolderPosition`
+  - `interface HolderStatementRow { seq; occurredOn; type; voided; own; unitsDelta; unitsAfter; basisAfter; valueAfter; valueDelta }`
+  - `holderStatement(steps: readonly LedgerStep[], holderId: number): HolderStatementRow[]`
+  - `HolderStatement` component
+
+- [ ] **Step 1: Create `lib/compound/present/wording.ts`**
+
+Every phrase on a payout receipt, in one place. The brief for this product is explicit that an investor reads these figures back in a dispute, so each accounting term appears with the plain-English sentence that defines it.
+
+```typescript
+/**
+ * The words on a payout receipt.
+ *
+ * They live here rather than inside the component because two screens render
+ * them: the holder statement's "if you withdrew today" block and the payout
+ * sheet itself. A holder who reads "Capital in" on one and "Cost basis" on the
+ * other has been given two names for one number, and will reasonably ask which
+ * is which at exactly the wrong moment.
+ *
+ * "Cost basis, their high-water mark" is precise and is jargon. What a
+ * non-accountant reads is "what they have put in", with the mechanism stated
+ * underneath in a sentence: it rises when they add capital, does not move when
+ * they take profit, and resets when they exit. That sentence IS the high-water
+ * mark; the term is not needed to explain it, and is kept only as a
+ * parenthetical for readers who already know it.
+ */
+export const PAYOUT_WORDS = {
+  unitsHeld: "Units held",
+  unitsHeldHint: "Their share of the pool, in units.",
+
+  valueNow: "Value at today's NAV",
+  valueNowHint: "Units held, at the NAV this payout settles against.",
+
+  capitalIn: (name: string) => `What ${name} has put in`,
+  capitalInHint: (name: string) =>
+    `Profit is measured against this. It rises when ${name} adds capital, does not ` +
+    `move when ${name} takes profit, and resets to zero on a full exit — which is ` +
+    `what a high-water mark is.`,
+
+  profit: "Profit above that",
+  profitHint: "Value today, less what has been put in.",
+
+  holderShare: (name: string, pct: string) => `${name}'s share of the profit (${pct}%)`,
+  managerFee: (pct: string) => `Your fee (${pct}%)`,
+  managerFeeHint: "Charged only on withdrawal, and only on profit. Never on a paper gain.",
+
+  unitsRedeemed: (name: string) => `Units ${name} gives up`,
+  unitsKept: (name: string) => `Units ${name} keeps`,
+  unitsKeptHint: "And what they are worth immediately after this payout.",
+
+  receives: (name: string) => `${name} receives`,
+
+  feeSettlement: "How your fee settles",
+  feeSettlementUnits: "Keep it in the account, as units",
+  feeSettlementUnitsHint:
+    "The cash stays in the pool and you are issued units for it. Your capital in rises " +
+    "by the fee. NAV does not move.",
+  feeSettlementCash: "Take it out, as cash",
+  feeSettlementCashHint:
+    "Equity falls by the fee and no units are issued. NAV does not move.",
+
+  belowMarkTitle: "Below the high-water mark",
+  belowMark: (name: string, put: string, worth: string, recovery: string) =>
+    `${name} has put in ${put}. The holding is worth ${worth} today. ` +
+    `${recovery} of recovery is needed before any profit can be withdrawn.`,
+  atMarkTitle: "Exactly at the high-water mark",
+  atMark: (name: string) =>
+    `${name}'s holding is worth exactly what they have put in. There is no profit to ` +
+    `withdraw yet, and no fee would be charged.`,
+  exitStillAvailable: (worth: string) =>
+    `A full exit is still available, at today's value of ${worth}, with no fee.`,
+
+  profitOnly: "Profit only",
+  profitOnlyHint: (name: string) =>
+    `${name} takes their profit and keeps their units. What they have put in is unchanged.`,
+  exitInFull: "Exit in full",
+  exitInFullHint: (name: string) =>
+    `${name} surrenders every unit and leaves the pool. What they have put in resets to zero.`,
+
+  statementVsSettlement: (statement: string, settlement: string) =>
+    `This statement values the holding at ${statement}, which is its exact share of ` +
+    `account equity. A payout settles at ${settlement}, rounded down to the cent so the ` +
+    `pool is never short. The difference is at most one cent and it stays in the pool.`,
+} as const;
+```
+
+- [ ] **Step 2: Create `lib/compound/present/holder.ts`**
+
+```typescript
+/**
+ * One holder's position and history.
+ *
+ * markState exists because quote()'s belowHighWaterMark is `profitCents <= 0n`,
+ * which reports a holder sitting EXACTLY on their mark as below it. That is
+ * defensible inside the engine — zero profit and negative profit both mean no
+ * fee — and it is wrong on a screen, where "below the high-water mark, $0.00 of
+ * recovery needed" reads as a glitch. Branching on the sign of profitCents here
+ * fixes the presentation without touching an engine that 125 tests agree with.
+ */
+import type { Cents, Units } from "@/lib/compound/engine/money";
+import { allocateValues, valueOfUnits } from "@/lib/compound/engine/nav";
+import { quote, type Quote } from "@/lib/compound/engine/quote";
+import {
+  totalsOf, type HolderState, type LedgerEntryType, type PoolState,
+} from "@/lib/compound/engine/replay";
+import type { LedgerStep } from "./derive";
+import { allocateShares } from "./rail";
+
+export interface HolderPosition {
+  holder: HolderState;
+  ppm: number;
+  /** ALLOCATED. Sums with the other holders to equity exactly. */
+  statementValueCents: Cents;
+  /** FLOORED. What a payout settles at. Can be one cent lower. */
+  settlementValueCents: Cents;
+  /** Against the SETTLEMENT value, because that is what a fee is charged on. */
+  profitCents: Cents;
+  /** Positive only when below the mark. Zero otherwise. */
+  recoveryCents: Cents;
+  markState: "above" | "at" | "below";
+  profitQuote: Quote;
+  exitQuote: Quote;
+}
+
+export function holderPosition(state: PoolState, holderId: number): HolderPosition {
+  const index = state.holders.findIndex((h) => h.holderId === holderId);
+  if (index === -1) throw new RangeError(`no holder ${holderId} on this account`);
+  const holder = state.holders[index]!;
+  const totals = totalsOf(state);
+
+  const common = {
+    totals,
+    holderUnits: holder.units,
+    basisCents: holder.basisCents,
+    splitBps: holder.splitBps,
+    isManager: holder.isManager,
+  };
+  const profitQuote = quote({ ...common, mode: "profit" });
+  const exitQuote = quote({ ...common, mode: "exit" });
+
+  const settlementValueCents = valueOfUnits(totals, holder.units);
+  const profitCents = settlementValueCents - holder.basisCents;
+
+  return {
+    holder,
+    ppm: allocateShares(state.holders.map((h) => h.units), state.units)[index]!,
+    statementValueCents: allocateValues(totals, state.holders.map((h) => h.units))[index]!,
+    settlementValueCents,
+    profitCents,
+    recoveryCents: profitCents < 0n ? -profitCents : 0n,
+    markState: profitCents > 0n ? "above" : profitCents === 0n ? "at" : "below",
+    profitQuote,
+    exitQuote,
+  };
+}
+
+export interface HolderStatementRow {
+  seq: number;
+  occurredOn: string;
+  type: LedgerEntryType;
+  voided: boolean;
+  /** True when the entry is this holder's own. A reading is nobody's. */
+  own: boolean;
+  /** Signed. Zero for an entry that does not move this holder's units. */
+  unitsDelta: Units;
+  unitsAfter: Units;
+  basisAfter: Cents;
+  /** Allocated, so a row here agrees with the desk on the same date. */
+  valueAfter: Cents;
+  /** Signed. What this entry did to their value. */
+  valueDelta: Cents;
+}
+
+/**
+ * Every entry on the account, from this holder's point of view.
+ *
+ * Readings are included even though they are nobody's entry, because a
+ * statement that showed only a holder's own deposits could not explain why
+ * their value changed between them — which is the single most likely question
+ * a statement has to answer.
+ */
+export function holderStatement(
+  steps: readonly LedgerStep[],
+  holderId: number,
+): HolderStatementRow[] {
+  const valueIn = (state: PoolState): Cents => {
+    const i = state.holders.findIndex((h) => h.holderId === holderId);
+    if (i === -1) return 0n;
+    return allocateValues(totalsOf(state), state.holders.map((h) => h.units))[i]!;
+  };
+  const holderIn = (state: PoolState): HolderState | undefined =>
+    state.holders.find((h) => h.holderId === holderId);
+
+  return steps.map((s) => {
+    const before = holderIn(s.before);
+    const after = holderIn(s.after);
+    return {
+      seq: s.entry.seq,
+      occurredOn: s.entry.occurredOn,
+      type: s.entry.type,
+      voided: s.voided,
+      own: s.entry.holderId === holderId,
+      unitsDelta: (after?.units ?? 0n) - (before?.units ?? 0n),
+      unitsAfter: after?.units ?? 0n,
+      basisAfter: after?.basisCents ?? 0n,
+      valueAfter: valueIn(s.after),
+      valueDelta: valueIn(s.after) - valueIn(s.before),
+    };
+  });
+}
+```
+
+- [ ] **Step 3: Write `lib/compound/present/holder.test.ts` and `wording.test.ts`**
+
+```typescript
+// lib/compound/present/holder.test.ts
+import { UNIT_SCALE, centsFromDecimal } from "@/lib/compound/engine/money";
+import { fold, type PoolState } from "@/lib/compound/engine/replay";
+import { ADA_ID, GRACE_ID, LEDGER, LEDGER_UNDERWATER, MANAGER_ID, SEEDS }
+  from "./fixture";
+import { ledgerSteps } from "./derive";
+import { holderPosition, holderStatement } from "./holder";
+
+const c = centsFromDecimal;
+const STATE = fold(LEDGER, SEEDS);
+const UNDER = fold(LEDGER_UNDERWATER, SEEDS);
+
+describe("holderPosition — above the mark", () => {
+  const p = holderPosition(STATE, ADA_ID);
+
+  it("gives the statement value and the settlement value separately", () => {
+    expect(p.statementValueCents).toBe(c("12630.61"));   // allocated
+    expect(p.settlementValueCents).toBe(c("12630.60"));  // floored
+  });
+
+  it("measures profit against the settlement value, because that is what a fee is charged on", () => {
+    expect(p.profitCents).toBe(c("2630.60"));
+    expect(p.profitCents).not.toBe(c("2630.61"));
+  });
+
+  it("reports the mark state as above, and needs no recovery", () => {
+    expect(p.markState).toBe("above");
+    expect(p.recoveryCents).toBe(0n);
+  });
+
+  it("quotes both modes against the same NAV", () => {
+    expect(p.profitQuote.feeCents).toBe(c("1052.24"));
+    expect(p.profitQuote.toHolderCents).toBe(c("1578.36"));
+    expect(p.exitQuote.feeCents).toBe(c("1052.24"));
+    expect(p.exitQuote.toHolderCents).toBe(c("11578.36"));
+  });
+
+  it("carries the holder's share", () => {
+    expect(p.ppm).toBe(226_583);
+  });
+});
+
+describe("holderPosition — below the mark", () => {
+  it("states the recovery for each holder", () => {
+    expect(holderPosition(UNDER, MANAGER_ID).recoveryCents).toBe(c("1312.71"));
+    expect(holderPosition(UNDER, ADA_ID).recoveryCents).toBe(c("1364.84"));
+    expect(holderPosition(UNDER, GRACE_ID).recoveryCents).toBe(c("1712.02"));
+  });
+
+  it("charges no fee in either mode", () => {
+    const p = holderPosition(UNDER, ADA_ID);
+    expect(p.profitQuote.feeCents).toBe(0n);
+    expect(p.exitQuote.feeCents).toBe(0n);
+  });
+
+  it("still lets a full exit take the whole value", () => {
+    expect(holderPosition(UNDER, ADA_ID).exitQuote.toHolderCents).toBe(c("8635.16"));
+  });
+
+  it("pays nothing in profit mode", () => {
+    expect(holderPosition(UNDER, ADA_ID).profitQuote.toHolderCents).toBe(0n);
+  });
+});
+
+describe("holderPosition — exactly at the mark", () => {
+  // Deliberately tiny and deliberately awkward: 700 cents across 3 units.
+  const atMark: PoolState = {
+    equityCents: 700n,
+    units: 3n * UNIT_SCALE,
+    holders: [{
+      holderId: 1, isManager: false, splitBps: 4000,
+      units: 3n * UNIT_SCALE, basisCents: 700n, status: "active",
+    }],
+    lastReadingOn: "2026-08-14",
+    seq: 1,
+  };
+
+  it("says AT the mark, not below it", () => {
+    // quote().belowHighWaterMark is `profitCents <= 0n` and reports true here.
+    // A screen that rendered that would say "below the high-water mark, $0.00
+    // of recovery needed", which reads as a bug to the person it is shown to.
+    const p = holderPosition(atMark, 1);
+    expect(p.profitCents).toBe(0n);
+    expect(p.markState).toBe("at");
+    expect(p.recoveryCents).toBe(0n);
+    expect(p.profitQuote.belowHighWaterMark).toBe(true);   // the engine's view
+  });
+});
+
+describe("holderPosition — a one-cent statement/settlement gap", () => {
+  // Two holders, 700 cents, 3 units. Floors are 233 and 466, one cent short of
+  // 700; largest remainder awards the cent to the second holder.
+  const split: PoolState = {
+    equityCents: 700n,
+    units: 3n * UNIT_SCALE,
+    holders: [
+      { holderId: 1, isManager: true, splitBps: 0, units: 1n * UNIT_SCALE, basisCents: 200n, status: "active" },
+      { holderId: 2, isManager: false, splitBps: 4000, units: 2n * UNIT_SCALE, basisCents: 400n, status: "active" },
+    ],
+    lastReadingOn: "2026-08-14",
+    seq: 1,
+  };
+
+  it("gives holder 2 a statement value one cent above their settlement value", () => {
+    const p = holderPosition(split, 2);
+    expect(p.statementValueCents).toBe(467n);
+    expect(p.settlementValueCents).toBe(466n);
+  });
+
+  it("leaves holder 1's two figures equal", () => {
+    const p = holderPosition(split, 1);
+    expect(p.statementValueCents).toBe(233n);
+    expect(p.settlementValueCents).toBe(233n);
+  });
+});
+
+describe("holderPosition — refusals", () => {
+  it("refuses a holder who is not on this account", () => {
+    expect(() => holderPosition(STATE, 99)).toThrow(/no holder 99 on this account/);
+  });
+});
+
+describe("holderStatement", () => {
+  const rows = holderStatement(ledgerSteps(LEDGER, SEEDS), ADA_ID);
+
+  it("includes every entry, not only Ada's own", () => {
+    expect(rows).toHaveLength(6);
+    expect(rows.filter((r) => r.own).map((r) => r.seq)).toEqual([3]);
+  });
+
+  it("shows Ada holding nothing before her deposit", () => {
+    expect(rows[0]!.unitsAfter).toBe(0n);
+    expect(rows[0]!.valueAfter).toBe(0n);
+  });
+
+  it("issues her units on her deposit and sets her capital in", () => {
+    expect(rows[2]!.unitsDelta).toBeGreaterThan(0n);
+    expect(rows[2]!.basisAfter).toBe(c("10000.00"));
+    expect(rows[2]!.valueAfter).toBe(c("10000.00"));
+  });
+
+  it("moves her value on a reading she had no part in", () => {
+    // This is why readings are on a holder's statement at all: without seq 4
+    // her value jumps between her own entries with nothing to explain it.
+    expect(rows[3]!.own).toBe(false);
+    expect(rows[3]!.unitsDelta).toBe(0n);
+    expect(rows[3]!.valueDelta).toBeGreaterThan(0n);
+  });
+
+  it("ends on the figure her statement head shows", () => {
+    expect(rows[5]!.valueAfter).toBe(c("12630.61"));
+    expect(rows[5]!.unitsAfter).toBe(holderPosition(STATE, ADA_ID).holder.units);
+  });
+
+  it("leaves her value unmoved by another holder's deposit", () => {
+    // Grace joins at seq 5. Ada's units do not change and neither does her
+    // value: a deposit issues units at the prevailing NAV, which is what makes
+    // staggered entry safe.
+    expect(rows[4]!.unitsDelta).toBe(0n);
+    expect(rows[4]!.valueDelta).toBe(0n);
+  });
+});
+```
+
+```typescript
+// lib/compound/present/wording.test.ts
+import { PAYOUT_WORDS } from "./wording";
+
+describe("PAYOUT_WORDS", () => {
+  it("names the holder in every sentence that is about them", () => {
+    expect(PAYOUT_WORDS.capitalIn("Ada")).toBe("What Ada has put in");
+    expect(PAYOUT_WORDS.receives("Ada")).toBe("Ada receives");
+    expect(PAYOUT_WORDS.unitsRedeemed("Ada")).toBe("Units Ada gives up");
+  });
+
+  it("explains the high-water mark without requiring the term", () => {
+    const hint = PAYOUT_WORDS.capitalInHint("Ada");
+    expect(hint).toContain("rises when Ada adds capital");
+    expect(hint).toContain("does not move when Ada takes profit");
+    expect(hint).toContain("resets to zero on a full exit");
+  });
+
+  it("says when a fee is charged, in the fee's own hint", () => {
+    expect(PAYOUT_WORDS.managerFeeHint).toContain("only on withdrawal");
+    expect(PAYOUT_WORDS.managerFeeHint).toContain("only on profit");
+    expect(PAYOUT_WORDS.managerFeeHint).toContain("Never on a paper gain");
+  });
+
+  it("states the recovery figure in the below-the-mark sentence", () => {
+    expect(PAYOUT_WORDS.belowMark("Ada", "$10,000.00", "$8,635.16", "$1,364.84"))
+      .toBe(
+        "Ada has put in $10,000.00. The holding is worth $8,635.16 today. " +
+        "$1,364.84 of recovery is needed before any profit can be withdrawn.",
+      );
+  });
+
+  it("keeps exit available in the same breath as refusing profit", () => {
+    expect(PAYOUT_WORDS.exitStillAvailable("$8,635.16"))
+      .toContain("still available, at today's value of $8,635.16, with no fee");
+  });
+
+  it("does not say 'below the mark' when the holder is exactly on it", () => {
+    expect(PAYOUT_WORDS.atMark("Ada")).not.toMatch(/below/i);
+    expect(PAYOUT_WORDS.atMark("Ada")).toContain("no profit to withdraw yet");
+  });
+
+  it("explains both fee settlements as NAV-neutral", () => {
+    expect(PAYOUT_WORDS.feeSettlementUnitsHint).toContain("NAV does not move");
+    expect(PAYOUT_WORDS.feeSettlementCashHint).toContain("NAV does not move");
+    expect(PAYOUT_WORDS.feeSettlementUnitsHint).toContain("capital in rises by the fee");
+  });
+
+  it("explains the statement/settlement gap and where the cent goes", () => {
+    const s = PAYOUT_WORDS.statementVsSettlement("$12,630.61", "$12,630.60");
+    expect(s).toContain("exact share of account equity");
+    expect(s).toContain("rounded down to the cent so the pool is never short");
+    expect(s).toContain("at most one cent and it stays in the pool");
+  });
+});
+```
+
+**How these bite.** These read like tests of prose, and two of them are load-bearing. `does not say 'below the mark' when the holder is exactly on it` fails the moment someone renders `quote().belowHighWaterMark` directly, which is the engine's carried-forward finding arriving on a screen. `states the recovery figure` fails if the sentence is reworded to omit the number, which is the difference between a refusal a manager can act on and one they cannot.
+
+- [ ] **Step 4: Create `lib/compound/ui/holder-statement.tsx`**
+
+```tsx
+/**
+ * One holder's statement.
+ *
+ * The withdraw block is a preview of the payout receipt and imports the same
+ * words from PAYOUT_WORDS. In Phase A it has no button; Task 13 adds the link.
+ */
+import type { HolderRow } from "@/lib/compound/db/holders";
+import type { PoolTotals } from "@/lib/compound/engine/nav";
+import type { HolderPosition, HolderStatementRow } from "@/lib/compound/present/holder";
+import {
+  formatDate, formatMoney, formatNav, formatSplit, formatSplitWords, formatUnitsDp,
+} from "@/lib/compound/present/format";
+import { PAYOUT_WORDS } from "@/lib/compound/present/wording";
+import { DeltaMoney, Eyebrow, FeeMoney, LabelledFigure, Money, Panel, Share, Tag }
+  from "./primitives";
+import { Receipt, ReceiptLine } from "./receipt";
+
+const TYPE_LABELS: Record<string, string> = {
+  deposit: "Deposit", payout: "Payout", exit: "Exit",
+  equity_reading: "Account revalued", adjustment: "Adjustment",
+};
+
+export function HolderStatement({
+  holder, position, rows, totals, currency, withdrawAction,
+}: {
+  holder: HolderRow;
+  position: HolderPosition;
+  rows: HolderStatementRow[];
+  totals: PoolTotals;
+  currency: string;
+  /** Phase B fills this. */
+  withdrawAction?: React.ReactNode;
+}) {
+  const name = holder.name;
+  const money = (c: bigint) => formatMoney(c, { currency });
+  const managerPct = formatSplit(holder.splitBps).split(" / ")[1]!;
+  const holderPct = formatSplit(holder.splitBps).split(" / ")[0]!;
+  const derivedStatus = position.holder.status;
+
+  return (
+    <>
+      <Panel>
+        <Eyebrow>
+          Holder statement · joined{" "}
+          {holder.joinedAt === null ? "—" : formatDate(holder.joinedAt)}
+        </Eyebrow>
+        <h1 style={{ fontFamily: "var(--serif)", fontWeight: 400, fontSize: 30, margin: "6px 0 2px" }}>
+          {name}
+          {holder.isManager ? <Tag>Manager</Tag> : null}
+          {derivedStatus === "closed" ? <Tag>Closed</Tag> : null}
+        </h1>
+        <p className="muted" style={{ margin: "0 0 16px", fontSize: 13 }}>
+          {holder.isManager
+            ? "You manage this account. No fee is charged on your own holding."
+            : formatSplitWords(holder.splitBps, name)}
+        </p>
+
+        <div className="kpi">
+          <LabelledFigure label="Units held" className="kpi-item">
+            {formatUnitsDp(position.holder.units)}
+          </LabelledFigure>
+          <LabelledFigure label="Share of the pool" className="kpi-item">
+            <Share ppm={position.ppm} />
+          </LabelledFigure>
+          <LabelledFigure label={PAYOUT_WORDS.capitalIn(name)} className="kpi-item">
+            <Money cents={position.holder.basisCents} currency={currency} />
+          </LabelledFigure>
+          <LabelledFigure label="Value on this statement" className="kpi-item">
+            <Money cents={position.statementValueCents} currency={currency} />
+          </LabelledFigure>
+          <LabelledFigure label="Profit above that" className="kpi-item">
+            <DeltaMoney cents={position.profitCents} currency={currency} />
+          </LabelledFigure>
+        </div>
+
+        <p className="split-note">
+          {PAYOUT_WORDS.statementVsSettlement(
+            money(position.statementValueCents),
+            money(position.settlementValueCents),
+          )}
+        </p>
+      </Panel>
+
+      <Panel>
+        <Eyebrow>If {name} withdrew today · NAV {formatNav(totals)}</Eyebrow>
+
+        {position.markState === "above" ? (
+          <Receipt label={`Withdrawal preview for ${name}`}>
+            <ReceiptLine label={PAYOUT_WORDS.valueNow} hint={PAYOUT_WORDS.valueNowHint}>
+              <span className="num">{money(position.settlementValueCents)}</span>
+            </ReceiptLine>
+            <ReceiptLine label={PAYOUT_WORDS.profit} hint={PAYOUT_WORDS.profitHint}>
+              <DeltaMoney cents={position.profitCents} currency={currency} />
+            </ReceiptLine>
+            <ReceiptLine label={PAYOUT_WORDS.holderShare(name, holderPct)}>
+              <span className="num">{money(position.profitQuote.toHolderCents)}</span>
+            </ReceiptLine>
+            <ReceiptLine
+              label={PAYOUT_WORDS.managerFee(managerPct)}
+              hint={PAYOUT_WORDS.managerFeeHint}
+              tone="fee"
+            >
+              <FeeMoney cents={position.profitQuote.feeCents} currency={currency} />
+            </ReceiptLine>
+            <ReceiptLine label={`${PAYOUT_WORDS.exitInFull} — ${name} receives`}>
+              <span className="num">{money(position.exitQuote.toHolderCents)}</span>
+            </ReceiptLine>
+          </Receipt>
+        ) : (
+          <div className="banner-halt" role="status">
+            <strong>
+              {position.markState === "below"
+                ? PAYOUT_WORDS.belowMarkTitle
+                : PAYOUT_WORDS.atMarkTitle}
+            </strong>
+            <p style={{ margin: "6px 0 0" }}>
+              {position.markState === "below"
+                ? PAYOUT_WORDS.belowMark(
+                    name,
+                    money(position.holder.basisCents),
+                    money(position.settlementValueCents),
+                    money(position.recoveryCents),
+                  )
+                : PAYOUT_WORDS.atMark(name)}
+            </p>
+            <p style={{ margin: "6px 0 0" }}>
+              {PAYOUT_WORDS.exitStillAvailable(money(position.exitQuote.toHolderCents))}
+            </p>
+          </div>
+        )}
+
+        {withdrawAction ? <div className="actions">{withdrawAction}</div> : null}
+      </Panel>
+
+      <Panel flush>
+        <div className="scroller">
+          <table>
+            <caption className="eyebrow">{name}&apos;s history</caption>
+            <thead>
+              <tr>
+                <th scope="col">Occurred</th>
+                <th scope="col">What happened</th>
+                <th scope="col">Units in/out</th>
+                <th scope="col">Units after</th>
+                <th scope="col">Capital in</th>
+                <th scope="col">Value after</th>
+                <th scope="col">Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.seq} className={r.voided ? "voided" : r.own ? "own" : ""}>
+                  <th scope="row" className="num" style={{ fontWeight: 400 }}>
+                    {formatDate(r.occurredOn)}
+                  </th>
+                  <td>
+                    {TYPE_LABELS[r.type] ?? r.type}
+                    {r.own ? null : <span className="muted"> · account-wide</span>}
+                    {r.voided ? <span className="muted"> · voided</span> : null}
+                  </td>
+                  <td className="num">
+                    {r.unitsDelta === 0n
+                      ? "—"
+                      : `${r.unitsDelta > 0n ? "+" : "-"}${formatUnitsDp(
+                          r.unitsDelta < 0n ? -r.unitsDelta : r.unitsDelta,
+                        )}`}
+                  </td>
+                  <td className="num">{formatUnitsDp(r.unitsAfter)}</td>
+                  <td><Money cents={r.basisAfter} currency={currency} /></td>
+                  <td><Money cents={r.valueAfter} currency={currency} /></td>
+                  <td>
+                    {r.valueDelta === 0n
+                      ? <span className="num">—</span>
+                      : <DeltaMoney cents={r.valueDelta} currency={currency} />}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </>
+  );
+}
+```
+
+- [ ] **Step 5: Create `app/a/[id]/holders/[hid]/page.tsx`**
+
+```tsx
+import { notFound } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { listHolders } from "@/lib/compound/db/holders";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger";
+import { ledgerSteps } from "@/lib/compound/present/derive";
+import { holderPosition, holderStatement } from "@/lib/compound/present/holder";
+import { HolderStatement } from "@/lib/compound/ui/holder-statement";
+
+export const dynamic = "force-dynamic";
+
+export default async function HolderPage({
+  params,
+}: { params: Promise<{ id: string; hid: string }> }) {
+  const { id, hid } = await params;
+  const account = await requireAccount(id);
+  if (!/^[1-9][0-9]{0,17}$/.test(hid)) notFound();
+  const holderId = Number(hid);
+
+  const [state, entries, seeds, holders] = await Promise.all([
+    loadPoolState(account.id),
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    withDb((c) => listHolders(c, account.id)),
+  ]);
+
+  const holder = holders.find((h) => h.id === holderId);
+  if (holder === undefined) notFound();
+
+  return (
+    <HolderStatement
+      holder={holder}
+      position={holderPosition(state, holderId)}
+      rows={holderStatement(ledgerSteps(entries, seeds), holderId)}
+      totals={totalsOf(state)}
+      currency={account.currency}
+    />
+  );
+}
+```
+
+- [ ] **Step 6: Write `lib/compound/ui/holder-statement.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import { fold, totalsOf } from "@/lib/compound/engine/replay";
+import { ledgerSteps } from "@/lib/compound/present/derive";
+import { holderPosition, holderStatement } from "@/lib/compound/present/holder";
+import { ADA_ID, LEDGER, LEDGER_UNDERWATER, SEEDS } from "@/lib/compound/present/fixture";
+import { HolderStatement } from "./holder-statement";
+
+const ADA: HolderRow = {
+  id: ADA_ID, accountId: 7, name: "Ada Lovelace", email: "ada@example.com",
+  userId: null, isManager: false, splitBps: 4000, joinedAt: "2026-05-04", status: "active",
+};
+
+function renderFor(ledger = LEDGER, holder: HolderRow = ADA) {
+  const state = fold(ledger, SEEDS);
+  return render(
+    <HolderStatement
+      holder={holder}
+      position={holderPosition(state, holder.id)}
+      rows={holderStatement(ledgerSteps(ledger, SEEDS), holder.id)}
+      totals={totalsOf(state)}
+      currency="USD"
+    />,
+  );
+}
+
+describe("HolderStatement — the position", () => {
+  beforeEach(() => renderFor());
+
+  it("reads back every headline figure", () => {
+    expect(screen.getByLabelText("Units held").textContent).toBe("9,113.7132");
+    expect(screen.getByLabelText("Share of the pool").textContent).toBe("22.66%");
+    expect(screen.getByLabelText("What Ada Lovelace has put in").textContent).toBe("$10,000.00");
+    expect(screen.getByLabelText("Value on this statement").textContent).toBe("$12,630.61");
+    expect(screen.getByLabelText("Profit above that").textContent).toBe("+$2,630.60");
+  });
+
+  it("states both values and where the cent goes, before anyone has to ask", () => {
+    const note = screen.getByText(/This statement values the holding at/);
+    expect(note.textContent).toContain("$12,630.61");
+    expect(note.textContent).toContain("$12,630.60");
+    expect(note.textContent).toContain("so the pool is never short");
+  });
+
+  it("states the terms in a sentence, using Ada's own split", () => {
+    expect(screen.getByText(/Ada Lovelace keeps 60% of profit and you keep 40%/))
+      .toBeInTheDocument();
+  });
+});
+
+describe("HolderStatement — the withdrawal preview, above the mark", () => {
+  beforeEach(() => renderFor());
+
+  it("shows the value it would settle at, not the statement value", () => {
+    expect(screen.getByLabelText(/Value at today's NAV/).textContent).toBe("$12,630.60");
+  });
+
+  it("splits the profit and names the fee as the fee", () => {
+    expect(screen.getByLabelText("Ada Lovelace's share of the profit (60%)").textContent)
+      .toBe("$1,578.36");
+    expect(screen.getByLabelText("Your fee (40%)").textContent).toBe("$1,052.24");
+  });
+
+  it("shows what a full exit would pay", () => {
+    expect(screen.getByLabelText(/Exit in full — Ada Lovelace receives/).textContent)
+      .toBe("$11,578.36");
+  });
+
+  it("puts the fee line in amber and nothing else", () => {
+    expect(document.querySelectorAll(".receipt-line.is-fee")).toHaveLength(1);
+  });
+
+  it("adds up: the holder's share plus the fee is the profit", () => {
+    const share = BigInt(screen.getByLabelText(/share of the profit/).textContent!.replace(/\D/g, ""));
+    const fee = BigInt(screen.getByLabelText("Your fee (40%)").textContent!.replace(/\D/g, ""));
+    const profit = BigInt(screen.getByLabelText("Profit above that").textContent!.replace(/\D/g, ""));
+    expect(share + fee).toBe(profit);
+  });
+});
+
+describe("HolderStatement — below the mark", () => {
+  beforeEach(() => renderFor(LEDGER_UNDERWATER));
+
+  it("says so, and states the recovery figure", () => {
+    expect(screen.getByText("Below the high-water mark")).toBeInTheDocument();
+    expect(screen.getByText(/\$1,364\.84 of recovery is needed/)).toBeInTheDocument();
+  });
+
+  it("keeps the exit available, with no fee, in the same block", () => {
+    expect(screen.getByText(/still available, at today's value of \$8,635\.16, with no fee/))
+      .toBeInTheDocument();
+  });
+
+  it("shows no fee line at all, rather than a fee of zero", () => {
+    expect(screen.queryByLabelText(/Your fee/)).toBeNull();
+  });
+
+  it("shows profit negative with a sign", () => {
+    expect(screen.getByLabelText("Profit above that").textContent).toBe("-$1,364.84");
+  });
+});
+
+describe("HolderStatement — the history", () => {
+  beforeEach(() => renderFor());
+
+  it("shows every entry, marking the ones that are not Ada's", () => {
+    const rows = screen.getAllByRole("row").filter((r) => within(r).queryAllByRole("cell").length > 0);
+    expect(rows).toHaveLength(6);
+    expect(rows.filter((r) => r.textContent?.includes("account-wide"))).toHaveLength(5);
+  });
+
+  it("explains a value change she had no part in", () => {
+    const revalue = screen.getAllByRole("row", { name: /Account revalued/ });
+    expect(revalue.length).toBe(3);
+    // 30 Jun 2026: her units do not move, her value does.
+    const row = screen.getByRole("row", { name: /30 Jun 2026/ });
+    const cells = within(row).getAllByRole("cell").map((c) => c.textContent);
+    expect(cells[1]).toBe("—");                       // units in/out
+    expect(cells[5]).toMatch(/^\+\$/);                // change is positive
+  });
+
+  it("leaves her untouched by Grace's deposit", () => {
+    const row = screen.getByRole("row", { name: /6 Jul 2026/ });
+    const cells = within(row).getAllByRole("cell").map((c) => c.textContent);
+    expect(cells[1]).toBe("—");   // units in/out
+    expect(cells[5]).toBe("—");   // change
+  });
+
+  it("ends on the value the position block shows", () => {
+    const row = screen.getByRole("row", { name: /14 Aug 2026/ });
+    expect(within(row).getAllByRole("cell")[4]!.textContent).toBe("$12,630.61");
+  });
+});
+
+describe("HolderStatement — the manager", () => {
+  it("says no fee is charged on their own holding, and shows none", () => {
+    renderFor(LEDGER, {
+      ...ADA, id: 1, name: "J. Marsh", isManager: true, splitBps: 0, joinedAt: "2026-03-02",
+    });
+    expect(screen.getByText(/No fee is charged on your own holding/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Your fee (0%)").textContent).toBe("$0.00");
+  });
+});
+
+describe("HolderStatement — Phase A", () => {
+  it("previews a withdrawal without offering to make one", () => {
+    renderFor();
+    expect(screen.queryByRole("link", { name: /Pay out/ })).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 7: Run the gates and prove three probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `holderPosition`, compute `profitCents` from `statementValueCents`. Expect the "measures profit against the settlement value" test to fail, and the receipt's share-plus-fee-equals-profit assertion to fail with it — a one-cent break that a round fixture would never have shown.
+2. In `HolderStatement`, render `position.profitQuote.belowHighWaterMark` instead of `markState`. Expect the at-the-mark case in `holder.test.ts` to keep passing (it tests the presenter, not the component) and the component to start claiming a holder at the mark is below it. **Add a component case for it** if the probe shows nothing goes red — a gap found by probing is a gap, not a pass.
+3. In `holderStatement`, filter to `s.entry.holderId === holderId`. Expect "shows every entry" and "explains a value change she had no part in" to fail. That filter is the obvious optimisation and it is the one that makes a statement unable to explain itself.
+
+- [ ] **Step 8: Commit — this is the end of Phase A**
+
+```bash
+pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the per-holder statement, and the words a payout uses
+
+Ends phase A. Every read surface in spec section 7 now renders real figures.
+
+The statement states its own rounding: a holding is worth $12,630.61 as its
+exact share of equity and settles at $12,630.60 rounded down, and the page says
+so rather than leaving it to be discovered in a dispute. PAYOUT_WORDS holds the
+wording both this page and the payout receipt use.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
+> **Phase A checkpoint.** Stop here if this is being executed as two plans. What exists: sign-in, the account list, account creation, the account shell, the desk, the ledger and the holder statement, all rendering real figures from the real database, with nothing that writes. That is a coherent, mergeable product.
+
