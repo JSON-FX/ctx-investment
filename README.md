@@ -125,6 +125,25 @@ pnpm test:db
 
 `pnpm test` stays offline and never touches Postgres.
 
+**Working in a second worktree with its own Supabase stack on different
+ports?** `pnpm test:db` does not read `.env` — nothing in `jest.config.mjs`,
+`jest.db.config.mjs` or `global-setup.ts` loads dotenv. `COMPOUND_DATABASE_URL`
+/ `COMPOUND_TEST_DATABASE_URL` silently fall back to
+`lib/compound/db/testing/env.ts`'s hard-coded `127.0.0.1:54622` — this
+worktree's default, but likely a *different* worktree's stack — unless you
+export them in the shell before running the command:
+
+```bash
+export COMPOUND_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:<your-db-port>/postgres"
+export COMPOUND_TEST_DATABASE_URL="$COMPOUND_DATABASE_URL"
+pnpm test:db
+```
+
+Forgetting this doesn't fail loudly — it runs cleanly against whichever
+project happens to be listening on `54622`, and `resetCompoundTables`
+truncates it. Against another worktree's in-flight run that reads as a flaky
+or broken test over there, not as an environment mistake over here.
+
 **Never run `supabase link` or `supabase db push` in this repository.** The
 `compound_*` migrations are applied to CopyTraderX by hand, as a reviewed step,
 not by any command in this repo.
