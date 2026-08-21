@@ -95,6 +95,33 @@ describe("computeTradeStats", () => {
     expect(l.worstTradeCents).toBe(-1511n);
   });
 
+  // expectedPayoffCents is the only genuinely-signed division in this file:
+  // netAfterFeesCents can be negative (a losing account), and the divisor
+  // (trade count) is always positive, so floor and truncate-toward-zero can
+  // disagree. Every other divFloor call site here divides two quantities
+  // that are structurally non-negative by construction (win/loss counts,
+  // and sums that only ever accumulate one sign), so this is the one place
+  // a regression from divFloor to plain `/` is otherwise invisible. On this
+  // losing sub-fixture, netAfterFeesCents is -2824n over 3 trades:
+  // -2824n / 3n truncates to -941n, but divFloor(-2824n, 3n) is -942n.
+  // Mutation caught: replacing divFloor with plain `/` in
+  // expectedPayoffCents, which none of the other tests in this file (nor
+  // the rest of the 128-test journal suite) catch — this fixture is
+  // deliberately a losing account with a non-evenly-divisible count so the
+  // two answers differ. Verified directly: mutating that call site left
+  // every other test in lib/compound/journal/ green and failed only this
+  // one assertion.
+  it("floors expectedPayoffCents on a loss, where floor and truncation disagree", () => {
+    const losersOnly = buildTradeHistory(
+      RAW_DEALS.filter((d) => d.profitCents < 0n),
+      FIXTURE_OFFSET_HOURS,
+    );
+    const l = computeTradeStats(losersOnly.deals);
+    expect(l.totalTrades).toBe(3);
+    expect(l.netAfterFeesCents).toBe(-2824n);
+    expect(l.expectedPayoffCents).toBe(-942n);
+  });
+
   // THE DEDUPE ASSERTION. Every headline figure moves if the planted twin
   // survives. Mutation caught: any change that skips dedupeDeals.
   // THE DEDUPE ASSERTION. Ticket 5092 is a WIN clone of ticket 5008, so it

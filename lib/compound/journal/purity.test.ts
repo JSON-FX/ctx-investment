@@ -1,3 +1,17 @@
+/**
+ * journal/ is pure: no React, no I/O, no floating point (the design plan's
+ * Architecture section states this claim in those words).
+ *
+ * FORBIDDEN below is the mechanical half of that claim, not the whole of
+ * it: each entry is a regex over one source file's stripped text, so it
+ * catches literal text in this directory's own top-level files, not I/O
+ * reached indirectly — a helper imported from outside this directory, a
+ * dynamic `import()`, or a `require()` call could all still slip past a
+ * text scan. Within that limit, "no I/O" here specifically means: no
+ * db/next/react/@supabase import, no `node:` builtin import (`node:fs`,
+ * `node:https`, ...), and no bare `fetch(` call — on top of the
+ * pre-existing bans on Date, parseFloat and decimal literals below.
+ */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { stripComments } from "@/lib/compound/testing/strip-comments";
@@ -13,6 +27,18 @@ const FORBIDDEN: Array<[string, RegExp]> = [
   ["imports next", /from\s+["']next/],
   ["imports react", /from\s+["']react/],
   ["imports @supabase", /from\s+["']@supabase/],
+  // Real I/O. A planted `readFileSync` call in int.ts stayed invisible to
+  // every check above it — none of them look for the filesystem, the
+  // network, or a child process. `node:` covers the prefixed form every
+  // built-in module supports (node:fs, node:https, node:child_process, ...);
+  // the bare-name alternation covers the same three modules' unprefixed
+  // form, which Node accepts identically and is the more common style in
+  // the wild, so relying on the prefix alone would leave the trivial
+  // workaround of just dropping it. fetch() is the network case neither
+  // pattern reaches on its own.
+  ["imports a node: builtin", /from\s+["']node:/],
+  ["imports fs, https, http or child_process unprefixed", /from\s+["'](fs|https?|child_process)(\/|["'])/],
+  ["calls fetch", /\bfetch\s*\(/],
   // A month grid or a day key built from a local Date shifts west of UTC.
   // reconcile/date-key.ts is where Date is allowed; nothing here needs it.
   ["constructs a Date", /new\s+Date\s*\(/],

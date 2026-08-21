@@ -16,7 +16,15 @@
 // Do not "simplify" this back to UTC or remove it — that reintroduces the
 // exact blind spot this comment describes. It stays at module scope so it is
 // set before either project below is constructed.
-process.env.TZ = "Asia/Manila";
+//
+// This must be a DEFAULT, not an unconditional override. An unconditional
+// `process.env.TZ = "Asia/Manila"` here would silently clobber a
+// shell-supplied TZ (e.g. `TZ=Pacific/Kiritimati npx jest`), which defeats
+// the one way anyone can actually verify a timezone-independence claim by
+// varying the runner's zone. Whenever the shell leaves TZ unset — every CI
+// runner and most local runs — this still lands on Asia/Manila, so the
+// discriminating power described above is unchanged by default.
+if (!process.env.TZ) process.env.TZ = "Asia/Manila";
 
 /** @type {import('jest').Config} */
 const shared = {

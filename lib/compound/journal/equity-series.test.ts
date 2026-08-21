@@ -185,12 +185,19 @@ describe("buildAccountEquitySeries", () => {
     }
   });
 
-  // R4's actual failure mode, made concrete: performanceCents must equal
-  // equityCents - contributedCents at every point, not just the two probed
-  // above. If this invariant holds everywhere, "the gap between the top two
-  // lines is the bottom line" is true by construction, not by coincidence at
-  // two hand-picked indices.
-  it("holds equity = contributed + performance at every point", () => {
+  // NOT a correctness check on contributedCents — a definitional-consistency
+  // check. equity-series.ts sets performanceCents to
+  // `snap.equityCloseCents - contributed` in the same object literal that
+  // sets equityCents and contributedCents, so this identity holds by
+  // construction for whatever value `contributed` happens to have, right or
+  // wrong. Confirmed: forcing `contributed` to stay 0n throughout leaves
+  // this assertion green while six other tests in this file (the ones that
+  // pin contributedCents/performanceCents to specific numbers) correctly go
+  // red. What this test actually guards: a future refactor that computes
+  // performanceCents some other way, or from a stale copy of `contributed`,
+  // so the three fields quietly drift out of sync with each other — a real
+  // bug this would still catch, just not the one its old name implied.
+  it("holds performanceCents = equity - contributed by definition (not a correctness check on contributed)", () => {
     for (const p of series.points) {
       expect(p.contributedCents + p.performanceCents).toBe(p.equityCents);
     }
