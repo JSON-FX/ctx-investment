@@ -7249,7 +7249,7 @@ export function ReadingSheet({
       <Sheet title="Post an equity reading" backHref={backHref}>
         <div className="banner-halt" role="status">
           <strong>Not yet.</strong>
-          <p style={{ margin: "6th 0 0" }}>
+          <p style={{ margin: "6px 0 0" }}>
             {gate.kind === "not-configured"
               ? "The broker UTC offset is not set for this account, so nothing has been reconciled. Set it on the account before posting readings by hand."
               : gate.kind === "error"
@@ -7350,8 +7350,6 @@ export function ReadingSheet({
   );
 }
 ```
-
-> **Typo to fix on sight:** `margin: "6th 0 0"` in the gate block is not a CSS length. It should be `"6px 0 0"`. It is left visible here rather than silently corrected because a broken inline style renders without erroring, which is exactly the class of defect that survives a review.
 
 - [ ] **Step 6: Create `app/a/[id]/actions/reading/page.tsx`**
 
