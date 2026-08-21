@@ -23,6 +23,7 @@ import { loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger
 import { ledgerSteps } from "@/lib/compound/present/derive";
 import { holderPosition, holderStatement } from "@/lib/compound/present/holder";
 import { HolderStatement } from "@/lib/compound/ui/holder-statement";
+import { payoutHref } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
 
@@ -60,6 +61,11 @@ export default async function HolderPage({
       rows={holderStatement(ledgerSteps(entries, seeds), holderId)}
       totals={totalsOf(state)}
       currency={account.currency}
+      withdrawAction={
+        <a className="btn btn-primary" href={payoutHref(account.id, holderId)}>
+          Pay out
+        </a>
+      }
     />
   );
 }
