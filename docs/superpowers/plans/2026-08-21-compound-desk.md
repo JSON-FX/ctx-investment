@@ -11579,3 +11579,232 @@ MSG
 )"
 ```
 
+---
+
+### Task 15: Retiring the shell, and verifying what no unit test can
+
+Everything the deployment shell demonstrated is now demonstrated by the desk itself, against real data. This task removes it, checks the things that only a browser can check, and runs the full gate.
+
+**What is genuinely not covered by the tests in this plan**, stated plainly rather than assumed away:
+
+| Not covered | Why | Covered instead by |
+|---|---|---|
+| The pages themselves | async Server Components cannot be rendered by `@testing-library/react`; each page is *resolve, load, render* with no branches | the smoke pass in Step 3 |
+| Server Actions end to end | they redirect and revalidate; testing that needs a running server | the smoke pass, and the writer integration tests |
+| That a loader fetched the right rows | mocking the loader and asserting the mock was called tests the mock | plan 3's integration suite, and Tasks 5/6/9/12/13/14's `.db.test.ts` files |
+| Visual layout at each breakpoint | no automated check is honest about this | Step 4, by hand, at four widths |
+| Focus order and keyboard operation | jsdom has no layout and no real focus model | Step 4, by hand |
+
+- [ ] **Step 1: Delete the shell**
+
+```bash
+git rm lib/compound/demo/fixture-ledger.ts
+rmdir lib/compound/demo 2>/dev/null || true
+```
+
+`app/page.tsx` was already replaced in Task 6. Confirm nothing else imports the demo fixture:
+
+```bash
+grep -rn "compound/demo\|DEMO_LEDGER\|DEMO_HOLDERS\|DEMO_HOLDER_NAMES" --include='*.ts' --include='*.tsx' . | grep -v node_modules
+```
+
+Expected: no output. **Plan 5 does not reference it** — checked against its merged plan, which builds only under `lib/compound/ui/journal|calendar|performance/` and reads through plan 3's readers.
+
+- [ ] **Step 2: Update `app/layout.tsx` for the fonts the design system actually uses**
+
+Unchanged in substance — Instrument Serif, Inter and IBM Plex Mono are already preconnected and loaded. Add the one thing missing: a skip link, so a keyboard reader is not walked through the masthead and six nav entries on every page.
+
+```tsx
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif&family=Inter:wght@400;500;600;700&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body>
+        <a className="skip" href="#main">Skip to content</a>
+        <main id="main">{children}</main>
+      </body>
+    </html>
+  );
+}
+```
+
+with, in `app/globals.css`:
+
+```css
+.skip {
+  position: absolute; left: -9999px; top: 0;
+  background: var(--card); color: var(--ink); padding: 10px 14px;
+  border: 1px solid var(--ink); border-radius: 3px; z-index: 100;
+}
+.skip:focus { left: 8px; top: 8px; }
+```
+
+- [ ] **Step 3: The smoke pass**
+
+Start the stack and walk every route. This is the only check that the pages compose, and there is no substitute for it.
+
+```bash
+supabase db reset
+pnpm build && pnpm start
+```
+
+Sign in as the seeded manager, then, in order:
+
+- [ ] `/` — with no accounts, the empty state offers `Add an account`.
+- [ ] `/accounts/new` — create one against the seeded MT5 account `90000001`, broker offset `3`. The confirm step reports 10 daily snapshots. Landing page is the new desk.
+- [ ] `/` again — one account, so it **redirects** to `/a/1`.
+- [ ] `/a/1` — empty desk, "Nothing posted yet".
+- [ ] Add capital for the manager, then add an investor, then add capital for them. The desk fills in; the rail shows two segments; the value column sums to equity.
+- [ ] **Refresh readings.** The seed has an unexplained `+5000.00` on `2026-08-12`, so this must **halt**: the sub-nav Review badge shows `1`, the frozen banner appears on every account page including `/a/1/ledger`.
+- [ ] `/a/1/review` — the candidate shows `+$5,000.00` moved, `+$0.00` explained, `+$5,000.00` unaccounted for. The suppressed-duplicates panel lists ticket `90019999` as a copy of `90010004`. **Both of these come from the seed and both must appear.**
+- [ ] `/a/1/actions/capital` and `/a/1/actions/payout/...` — both refuse while the candidate is pending.
+- [ ] Classify it as a deposit for the investor. Review goes clear, the badge disappears, the banner goes.
+- [ ] **Refresh readings** again — now advances. The desk's equity matches the seed's last snapshot.
+- [ ] `/a/1/ledger` — the classified deposit is dated `12 Aug 2026`, and the last row's state equals the desk.
+- [ ] `/a/1/holders/2` — the statement's figures match the desk's row for that holder, and the statement/settlement note names two figures.
+- [ ] Pay the investor out, profit only, fee as units. The receipt's `receives` figure matches what the holder statement previewed. Confirm. The ledger gains **two** rows: the settlement reading and the payout, adjacent.
+- [ ] Open the payout sheet again in a second tab, commit in the first, then confirm in the second. **The second must refuse** with "the account moved while this was open", and nothing must be written.
+- [ ] `/a/1/journal`, `/a/1/calendar`, `/a/1/performance` — 404 until plan 5 lands. Expected, and agreed.
+- [ ] `/a/2` — 404 for an account that does not exist.
+
+- [ ] **Step 4: Accessibility and responsive verification**
+
+Spec §8.4, at 375 / 768 / 1024 / 1440. Check each and record what you found — an unrecorded pass is indistinguishable from a skipped check.
+
+- [ ] **No horizontal page scroll at 375.** Every table is inside `.scroller`; the page body is not.
+- [ ] **The statement head's equity figure** stays on one line at 375 (it is `clamp(32px, 6vw, 48px)`).
+- [ ] **The KPI strip** reflows to one column at 375 and does not clip a figure.
+- [ ] **The ownership rail** stays readable at 375 — segments below about 3% are visually thin, and the **legend is what carries the information**, per §8.4. Confirm the legend wraps rather than truncating.
+- [ ] **Keyboard**: tab from the skip link through the masthead, switcher, sub-nav and into the page. The `<details>` switcher opens on Enter and closes on Escape. Every focused element has a visible ring (Task 1's `:focus-visible` rule).
+- [ ] **The payout sheet by keyboard alone**: choose exit, tab to the settlement equity, submit, read the receipt, confirm. No mouse.
+- [ ] **`prefers-reduced-motion`**: enable it at the OS level and confirm nothing animates.
+- [ ] **Greyscale**: view the desk with colour removed. P/L still readable (the sign carries it), the fee column still identifiable (the amber tile has a label), the rail segments still distinguishable (Task 3's adjacent-lightness rule) and labelled.
+- [ ] **Zoom to 200%** at 1440. Nothing overlaps; the tables scroll.
+
+- [ ] **Step 5: The full gate**
+
+```bash
+supabase db reset
+pnpm typecheck && pnpm test && pnpm test:db && pnpm build && pnpm check:secrets
+```
+
+All five must pass. `check:secrets` matters more than usual here: this plan adds fixtures, a seed-driven smoke pass and a screenshot-prone masthead, and the repository is public.
+
+- [ ] **Step 6: Confirm the public-repository rules held**
+
+```bash
+grep -rn "90000001" --include='*.ts' --include='*.tsx' --include='*.sql' . | grep -v node_modules | grep -v supabase/seed.sql
+```
+
+Expected: only `supabase/seed.sql`, which is fictional by construction. No real account number, broker name or holder name in any file this plan touched. Every name in every fixture — J. Marsh, Ada Lovelace, Grace Hopper, Katherine Johnson — is invented.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): retire the deployment shell
+
+Everything it demonstrated — the container runs, the engine computes — is now
+demonstrated by the desk itself, against real data. Adds a skip link, and
+records the accessibility and responsive pass at 375/768/1024/1440.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
+---
+
+## Plan self-review
+
+**Spec coverage.** Every clause of §7 (surfaces), §8 (design system) and §9 (auth) maps to a task, along with the parts of §3, §4 and §5 that reach a screen.
+
+| Spec | Task |
+|---|---|
+| §3.2 cost basis and the high-water mark, on screen | 10, 13 |
+| §3.3 the split, on a receipt | 13 |
+| §3.4 fee settlement — units or cash, both NAV-neutral | 13 |
+| §3.5 invariant 2 (Σ value = equity) rendered exactly | 3, 4, 8 |
+| §3.5 invariant 3 (NAV never falls) asserted at the presentation boundary | 3, 12 |
+| §4 money, units, splits as integers to the screen edge | 2 |
+| §4 NAV rounded to 4dp **at the presentation boundary only** | 2 |
+| §4 rounding policy — allocated for reporting, floored for settlement | 2, 3, 10 (decision D-A) |
+| §5.2 committed versus live NAV | 4, 8, 13 |
+| §5.2 a payout writes its settlement reading in one transaction | 13 |
+| §5.3 the safety interlock, visible on every account surface | 7, 11, 12, 13, 14 |
+| §6.1 the ledger stores inputs, not outputs | 12, 13 |
+| §6.2 `seq` defines replay order | 5, 9, 12, 13 |
+| §6.3 duplicate deals — the suppression is now auditable | 14 |
+| §7 `/` account list, or redirect when there is one | 6 |
+| §7 `/a/[id]` the desk | 8 |
+| §7 `/a/[id]/ledger` | 9 |
+| §7 `/a/[id]/review` | 14 |
+| §7 `/a/[id]/holders/[hid]` | 10 |
+| §7 modal — post an equity reading | 11 |
+| §7 modal — add an investor | 12 |
+| §7 modal — add capital | 12 |
+| §7 modal — pay out | 13 |
+| §7 modal — classify a capital event | 14 |
+| §7 "each shows full arithmetic before commit" | 11 (D-C, D-D), 12, 13, 14 |
+| §8.1 tokens, exact values | 1 |
+| §8.2 three hues, three meanings, none overloaded | 1, 3, 4 |
+| §8.3 Instrument Serif / Inter / IBM Plex Mono, tabular | 1, 15 |
+| §8.4 contrast floor, sign carries P/L, focus rings, reduced motion | 1, 15 |
+| §8.4 verified at 375/768/1024/1440 | 15 |
+| §9 the admin AND ownership gate | 5 (decision D-F) |
+| §9 no `investor` role, no third role | 5 |
+| §9 append-only visible in the product | 9, 12 |
+| §10 no real identifiers in tracked files | 2, 15 |
+| §11 "component tests for the payout receipt and review queue arithmetic" | 13, 14 |
+
+Covered by other plans, not here: the engine (merged), the reconciler (merged), schema/RLS/append-only enforcement and the readers (plan 3), and `/journal`, `/calendar`, `/performance` (plan 5, merged at `700f89a`).
+
+Deferred by the spec itself and deliberately absent: the investor portal (§12), partial capital withdrawal P6 — named on screen in Task 14 rather than silently missing — payout PDFs P7, scheduled payouts P8, time-weighted return R7, manager earnings R8, multi-currency beyond a symbol, and E5's reverse-an-entry control (§11 puts E5 outside v1; Task 9 renders a reversal correctly but offers no button that creates one).
+
+**Type consistency.** Every engine and reconciler type is imported, never redefined: `Cents`, `Units`, `PoolTotals`, `PoolState`, `HolderState`, `HolderSeed`, `LedgerEntry`, `LedgerEntryType`, `Quote`, `PayoutMode`, `DailySnapshot`, `ClosedDeal`, `ReadingPlan`, `PlannedReading`, `CapitalEventCandidate`, `ReconcileCursor`, `DroppedDeal`. Plan 3's `CompoundAccount`, `CapitalEventCandidateRow` and `Queryable` likewise — `CompoundAccount` is *extended* in Task 5 with `brokerOffsetHours`, in plan 3's own file, rather than shadowed by a second shape.
+
+Types this plan introduces are each defined once and used by that name throughout: `RailSegment`, `LedgerStep`, `CapitalMark`, `ProposedEntry`, `Fingerprint`, `Preview`, `PreviewInput`, `DeskRow`, `DeskFigures`, `HolderPosition`, `HolderStatementRow`, `HolderRow`, `LedgerEntryMeta`, `ResolvedAccount`, `SessionUser`, `InterlockState`, `ReconcileOutcome`, `ReadingGate`, `PayoutForm`, `LiveFigures`, `KpiItem`, `NavEntry`, `ClassifyOutcome`, and the five writer input types.
+
+Functions defined in exactly one task and used consistently after it: `formatMoney`, `splitMoney`, `formatUnitsDp`, `formatNav`, `formatSinceInception`, `formatPpm`, `formatSplit`, `formatSplitWords`, `formatDate`, `formatUtcStamp`, `formatLots`, `signOf`, `allocateShares`, `railTint`, `railIsHatched`, `railSegments`, `ledgerSteps`, `capitalMarks`, `fingerprintOf`, `assertNavDidNotFall`, `previewEntry`, `deskFigures`, `holderPosition`, `holderStatement`, `explainCommitError`, `isNextControlFlow`, `fingerprintToFields`, `fingerprintFromFields`, `fingerprintMismatch`, `planFor`, `requireManager`, `requireAccount`, `resolveOwnedAccount`, `listManagerAccounts`, `loadLedger`, `loadSeeds`, `loadHolderNames`, `loadPoolState`, `loadLive`, `loadInterlock`, `listHolders`, `listLedgerMeta`, `getUserRole`, `createAccount`, `addHolder`, `commitDeposit`, `commitPayout`, `classifyCandidate`, `maskMt5`.
+
+**One deliberate near-collision, checked.** `capitalMarks` returns `CapitalMark`, and plan 3's `CapitalEventCandidateRow` and the reconciler's `CapitalEventCandidate` are three different things with similar names. They are: a mark on an equity curve, a database row, and the reconciler's finding. All three appear in Task 14 and are imported under their own names; none is aliased.
+
+**Placeholder scan.** No `TBD`. No "add error handling". No "similar to Task N". Every code step contains the code it describes. The two places that read like gaps are deliberate and are labelled as such:
+
+- Task 5's note that `seedTwoAccounts` and `seedLedger` belong in **plan 3's** harness, with instructions to add them there rather than inline — because three plans' integration tests need the same seeder and three copies would drift.
+- Task 13's at-the-mark component test carries a `throw` in its else branch rather than a skip, so a fixture that drifts off the mark fails loudly instead of quietly testing nothing.
+
+**Every fixture figure in this plan was computed by running the merged engine**, not by hand. The one-cent gap between `$12,630.61` and `$12,630.60`, the 999,998 ppm share total, the `759.2520121904` fee units, the `1,376.53` reading delta and all four payout settlement combinations are transcriptions of that run.
+
+---
+
+## Deviations from the spec, for the record
+
+Fold these back into the spec before executing.
+
+1. **`--ink-3` cannot carry body text (D-L).** §8.1 sets it to `#8A96A6`, which is 3.00:1 on `--card` and 2.49:1 on `--paper`; §8.4 requires body text at ≥ 4.5:1. Both cannot be true. This plan restricts `--ink-3` to rules, decoration and large display text and moves every small label to `--ink-2`. The alternative — changing the token to `#5F6B7C` (5.41:1 / 4.49:1) — is a spec edit and was not taken unilaterally.
+
+2. **A holder's value has two correct answers (D-A).** §4 specifies allocation for reporting and flooring for operations and never addresses their appearing on adjacent screens. They differ by up to a cent. The desk and holder tables show the allocated figure; the payout receipt shows the floored one; the holder statement reconciles them in words.
+
+3. **`broker_offset_hours` is a new column on `compound_account`, nullable, range 1..14.** §6's schema sketch has no such column and `planReadings` requires the value. The range matches `dedupe.ts`'s own `MIN_OFFSET_HOURS`..`MAX_OFFSET_HOURS`, so the database cannot store a value the engine throws on. **Consequence worth deciding on: a broker running on UTC exactly cannot be configured**, because `MIN_OFFSET_HOURS` is 1. Widening it to 0 is a reconciler change.
+
+4. **Spec §9's AND gate is enforced in application code, not by RLS (D-F).** Plan 3's P4 runs every connection as `service_role`, which carries `BYPASSRLS`. The policies are real and protect other clients; they do not run for these pages. §9 should say where the gate that actually binds lives.
+
+5. **Money flows are routes, not overlays (D-B), and are two-step (D-C).** §7 calls them "modal flows". Every figure stays server-rendered, the back button works, and nothing hydrates.
+
+6. **Sign-in and account creation are in scope (D-H, D-I).** Neither appears in §7's route table and without both nothing in this plan is reachable. Account creation writes the manager holder in the same transaction, because `fold` cannot settle a fee without one.
+
+7. **Classification offers three outcomes, and partial withdrawal is named as absent (D-J).** §7 says "classify capital event" without saying into what. A negative unexplained move that is not an already-recorded payout is P6, which §12 defers; the queue says so rather than offering a control that would record it wrongly.
+
+8. **`toleranceCents` is `0n` (D-O).** §6.3 verified a residual of exactly zero on real history and §5.3 does not name a tolerance. Any non-zero value is a capital event small enough to hide permanently.
+
+9. **A payout does not move the reconcile cursor.** §5.2 requires the settlement reading and the payout in one transaction and says nothing about the cursor. Moving it would leave the payout's own day permanently unreconciled.
+
+10. **`compound_holder.status` is written and never read (D-M).** This closes the gap plan 3 carried forward. `fold` decides; the column is kept in step by Task 13's exit writer so the database is not misleading to a direct reader, and Task 13's integration test asserts the two agree — the test plan 3 could not write, because none of its fixtures contained a payout.
