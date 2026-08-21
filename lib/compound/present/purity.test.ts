@@ -85,11 +85,11 @@ describe("present/ purity", () => {
   // iterates nothing and every forbidden-pattern check passes having checked
   // nothing. Pinning the count (not just "> 0") also catches a *partial*
   // miss, where the filter silently drops one file out of several rather
-  // than all of them. The floor is raised as present/ grows: this task adds
+  // than all of them. The floor is raised as present/ grows: Task 2 added
   // format.ts and fixture.ts (2); Task 3 adds rail.ts and derive.ts, taking
   // it to 4.
   it("scans every source file in present/", () => {
-    expect(files.length).toBeGreaterThanOrEqual(2);
+    expect(files.length).toBeGreaterThanOrEqual(4);
   });
 
   it("imports neither React nor the data layer, touches no clock or RNG, and never rounds a float", () => {
