@@ -48,9 +48,10 @@ describe("db purity", () => {
   // Ratchet. If the glob ever stops matching, the loop below iterates nothing
   // and passes having checked nothing. The floor is raised as db/ grows —
   // Task 8 took it to 6; Task 5 adds holders.ts and users.ts, taking it to 8;
-  // Task 6 adds write-account.ts, taking it to 9.
+  // Task 6 adds write-account.ts, taking it to 9; plan 4 Task 9 adds
+  // ledger-meta.ts, taking it to 10.
   it("scans every source file in db/", () => {
-    expect(files.length).toBeGreaterThanOrEqual(9);
+    expect(files.length).toBeGreaterThanOrEqual(10);
   });
 
   // Comments are stripped before matching (see strip-comments.ts): a doc
