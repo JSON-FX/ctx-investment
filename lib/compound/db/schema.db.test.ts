@@ -322,6 +322,136 @@ describe("compound_ledger_entry constraints", () => {
     expect(typeof back).toBe("string");
     expect(BigInt(back)).toBe(9007199254740993n);
   });
+
+  // The four constraints below were dropped one at a time against the
+  // running suite before this file had any test for them, and the suite
+  // stayed fully green each time — a passing suite that would still pass
+  // with the constraint gone. compound_ledger_entry_seq_check is the first;
+  // compound_ledger_entry_holder_id_fkey (next describe down, holder_id) is
+  // the one P8 credits with turning replay.ts's "unknown holderId" throw
+  // into a row refusal — the plan's own accounting for that claim had
+  // nothing testing it until now.
+  it("refuses a seq of zero", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, seq, occurred_on, type, amount_cents)
+           values ($1, 0, '2026-05-02', 'equity_reading', 100)`,
+          [accountId],
+        ),
+        "23514",
+        /compound_ledger_entry_seq_check/,
+      ),
+    );
+  });
+
+  it("refuses a negative seq", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, seq, occurred_on, type, amount_cents)
+           values ($1, -1, '2026-05-02', 'equity_reading', 100)`,
+          [accountId],
+        ),
+        "23514",
+        /compound_ledger_entry_seq_check/,
+      ),
+    );
+  });
+
+  it("refuses a holder_id that belongs to no holder — this is what replay.ts's holderOf() throw becomes at write time", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, holder_id, seq, occurred_on, type, amount_cents)
+           values ($1, 999999999, 1, '2026-05-02', 'deposit', 500000)`,
+          [accountId],
+        ),
+        "23503",
+        /compound_ledger_entry_holder_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses an account_id that does not exist", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, seq, occurred_on, type, amount_cents)
+           values (999999999, 1, '2026-05-02', 'equity_reading', 100)`,
+        ),
+        "23503",
+        /compound_ledger_entry_account_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a created_by that is not a public.users row", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, seq, occurred_on, type, amount_cents, created_by)
+           values ($1, 1, '2026-05-02', 'equity_reading', 100,
+                   'ffffffff-0000-4000-8000-ffffffffffff')`,
+          [accountId],
+        ),
+        "23503",
+        /compound_ledger_entry_created_by_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a reverses_id that does not exist", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, seq, occurred_on, type, amount_cents, reverses_id)
+           values ($1, 1, '2026-05-02', 'equity_reading', 100, 999999999)`,
+          [accountId],
+        ),
+        "23503",
+        /compound_ledger_entry_reverses_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a fee_settlement outside units and cash", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, holder_id, seq, occurred_on, type, amount_cents,
+              fee_settlement, split_bps_applied)
+           values ($1, $2, 1, '2026-05-02', 'payout', 25000, 'crypto', 4000)`,
+          [accountId, holderId],
+        ),
+        "23514",
+        /compound_ledger_entry_fee_settlement_check/,
+      ),
+    );
+  });
+
+  it("refuses a split_bps_applied outside 0..10000", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_ledger_entry
+             (account_id, holder_id, seq, occurred_on, type, amount_cents,
+              fee_settlement, split_bps_applied)
+           values ($1, $2, 1, '2026-05-02', 'payout', 25000, 'units', 10001)`,
+          [accountId, holderId],
+        ),
+        "23514",
+        /compound_ledger_entry_split_bps_applied_check/,
+      ),
+    );
+  });
 });
 
 describe("compound_holder constraints", () => {
@@ -394,6 +524,36 @@ describe("compound_holder constraints", () => {
       ),
     );
   });
+
+  it("refuses an account_id that does not exist", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_holder
+             (account_id, name, is_manager, split_bps, status)
+           values (999999999, 'Orphan Holder', false, 4000, 'active')`,
+        ),
+        "23503",
+        /compound_holder_account_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a user_id that is not a public.users row", async () => {
+    const accountId = await seedAccount();
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_holder
+             (account_id, name, user_id, is_manager, split_bps, status)
+           values ($1, 'Orphan Link', 'ffffffff-0000-4000-8000-ffffffffffff', false, 4000, 'active')`,
+          [accountId],
+        ),
+        "23503",
+        /compound_holder_user_id_fkey/,
+      ),
+    );
+  });
 });
 
 describe("compound_capital_event_candidate constraints", () => {
@@ -435,6 +595,55 @@ describe("compound_capital_event_candidate constraints", () => {
       ),
     );
   });
+
+  it("refuses an account_id that does not exist", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_capital_event_candidate
+             (account_id, trade_date, balance_delta_cents, explained_cents, unexplained_cents)
+           values (999999999, '2026-06-25', 3100000, 0, 3100000)`,
+        ),
+        "23503",
+        /compound_capital_event_candidate_account_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a resolved_by that is not a public.users row", async () => {
+    const accountId = await seedAccount();
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_capital_event_candidate
+             (account_id, trade_date, balance_delta_cents, explained_cents,
+              unexplained_cents, resolved_by)
+           values ($1, '2026-06-25', 3100000, 0, 3100000,
+                   'ffffffff-0000-4000-8000-ffffffffffff')`,
+          [accountId],
+        ),
+        "23503",
+        /compound_capital_event_candidate_resolved_by_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a resolved_ledger_entry_id that does not exist", async () => {
+    const accountId = await seedAccount();
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_capital_event_candidate
+             (account_id, trade_date, balance_delta_cents, explained_cents,
+              unexplained_cents, resolved_ledger_entry_id)
+           values ($1, '2026-06-25', 3100000, 0, 3100000, 999999999)`,
+          [accountId],
+        ),
+        "23503",
+        /compound_capital_event_candidate_resolved_ledger_entry_id_fkey/,
+      ),
+    );
+  });
 });
 
 describe("compound_account constraints", () => {
@@ -466,6 +675,131 @@ describe("compound_account constraints", () => {
         ),
         "23503",
         /compound_account_manager_user_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a default_split_bps outside 0..10000", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_account
+             (mt5_account, label, currency, default_split_bps, inception_date, manager_user_id)
+           values ($1, 'Impossible Default', 'USD', 10001, '2026-05-01', $2)`,
+          [MT5 + 98, MANAGER],
+        ),
+        "23514",
+        /compound_account_default_split_bps_check/,
+      ),
+    );
+  });
+});
+
+// Neither of these two tables had a describe block before this task — Task
+// 2's own review found compound_reconcile_cursor and compound_audit had no
+// test coverage at all, and dropping either one's account_id foreign key
+// left the full suite green. compound_audit's is the sharper gap: P8 rests
+// part of its "replay.ts's throws become row refusals" argument on the
+// account_id foreign key existing, and nothing here tested that it does.
+describe("compound_reconcile_cursor constraints", () => {
+  it("accepts a cursor row for a real account", async () => {
+    const accountId = await seedAccount();
+    const n = await withTestClient(async (c) => {
+      const { rowCount } = await c.query(
+        `insert into public.compound_reconcile_cursor (account_id, last_reading_date, last_run_at)
+         values ($1, '2026-06-01', now())`,
+        [accountId],
+      );
+      return rowCount;
+    });
+    expect(n).toBe(1);
+  });
+
+  it("refuses an account_id that does not exist", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_reconcile_cursor (account_id, last_reading_date)
+           values (999999999, '2026-06-01')`,
+        ),
+        "23503",
+        /compound_reconcile_cursor_account_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses a second cursor row for the same account — account_id is its own primary key", async () => {
+    const accountId = await seedAccount();
+    await withTestClient(async (c) => {
+      await c.query(
+        `insert into public.compound_reconcile_cursor (account_id, last_reading_date)
+         values ($1, '2026-06-01')`,
+        [accountId],
+      );
+      await expectPgError(
+        c.query(
+          `insert into public.compound_reconcile_cursor (account_id, last_reading_date)
+           values ($1, '2026-06-02')`,
+          [accountId],
+        ),
+        "23505",
+        /compound_reconcile_cursor_pkey/,
+      );
+    });
+  });
+});
+
+describe("compound_audit constraints", () => {
+  it("accepts an audit row tied to a real account and a real actor", async () => {
+    const accountId = await seedAccount();
+    const n = await withTestClient(async (c) => {
+      const { rowCount } = await c.query(
+        `insert into public.compound_audit (account_id, actor, action, entity, entity_id)
+         values ($1, $2, 'create', 'compound_account', $1)`,
+        [accountId, MANAGER],
+      );
+      return rowCount;
+    });
+    expect(n).toBe(1);
+  });
+
+  it("accepts a null account_id — an action can precede any account existing", async () => {
+    const n = await withTestClient(async (c) => {
+      await seedUser(c, MANAGER, "schema-manager@example.test");
+      const { rowCount } = await c.query(
+        `insert into public.compound_audit (account_id, actor, action, entity)
+         values (null, $1, 'sign_in', 'auth')`,
+        [MANAGER],
+      );
+      return rowCount;
+    });
+    expect(n).toBe(1);
+  });
+
+  it("refuses an account_id that does not exist — this is the FK P8 credits with covering replay.ts's account-scoped throws", async () => {
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_audit (account_id, action, entity)
+           values (999999999, 'create', 'compound_account')`,
+        ),
+        "23503",
+        /compound_audit_account_id_fkey/,
+      ),
+    );
+  });
+
+  it("refuses an actor that is not a public.users row", async () => {
+    const accountId = await seedAccount();
+    await withTestClient((c) =>
+      expectPgError(
+        c.query(
+          `insert into public.compound_audit (account_id, actor, action, entity)
+           values ($1, 'ffffffff-0000-4000-8000-ffffffffffff', 'create', 'compound_account')`,
+          [accountId],
+        ),
+        "23503",
+        /compound_audit_actor_fkey/,
       ),
     );
   });
