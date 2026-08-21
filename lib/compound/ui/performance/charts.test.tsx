@@ -142,6 +142,20 @@ describe("EquityChart", () => {
     expect(html).toContain("9,500.00");
   });
 
+  // Checks the Equity column itself, not just Performance/Contributed.
+  // Mutation caught: equity-series.ts reading balanceCloseCents where it
+  // means equityCloseCents. Money-formatted, the two columns never collide
+  // for this fixture's numbers, so this is a real, direct check of the
+  // field this chart's whole left-hand line is plotted from — verified
+  // against a real run in the task report, where a mutation on ONLY the
+  // `equityCents:` line (not also `performanceCents:`, which independently
+  // rereads snap.equityCloseCents) left every other assertion in this file
+  // green, because the Performance figures never actually changed.
+  it("carries the true equity figure in the hidden table, independent of performance", () => {
+    expect(html).toContain("9,994.13"); // 2026-05-04 equity
+    expect(html).toContain("10,513.63"); // 2026-05-08 equity
+  });
+
   it("says so when there are no readings", () => {
     const empty = render(
       <EquityChart
@@ -152,12 +166,41 @@ describe("EquityChart", () => {
     expect(empty).not.toContain("NaN");
   });
 
-  // Mutation caught: a flat series dividing by a zero span.
-  it("renders a flat series without NaN", () => {
+  // A flat, non-zero equity paired with zero (no-marks) contributed capital.
+  // The COMBINED domain (equity and contributed together, per "plots both
+  // series on one scale" above) is [0, 500] here — span 500, not zero — so
+  // this does not actually reach verticalScale's span===0n branch. Kept as
+  // its own case anyway (a short, ordinary series must still render clean),
+  // but the zero-span branch itself is what the next test targets.
+  it("renders a flat, non-zero equity series without NaN", () => {
     const flat = render(
       <EquityChart
         series={buildAccountEquitySeries({
           snapshots: [S("2026-05-04", 500n, 500n), S("2026-05-05", 500n, 500n)],
+          marks: [],
+          marksCompleteThrough: "2026-05-05",
+        })}
+      />,
+    ).container.innerHTML;
+    expect(flat).not.toContain("NaN");
+    expect(attr(flat, "points")[0]!.split(" ")).toHaveLength(2);
+  });
+
+  // Mutation caught: a flat series dividing by a zero span. Equity is zero
+  // at both points and there are no marks, so contributed is zero too — the
+  // COMBINED domain is [0, 0], genuinely span-zero, which the case above
+  // does not reach. Verified against a real run: deleting verticalScale's
+  // span===0n branch turns this into an uncaught bigint "Division by zero"
+  // thrown during render (not a silent NaN in the output) — recorded in the
+  // task report, since the plan's own probe list predicted this test would
+  // go red and did not distinguish "throws" from "renders NaN"; the case
+  // above it, which the plan's draft used as its only flat-series test,
+  // turns out not to reach the branch at all.
+  it("renders a flat, all-zero series without a crash", () => {
+    const flat = render(
+      <EquityChart
+        series={buildAccountEquitySeries({
+          snapshots: [S("2026-05-04", 0n, 0n), S("2026-05-05", 0n, 0n)],
           marks: [],
           marksCompleteThrough: "2026-05-05",
         })}
@@ -405,13 +448,26 @@ describe("the two-drawdown, mid-series capital event fixture (task report)", () 
     expect(6775n).toBeGreaterThan(3150n);
   });
 
+  // Reads the figures out of the <desc> specifically, not toContain() over
+  // the whole render. A plain `toContain("96.50")` over the full HTML looks
+  // like it pins the peak, but does not: 9650n (this fixture's true peak) is
+  // also, structurally and unavoidably, one of the curve's own cumCents
+  // values, so its formatted string legitimately recurs in the hidden
+  // table's "Running total" column regardless of whether the <desc>'s OWN
+  // peak figure is right. Verified against a real run in the task report —
+  // under the first-peak-not-running-maximum mutation (Probe C), peakCents
+  // becomes 4000n (so the <desc> actually renders "40.00"), yet a whole-HTML
+  // `toContain("96.50")` still passed, because "+96.50" is deal 9107's
+  // correct running total and was never touched by the mutation.
   it("renders the peak, net and max-drawdown figures on the chart with no NaN", () => {
     const out = render(<PnlCurve result={equity} />).container.innerHTML;
     expect(out).not.toContain("NaN");
-    expect(out).toContain("+79.15"); // net
-    expect(out).toContain("96.50"); // peak
-    expect(out).toContain("67.75"); // max drawdown — NOT 31.50 (dd1)
-    expect(out).not.toContain("31.50");
+    const desc = out.slice(out.indexOf('id="pnl-curve-desc"'), out.indexOf("</desc>"));
+    expect(desc).toContain("+79.15"); // net
+    expect(desc).toContain("96.50"); // peak
+    expect(desc).toContain("67.75"); // max drawdown — NOT 31.50 (dd1) and NOT 11.25
+    expect(desc).not.toContain("31.50");
+    expect(desc).not.toContain("11.25");
   });
 
   // R4 in one number: across the ONE step where equity's entire move is the
