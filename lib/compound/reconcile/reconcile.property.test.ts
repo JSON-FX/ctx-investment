@@ -74,8 +74,12 @@ function build(days: readonly Day[]): { snapshots: DailySnapshot[]; deals: Close
         deals.push({
           ticket, symbol: "GBPUSD", side: "buy", volumeMilliLots: 10,
           openTime: `${date}T07:00:00.000Z`,
-          // 12:00 and 14:00 — two hours apart, never the three-hour broker
-          // offset dedupe looks for, so a split pair cannot be read as a twin.
+          // Both halves keep the same openTime, so the dedupe twin rule can
+          // never match them: it requires |openShift| === offsetMs, offsetMs is
+          // at least one hour, and openShift here is always exactly 0. The
+          // 12:00/14:00 close times do no work against dedupe — they exist to
+          // keep both closes inside the same UTC day, which is the whole point
+          // of exercising netByDay's per-day accumulation.
           closeTime: `${date}T${k === 0 ? "12" : "14"}:00:00.000Z`,
           profitCents, swapCents: 0n, commissionCents: 0n,
         });
