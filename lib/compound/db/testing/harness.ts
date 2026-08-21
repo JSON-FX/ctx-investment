@@ -22,6 +22,8 @@
  *   shipped exactly that bug.
  */
 import { Client, Pool, type PoolClient } from "pg";
+import type { Cents } from "../../engine/money";
+import type { LedgerEntryType } from "../../engine/replay";
 import type { Queryable } from "../types";
 import { testDatabaseUrl } from "./env";
 
@@ -203,6 +205,170 @@ export async function seedUser(
      on conflict (id) do nothing`,
     [id, email, role],
   );
+}
+
+/** One account, its manager's uuid, and the holder ids seedTwoAccounts left on it. */
+export interface SeededAccount {
+  accountId: number;
+  managerUserId: string;
+  holderIds: number[];
+}
+
+/** What seedTwoAccounts hands back — enough to assert against without re-querying. */
+export interface TwoAccountSeed {
+  accountA: SeededAccount;
+  accountB: SeededAccount;
+}
+
+/**
+ * Two compound_account rows under two distinct manager_user_id values, plus
+ * the public.users rows they reference through seedUser.
+ *
+ * The two accounts differ in holder count on purpose — account A gets a
+ * manager and one investor, account B gets a manager alone — so a caller can
+ * tell them apart by shape, not only by id. Two accounts that are identical
+ * except for their primary key is exactly the fixture shape this project's
+ * own lessons-from-the-engine-build table warns about ("one account, one
+ * manager" / a filter that already excludes the other rows): a policy or a
+ * query that quietly leaked rows across accounts would still look correct
+ * against two same-shaped accounts, because there would be nothing to tell
+ * the leaked rows apart from the real ones.
+ *
+ * Fictional mt5 account numbers in the 9_921_0xx range, chosen not to
+ * collide with the fixtures already in schema.db.test.ts (9_900_0xx),
+ * rls.db.test.ts (9900_10x) or append-only.db.test.ts (9_900_4xx) — relevant
+ * only if a caller also seeds its own account in the same test body; every
+ * test file's own beforeEach already truncates all six tables first, so
+ * there is no collision across files or across runs.
+ */
+export async function seedTwoAccounts(c: Queryable): Promise<TwoAccountSeed> {
+  const managerA = "aaaaaaaa-0000-4000-8000-0000000000a1";
+  const managerB = "bbbbbbbb-0000-4000-8000-0000000000b1";
+
+  await seedUser(c, managerA, "seed-two-accounts-a@example.test");
+  await seedUser(c, managerB, "seed-two-accounts-b@example.test");
+
+  const accountARow = await c.query<{ id: string }>(
+    `insert into public.compound_account
+       (mt5_account, label, currency, default_split_bps, inception_date, manager_user_id)
+     values (9921001, 'Seed Account A', 'USD', 4000, '2026-05-01', $1)
+     returning id`,
+    [managerA],
+  );
+  const accountAId = Number(accountARow.rows[0]!.id);
+
+  const accountBRow = await c.query<{ id: string }>(
+    `insert into public.compound_account
+       (mt5_account, label, currency, default_split_bps, inception_date, manager_user_id)
+     values (9921002, 'Seed Account B', 'USD', 3000, '2026-06-15', $1)
+     returning id`,
+    [managerB],
+  );
+  const accountBId = Number(accountBRow.rows[0]!.id);
+
+  // Account A: a manager plus one investor — two holders.
+  const holdersA = await c.query<{ id: string }>(
+    `insert into public.compound_holder
+       (account_id, name, is_manager, split_bps, joined_at, status)
+     values ($1, 'Seed Manager A', true, 4000, '2026-05-01', 'active'),
+            ($1, 'Seed Investor A1', false, 4000, '2026-05-02', 'active')
+     returning id`,
+    [accountAId],
+  );
+
+  // Account B: the manager alone — one holder. The count itself is the
+  // difference a test can see, per the doc comment above.
+  const holdersB = await c.query<{ id: string }>(
+    `insert into public.compound_holder
+       (account_id, name, is_manager, split_bps, joined_at, status)
+     values ($1, 'Seed Manager B', true, 3000, '2026-06-15', 'active')
+     returning id`,
+    [accountBId],
+  );
+
+  return {
+    accountA: {
+      accountId: accountAId,
+      managerUserId: managerA,
+      holderIds: holdersA.rows.map((r) => Number(r.id)),
+    },
+    accountB: {
+      accountId: accountBId,
+      managerUserId: managerB,
+      holderIds: holdersB.rows.map((r) => Number(r.id)),
+    },
+  };
+}
+
+/** One row for seedLedger. Mirrors compound_ledger_entry's own columns, not engine/replay's shape. */
+export interface LedgerSeedEntry {
+  /** Caller-controlled. Not generated here — see seedLedger's doc comment. */
+  seq: number;
+  /** Broker-server date, YYYY-MM-DD. */
+  occurredOn: string;
+  type: LedgerEntryType;
+  amountCents: Cents;
+  holderId?: number | null;
+  feeSettlement?: "units" | "cash" | null;
+  splitBpsApplied?: number | null;
+  reversesId?: number | null;
+  note?: string | null;
+  createdBy?: string | null;
+}
+
+/**
+ * Append ledger entries for an account, in the order given, and return their
+ * ids in that same order.
+ *
+ * seq is caller-controlled on purpose, not generated here: Plan 4 folds
+ * these through engine/replay.ts's fold(), which orders strictly by seq, so
+ * a caller that wants a specific replay order needs to be able to say so
+ * directly rather than trust an auto-increment to agree with it. This
+ * function does not validate contiguity or gaplessness itself — it inserts
+ * exactly what it is given, and compound_ledger_entry_account_seq_key (seq
+ * unique per account) and compound_ledger_entry_seq_check (seq > 0) are the
+ * schema's own word on what a caller can get away with.
+ *
+ * Entries are inserted one at a time, in array order, so an entry can carry
+ * a reversesId pointing at an id this same call already returned earlier in
+ * the array — the ordinary shape of a correction a few rows after the entry
+ * it reverses.
+ *
+ * amountCents is passed through as a string, not a bound bigint: node-pg
+ * does not turn a JS number into a bigint parameter, and `${amountCents}`
+ * on a bigint is exact (no float ever sees the value), the same rule P3
+ * applies to every other money-handling line in this project.
+ */
+export async function seedLedger(
+  c: Queryable,
+  accountId: number,
+  entries: readonly LedgerSeedEntry[],
+): Promise<number[]> {
+  const ids: number[] = [];
+  for (const entry of entries) {
+    const { rows } = await c.query<{ id: string }>(
+      `insert into public.compound_ledger_entry
+         (account_id, holder_id, seq, occurred_on, type, amount_cents,
+          fee_settlement, split_bps_applied, note, reverses_id, created_by)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       returning id`,
+      [
+        accountId,
+        entry.holderId ?? null,
+        entry.seq,
+        entry.occurredOn,
+        entry.type,
+        `${entry.amountCents}`,
+        entry.feeSettlement ?? null,
+        entry.splitBpsApplied ?? null,
+        entry.note ?? null,
+        entry.reversesId ?? null,
+        entry.createdBy ?? null,
+      ],
+    );
+    ids.push(Number(rows[0]!.id));
+  }
+  return ids;
 }
 
 /**
