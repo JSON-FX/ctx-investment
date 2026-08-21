@@ -280,4 +280,47 @@ tfoot td { background: #fbfcfd; border-top: 1px solid var(--ink); border-bottom:
 .actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
 
 .foot { padding: 18px 0; font-size: 11.5px; color: var(--ink-2); line-height: 1.6; }
+
+/* Filter bar and pagination (Task 9, agreement A9 — this plan's family).
+   Plan 4 owns .chip, .btn and .field; these are the layout around them, and
+   no new :root custom property is added (agreement A8) — every var() below
+   already exists above. */
+.filters {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+  padding: 12px 16px; border-bottom: 1px solid var(--rule-soft);
+}
+.filters-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.filters-label {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .14em;
+  color: var(--ink-3); font-weight: 600;
+}
+.filters-search { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.filters-pager {
+  display: flex; align-items: center; gap: 10px; justify-content: flex-end;
+  padding: 10px 16px; border-top: 1px solid var(--rule-soft);
+  font-size: 11.5px; color: var(--ink-2);
+}
+.filters-pager [aria-disabled="true"] { opacity: .4; pointer-events: none; }
+.chip-on { background: var(--ink); color: var(--card); border-color: var(--ink); }
+.sortlink { color: inherit; text-decoration: none; }
+.sortlink:hover { text-decoration: underline; }
+.sortlink:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+@media (max-width: 640px) {
+  .filters-search { margin-left: 0; width: 100%; }
+}
 .ok { color: var(--gain); font-weight: 600; }
+
+/* Task 10 — the journal route. Same .filters family, agreement A9. */
+.filters-notice {
+  margin: 0; padding: 11px 16px; font-size: 12px; line-height: 1.55;
+  color: var(--fee-ink); background: var(--fee-bg);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.filters-footnote {
+  margin: 0; padding: 10px 16px 14px; font-size: 11px; line-height: 1.6;
+  color: var(--ink-3); border-top: 1px solid var(--rule-soft);
+}
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
