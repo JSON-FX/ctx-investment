@@ -324,3 +324,48 @@ tfoot td { background: #fbfcfd; border-top: 1px solid var(--ink); border-bottom:
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+
+/* Task 12 — the performance route. Two new families, agreement A9: .curve
+   for the equity and trading-P/L line charts, .hist for the P/L
+   distribution. No new :root custom property (agreement A8) — every var()
+   below already exists above. The sitewide prefers-reduced-motion block
+   (top of this file) already covers these charts; nothing here draws motion
+   in the first place, so no second block is added. */
+.curve { margin: 12px 0 0; }
+.curve svg { width: 100%; height: 300px; display: block; }
+.curve-empty { color: var(--ink-3); font-size: 12px; margin: 12px 0 0; }
+.curve-zero { stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3; }
+.curve-equity { fill: none; stroke: var(--ink); stroke-width: 1.75; vector-effect: non-scaling-stroke; }
+.curve-contributed {
+  fill: none; stroke: var(--ink-3); stroke-width: 1.5;
+  stroke-dasharray: 5 4; vector-effect: non-scaling-stroke;
+}
+.curve-mark line { stroke: var(--fee); stroke-width: 1; }
+.curve-mark circle { fill: var(--fee); stroke: var(--ink); stroke-width: 1; }
+.curve-legend {
+  display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px;
+  font-size: 11px; color: var(--ink-2);
+}
+.curve-key::before {
+  content: ""; display: inline-block; width: 14px; height: 0;
+  border-top: 2px solid currentColor; margin-right: 7px; vertical-align: middle;
+}
+.curve-key-equity { color: var(--ink); }
+.curve-key-contributed { color: var(--ink-3); }
+.curve-key-mark { color: var(--fee-ink); }
+.curve-key-warn { color: var(--fee-ink); font-weight: 600; }
+.curve-key-warn::before { content: none; }
+
+.hist { margin: 12px 0 0; }
+.hist svg { width: 100%; height: 200px; display: block; }
+.hist-empty { color: var(--ink-3); font-size: 12px; margin: 12px 0 0; }
+.hist-base { stroke: var(--rule); stroke-width: 1; }
+.hist rect { stroke: var(--card); stroke-width: 1; }
+.hist .hist-win { fill: var(--gain); }
+.hist .hist-loss { fill: var(--loss); }
+.hist .hist-zero { fill: var(--ink-3); }
+
+@media (max-width: 640px) {
+  .curve svg { height: 220px; }
+  .hist svg { height: 160px; }
+}
