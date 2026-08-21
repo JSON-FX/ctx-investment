@@ -110,6 +110,7 @@ body {
   text-decoration: none; border-radius: 2px;
 }
 .switcher a:hover, .switcher a[aria-current="true"] { background: var(--paper); }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gain); flex: none; }
 
 .subnav {
   display: flex; gap: 2px; border-bottom: 1px solid var(--rule);
