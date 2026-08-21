@@ -4749,3 +4749,328 @@ MSG
 )"
 ```
 
+---
+
+### Task 7: `app/a/[id]/layout.tsx` — the shell every account surface renders inside
+
+Agreement A1: this layout is plan 4's, and plan 5's three surfaces render inside it. It owns the masthead, the account switcher, the sub-nav and the frozen-figures banner. It deliberately does **not** fold the ledger — two of plan 5's three pages need no ledger at all, and a layout that replays one makes them pay for it on every navigation.
+
+**Files:**
+- Create: `lib/compound/ui/masthead.tsx`
+- Create: `app/a/[id]/layout.tsx`
+- Create: `app/a/[id]/subnav.tsx`
+- Create: `app/a/[id]/not-found.tsx`
+- Test: `lib/compound/ui/masthead.test.tsx`
+
+**Interfaces:**
+- Consumes: `requireAccount`, `listManagerAccounts` from `@/lib/compound/load/account`; `loadInterlock` from `@/lib/compound/load/interlock`; `SUBNAV`, `activeNavKey` from `@/lib/compound/ui/routes`
+- Produces:
+  - `Masthead` component
+  - `AccountSwitcher` component
+  - `SubNav` client component
+  - the `/a/[id]` layout
+
+- [ ] **Step 1: Create `lib/compound/ui/masthead.tsx`**
+
+```tsx
+/**
+ * The masthead and the account switcher.
+ *
+ * The switcher is a <details> element. No client component, no state, no
+ * hydration — it opens and closes because that is what <details> does, and it
+ * is keyboard-operable and screen-reader-announced without any work.
+ *
+ * The MT5 number is masked here for the same reason it is masked in the account
+ * list: this is the strip that appears in every screenshot of the product.
+ */
+import type { ResolvedAccount } from "@/lib/compound/load/account";
+import { maskMt5 } from "./account-list";
+
+export function AccountSwitcher({
+  current, accounts,
+}: { current: ResolvedAccount; accounts: ResolvedAccount[] }) {
+  const others = accounts.filter((a) => a.id !== current.id);
+  const summary = (
+    <>
+      <span className="dot" aria-hidden="true" />
+      {current.label}
+      <span className="muted"> · {maskMt5(current.mt5Account)}</span>
+      {current.currency === "USD" ? null : <span className="muted"> · {current.currency}</span>}
+    </>
+  );
+
+  if (others.length === 0 && accounts.length <= 1) {
+    return <p className="switcher" style={{ margin: 0 }}><span>{summary}</span></p>;
+  }
+
+  return (
+    <details className="switcher">
+      <summary aria-label={`Account: ${current.label}. Switch account.`}>
+        {summary}
+        <span aria-hidden="true">▾</span>
+      </summary>
+      <div>
+        {accounts.map((a) => (
+          <a key={a.id} href={`/a/${a.id}`} aria-current={a.id === current.id ? "true" : undefined}>
+            {a.label}
+            <span className="muted"> · {maskMt5(a.mt5Account)}</span>
+          </a>
+        ))}
+        <a href="/accounts/new">+ Add an account</a>
+      </div>
+    </details>
+  );
+}
+
+export function Masthead({
+  current, accounts,
+}: { current: ResolvedAccount; accounts: ResolvedAccount[] }) {
+  return (
+    <header className="mast">
+      <div>
+        <a href="/" style={{ color: "inherit", textDecoration: "none" }}>
+          <span className="mark">Compound</span>
+        </a>
+        <span className="sub">Investor Desk</span>
+      </div>
+      <AccountSwitcher current={current} accounts={accounts} />
+    </header>
+  );
+}
+```
+
+Add the `.dot` rule back to `app/globals.css`, which Task 1's rewrite dropped along with the shell that used it:
+
+```css
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gain); flex: none; }
+```
+
+- [ ] **Step 2: Create `app/a/[id]/subnav.tsx`**
+
+The only client component in this plan. It reads the pathname and nothing else, and it takes two numbers — never a `bigint`, never a money value.
+
+```tsx
+"use client";
+
+/**
+ * The sub-nav. A client component because a layout is not told which child
+ * route rendered, and usePathname is the only way to know which tab is
+ * current.
+ *
+ * It takes two numbers. Nothing money-shaped crosses this boundary — see the
+ * global constraint on bigint. The logic worth testing lives in
+ * activeNavKey(), which is pure and tested in lib/compound/ui/routes.test.ts;
+ * what remains here is a map over a constant.
+ */
+import { usePathname } from "next/navigation";
+import { SUBNAV, activeNavKey } from "@/lib/compound/ui/routes";
+
+export function SubNav({
+  accountId, pendingCount,
+}: { accountId: number; pendingCount: number }) {
+  const active = activeNavKey(usePathname() ?? "", accountId);
+  return (
+    <nav className="subnav" aria-label="Account sections">
+      {SUBNAV.map((n) => (
+        <a
+          key={n.key}
+          href={n.href(accountId)}
+          aria-current={n.key === active ? "page" : undefined}
+        >
+          {n.label}
+          {n.badge === "pending" && pendingCount > 0 ? (
+            <span className="chip is-fee" aria-label={`${pendingCount} awaiting review`}>
+              {pendingCount}
+            </span>
+          ) : null}
+        </a>
+      ))}
+    </nav>
+  );
+}
+```
+
+- [ ] **Step 3: Create `app/a/[id]/layout.tsx`**
+
+```tsx
+/**
+ * The account shell. Agreement A1 with plan 5: this layout owns the masthead,
+ * the switcher, the sub-nav and the frozen-figures banner; plan 5's /journal,
+ * /calendar and /performance render inside it as page content only.
+ *
+ * It loads three things and no more: the account, the manager's other accounts
+ * for the switcher, and the interlock state for the badge and the banner. It
+ * does NOT load or fold the ledger. Two of plan 5's three surfaces need no
+ * ledger, and a layout that replays one taxes every navigation for a figure
+ * most pages will not render.
+ *
+ * The banner is here rather than on each page for a reason worth stating: when
+ * the reconciler has stopped, EVERY figure on the account is as of the frozen
+ * date. A banner that appeared on the desk and not on /performance would be
+ * telling the truth in one place and implying its opposite in another.
+ */
+import type { ReactNode } from "react";
+import { listManagerAccounts, requireAccount } from "@/lib/compound/load/account";
+import { loadInterlock } from "@/lib/compound/load/interlock";
+import { InterlockBanner } from "@/lib/compound/ui/banner";
+import { Masthead } from "@/lib/compound/ui/masthead";
+import { reviewHref } from "@/lib/compound/ui/routes";
+import { SubNav } from "./subnav";
+
+export const dynamic = "force-dynamic";
+
+export default async function AccountLayout({
+  children, params,
+}: { children: ReactNode; params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const account = await requireAccount(id);
+  const [accounts, interlock] = await Promise.all([
+    listManagerAccounts(),
+    loadInterlock(account.id),
+  ]);
+
+  return (
+    <div className="wrap">
+      <Masthead current={account} accounts={accounts} />
+      <SubNav accountId={account.id} pendingCount={interlock.pendingCount} />
+      {interlock.pendingCandidateDate === null ? null : (
+        <InterlockBanner
+          frozenAt={interlock.frozenAt}
+          candidateDate={interlock.pendingCandidateDate}
+          reviewHref={reviewHref(account.id)}
+        />
+      )}
+      {children}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Create `app/a/[id]/not-found.tsx`**
+
+```tsx
+/**
+ * What requireAccount's notFound() renders. It says the same thing for an
+ * account that does not exist and for one belonging to another manager,
+ * deliberately: a distinct message for the second confirms the account exists,
+ * which is the thing the gate is refusing to confirm.
+ */
+export default function AccountNotFound() {
+  return (
+    <div className="wrap">
+      <header className="mast">
+        <div>
+          <a href="/" style={{ color: "inherit", textDecoration: "none" }}>
+            <span className="mark">Compound</span>
+          </a>
+          <span className="sub">Investor Desk</span>
+        </div>
+      </header>
+      <section className="panel">
+        <p style={{ fontFamily: "var(--serif)", fontSize: 20, margin: "0 0 6px" }}>
+          No such account
+        </p>
+        <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+          That account does not exist, or it is not one of yours.{" "}
+          <a href="/">Back to your accounts</a>.
+        </p>
+      </section>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 5: Write `lib/compound/ui/masthead.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { ResolvedAccount } from "@/lib/compound/load/account";
+import { AccountSwitcher, Masthead } from "./masthead";
+
+const A: ResolvedAccount = {
+  id: 7, mt5Account: 90_000_001, label: "Pooled — live", broker: "Fictional Markets",
+  currency: "USD", defaultSplitBps: 4000, inceptionDate: "2026-03-02",
+  managerUserId: "u1", brokerOffsetHours: 3,
+};
+const B: ResolvedAccount = { ...A, id: 8, mt5Account: 90_000_002, label: "Pooled — second", currency: "EUR" };
+
+describe("AccountSwitcher — one account", () => {
+  it("shows the account without offering a menu there is nothing in", () => {
+    render(<AccountSwitcher current={A} accounts={[A]} />);
+    expect(screen.getByText("Pooled — live")).toBeInTheDocument();
+    expect(screen.queryByRole("group")).toBeNull();          // <details> has role group
+  });
+});
+
+describe("AccountSwitcher — several accounts", () => {
+  beforeEach(() => render(<AccountSwitcher current={A} accounts={[A, B]} />));
+
+  it("names the current account in the control's accessible name", () => {
+    expect(screen.getByLabelText("Account: Pooled — live. Switch account."))
+      .toBeInTheDocument();
+  });
+
+  it("lists every account, current one included, and marks the current one", () => {
+    const menu = screen.getByRole("group");
+    expect(within(menu).getByRole("link", { name: /Pooled — live/ }))
+      .toHaveAttribute("aria-current", "true");
+    expect(within(menu).getByRole("link", { name: /Pooled — second/ }))
+      .not.toHaveAttribute("aria-current");
+  });
+
+  it("links each entry to its desk", () => {
+    expect(screen.getByRole("link", { name: /Pooled — second/ }))
+      .toHaveAttribute("href", "/a/8");
+  });
+
+  it("offers a way to add another", () => {
+    expect(screen.getByRole("link", { name: "+ Add an account" }))
+      .toHaveAttribute("href", "/accounts/new");
+  });
+
+  it("masks the MT5 number in the strip that appears in every screenshot", () => {
+    expect(screen.queryByText(/90000001/)).toBeNull();
+    expect(screen.getAllByText(/••••0001/).length).toBeGreaterThan(0);
+  });
+
+  it("names a non-default currency in the summary", () => {
+    render(<AccountSwitcher current={B} accounts={[A, B]} />);
+    expect(screen.getByLabelText(/Account: Pooled — second/).textContent).toContain("EUR");
+  });
+});
+
+describe("Masthead", () => {
+  it("puts the brand mark in the display face and links it home", () => {
+    const { container } = render(<Masthead current={A} accounts={[A]} />);
+    expect(screen.getByText("Compound").closest("a")).toHaveAttribute("href", "/");
+    expect(container.querySelector(".mark")?.textContent).toBe("Compound");
+  });
+});
+```
+
+- [ ] **Step 6: Run the gates and prove two probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm build
+```
+
+Then, reverting each:
+
+1. In the layout, render `<InterlockBanner>` unconditionally. Nothing in the unit suite goes red — which is the point of naming it here. Confirm it manually instead: with no pending candidate, the desk must carry no banner. Task 15's smoke pass covers it, and this step is the note that it is not covered before then.
+2. In `subnav.tsx`, replace `activeNavKey(...)` with `pathname.includes(n.key)`. `routes.test.ts` still passes, because the pure function is unchanged — but `/a/7/review/12` now marks both Review and, on an account whose label contains "desk", nothing at all. This is the argument for keeping the branching in the pure module: the probe that cannot go red is the code that should not have branches.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the account shell — masthead, switcher, sub-nav, interlock banner
+
+The layout every account surface renders inside, including plan 5's three.
+Loads the account, the switcher list and the interlock state, and deliberately
+does not fold the ledger: two of plan 5's surfaces do not need one.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
