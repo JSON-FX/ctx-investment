@@ -30,6 +30,8 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.112.3",
     "next": "16.1.1",
     "pg": "^8.23.0",
     "react": "19.2.3",
