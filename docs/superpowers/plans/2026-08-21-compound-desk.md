@@ -1,0 +1,4094 @@
+# Compound Investor Desk Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Replace the deployment shell at `app/page.tsx` with the real desk — five read surfaces and five money flows, each of which shows the complete arithmetic before it commits anything, rendered from `PoolState` and `quote()` so that no figure on any screen is computed twice.
+
+**Architecture:** Four layers, each testable without the one above it. `lib/compound/present/` is pure derivation and formatting — it turns `PoolState`, `Quote` and `LedgerEntry[]` into the exact strings and shapes a screen needs, and imports neither React nor `db/`. `lib/compound/ui/` is the statement kit — presentational React components that take engine types and render figures, importing no data layer. `lib/compound/load/` is the request-scoped server loader — session, account resolution and cached reads over plan 3's `db/`. `app/` is routes only: every page resolves an account, calls a loader, and hands the result to the kit. Money flows are two-step server-rendered sheets — enter the amount, read the receipt, confirm — and every receipt is produced by folding the proposed ledger entry, so the preview *is* what the commit will write.
+
+**Tech Stack:** Next.js 16 (App Router, React 19 Server Components, Server Actions), TypeScript 5 strict, Jest 29 + ts-jest with a jsdom project, `@testing-library/react`, `pg` via plan 3's `lib/compound/db/`, Supabase Auth via `@supabase/ssr`, pnpm 10, Node 23.
+
+**Spec:** [`docs/superpowers/specs/2026-08-21-compound-investor-desk-design.md`](../specs/2026-08-21-compound-investor-desk-design.md)
+
+---
+
+## Scope note — read before starting
+
+**This is one plan and it is too big for one sitting. It is written in two phases with a hard checkpoint, and it is designed to be split.**
+
+| Phase | Tasks | Ends at |
+|---|---|---|
+| **A — the shell and the read-only desk** | 1–10 | Every read surface in spec §7 renders real figures from the real database. Nothing writes. |
+| **B — the money flows** | 11–15 | Five sheets that each show complete arithmetic before commit, and the writers behind them. |
+
+**If the executor wants two plans, split after Task 10.** Phase A is independently mergeable and independently valuable — it is a working, correct, read-only desk, which is already more than the shell it replaces. Phase B cannot start before it, because every sheet renders the same kit and the same presentation layer.
+
+Do not split anywhere else. Tasks 1–4 build one test harness and one vocabulary that everything after them uses; Tasks 11–15 share one action seam.
+
+## Prerequisites — this plan cannot start until these are merged
+
+- [ ] **`feat/accounting-engine`** — `lib/compound/engine/`. Already merged. Every figure on every screen comes from `fold`, `quote`, `allocateValues` or `navTimes1e4`.
+- [ ] **`feat/reconciler`** — `lib/compound/reconcile/`. Already merged. Task 14 renders `planReadings`'s `halt` variant; Task 11's refresh action drives it.
+- [ ] **Plan 3, `feat/persistence`, in full** — Tasks 2, 4, 5, 6, 7 and 8. This plan calls `getAccountById`, `listAccountsForManager`, `getHolderSeeds`, `getLedgerEntries`, `getReconcileCursor`, `listCandidates`, `getDailySnapshots`, `getClosedDeals`, `getLiveSnapshot`, `commitReadingPlan`, `withDb` and `withDbTransaction`, and it adds new `plpgsql` writers alongside `compound_commit_reading_plan`. **Phase A needs Tasks 5–7. Phase B needs Task 8's file as the pattern for its own writers.**
+
+Plan 5 (`docs/superpowers/plans/2026-08-21-compound-journal.md`) builds `/a/[id]/journal`, `/a/[id]/calendar` and `/a/[id]/performance` inside the layout this plan defines. It is **not** a prerequisite — Task 8's sub-nav links to those three routes, and until plan 5 lands they 404. That is the agreed sequencing, not an oversight.
+
+## Where this plan stops
+
+It does not build the investor portal (spec §12, deferred to v2), partial capital withdrawal (P6), payout PDFs (P7), scheduled payouts (P8), or multi-currency. It adds no `investor` role — spec §9 forbids one. It reads `orders` and `positions` from nowhere: plan 5 owns those tables, their fixtures and their readers, by agreement.
+
+---
+
+## Agreements with plan 5 — settled, do not renegotiate
+
+These were exchanged directly with plan 5's author and both plans are written against them.
+
+| # | Agreement |
+|---|---|
+| A1 | **`app/a/[id]/layout.tsx` is this plan's.** It owns the masthead, the account switcher, the sub-nav, `params.id` → account resolution and `notFound()`. Plan 5's pages render only their own `<section>` content. |
+| A2 | **Sub-nav, six entries, this order: Desk · Journal · Calendar · Performance · Ledger · Review.** There is no `Holders` entry — spec §7 has no holder index route, and the desk's holder table is the index. |
+| A3 | **Each page loads its own data.** No `PoolState` context provider. Sharing is `React.cache()` on the loaders, nothing more. |
+| A4 | **`requireAccount(idParam)` in `lib/compound/load/account.ts`** is the single account resolver both plans call. |
+| A5 | **`brokerOffsetHours` is a nullable column on `compound_account`**, added by this plan's Task 5. Null means "not configured". |
+| A6 | **`capitalMarks(entries)` and `loadInterlock(accountId)` are this plan's**, consumed by plan 5's `/performance`. |
+| A7 | **`InterlockBanner` and the live/committed labelling are this plan's components.** Plan 5 imports them rather than re-phrasing the same state. |
+| A8 | **No new `:root` custom properties, by either plan.** The green ownership ramp is a pure function, not tokens. |
+| A9 | **Class names this plan claims** in `app/globals.css`: `.kpi`, `.kpi-item`, `.receipt`, `.receipt-line`, `.receipt-total`, `.sheet`, `.sheet-scrim`, `.queue`, `.queue-item`, `.chip`, `.btn`, `.btn-primary`, `.btn-danger`, `.hairline`, `.switcher`, `.subnav`, `.banner-halt`, `.field`, `.field-error`, `.split-note`. Plan 5 claims `.cal`, `.curve`, `.hist`, `.filters`. |
+| A10 | **Orders and positions are plan 5's**, including their fixture tables and their readers. This plan adds neither. |
+
+---
+
+## Decisions this plan makes that the spec did not settle
+
+Each is a visible choice. Fold them back into the spec after this plan merges.
+
+| # | Decision | Why |
+|---|---|---|
+| **D-A** | **A holder's value has two legitimate answers and both appear in the product.** The desk and holder tables show `allocateValues` — largest-remainder, so the column sums to equity **exactly** (invariant 2). The payout receipt shows `quote().valueCents` — floored, because that is what actually settles. On this plan's fixture the same holder reads **$12,630.61** on the table and **$12,630.60** on the receipt. Neither is wrong. The holder statement page reconciles the two in words. | Spec §4 says valuation is allocated and operations are floored, and never says what happens when both appear on adjacent screens. Unifying them would be a real bug in either direction: using `allocateValues` in a payout lets a holder extract a cent the pool does not have; using `valueOfUnits` on the table makes the column sum two cents short of equity. |
+| **D-B** | **Money flows are routes, not intercepted overlays.** Each sheet is a plain route under `/a/[id]/actions/…` styled as a modal card over a scrim. No parallel routes, no `(.)` interception, no client-side dialog state. | Every figure stays server-rendered, the back button works, a half-completed flow is a URL you can reopen, and there is nothing to hydrate. Intercepting routes buy a visual nicety and cost a class of hydration bug in a product whose whole claim is that its numbers are right. |
+| **D-C** | **Every sheet is two steps: enter, then read the receipt, then confirm.** Step 2 is server-rendered from the engine. There is no live-updating preview. | "Shows complete arithmetic before it commits" becomes structural rather than a thing someone remembers to do. It also keeps every bigint on the server. |
+| **D-D** | **A receipt is produced by folding the proposed entry.** `previewEntry()` returns `fold(existing ++ [proposed])`. The receipt renders `before` and `after` from that. | The preview and the commit cannot disagree, because the preview is the commit's reducer run on the same input. A hand-written "what will happen" calculation is a second truth. |
+| **D-E** | **The ledger page derives each row by folding the prefix**, not by an incremental running total. | Same reason. `fold(entries.slice(0, i+1))` is O(n²) at a few thousand rows, which the spec's own scale note makes irrelevant, and it is the only way the ledger page cannot drift from the desk. |
+| **D-F** | **`requireManager()` enforces spec §9's AND gate in application code.** Plan 3's P4 connects as `service_role`, which carries `BYPASSRLS`. RLS is therefore defence-in-depth for other clients and **not** what protects these pages. | Shipping pages that rely on a policy the connection bypasses would be the twelfth unfalsifiable safety net in this project. The gate is: signed in, `app_metadata.role = 'admin'`, **and** `account.managerUserId === user.id`. |
+| **D-G** | **`broker_offset_hours` is nullable and reconciliation refuses when it is null.** | `dedupeDeals` at offset 0 is a no-op. Reconciling undeduped inflates `explained` and can hide a real capital event — plan 3's own words. A visible refusal beats a silently wrong answer. |
+| **D-H** | **A sign-in page is in scope.** Minimal: email and password against Supabase Auth, no sign-up, no reset. | Without it every route redirects to a 404 and nothing in this plan is executable end to end. |
+| **D-I** | **Account creation is in scope and creates the manager holder in the same transaction.** | `fold` throws `"a fee crystallised but no manager holder was seeded"` if there is none, and plan 3's P8 adds a one-manager-per-account unique index. An account without its manager holder is a broken account. |
+| **D-J** | **Classification offers three outcomes: Deposit, Match an existing entry, and Not a capital event.** Partial withdrawals are out of scope (spec §12, P6) and the queue says so. | `compound_capital_event_candidate.resolved_ledger_entry_id` exists precisely so a candidate can be tied to a payout that was already recorded before the broker withdrawal showed up. |
+| **D-K** | **Unit counts are displayed truncated, at 4dp.** This answers the question the engine's carried-forward note left open. | `formatUnits` truncates. Rounding a unit count up would print a holding larger than the holder owns, which contradicts the engine's floor bias on every operation that moves value. 4dp because 2dp hides differences that matter on a small pool and 10dp is unreadable. |
+
+---
+
+## Global Constraints
+
+Values below are copied from the spec, not paraphrased.
+
+- **Tokens are exactly spec §8's list, and no page adds a custom property.** (§8.1)
+  ```css
+  --paper: #E7EAEF;  --card: #FFFFFF;
+  --ink: #0F1B2D;    --ink-2: #4A5768;   --ink-3: #8A96A6;
+  --rule: #D2D8E0;   --rule-soft: #E6EAEF;
+  --gain: #0B6B45;   --loss: #A32A2B;
+  --own: #14532D;    --own-2: #D6E9DE;
+  --fee: #F59E0B;    --fee-ink: #B45309;  --fee-bg: #FEF6E4;
+  ```
+- **Three meanings, three hues, none overloaded.** Green ramp means *the pool, divided* — ownership rail and share bars only. Gain/loss green and red mean *P/L direction*. Amber means *the fee*, and nothing else. (§8.2)
+- **`--fee` (`#F59E0B`) is structural only — fills, chips, marks. It is 2.15:1 on white and may never carry text.** Fee text uses `--fee-ink` (`#B45309`, 5.02:1). (§8.1, §8.2)
+- **The ownership rail uses `--own` (9.11:1), not `--gain`.** Reusing the gain green would make green mean both "profitable" and "yours" on the same screen. Additional holders take progressively lighter tints of the same green. (§8.2)
+- **Type:** Instrument Serif for the brand mark and sheet headings; Inter for labels, body and controls; **IBM Plex Mono with `font-variant-numeric: tabular-nums` for every figure in the product.** Columns of money must not shift width between renders. (§8.3)
+- **Accessibility floor:** body and figure text ≥ 4.5:1, large display ≥ 3:1; colour is never the sole carrier of meaning — the rail is labelled and P/L carries a sign; visible focus rings; `prefers-reduced-motion` respected; verified at 375 / 768 / 1024 / 1440. (§8.4)
+- **Money:** integer minor units (cents) as `bigint`. **Units:** `bigint` scaled 1e-10. **Splits:** basis points, integer; 40% is `4000`. **NAV:** never stored, computed from an `(equityCents, units)` pair, rounded to 4dp **at the presentation boundary only**. (§4)
+- **No floating point in any money or unit calculation, anywhere, including presentation.** `number` is permitted for basis points, array indices, percentages already reduced to integers, and CSS lengths.
+- **No `bigint` crosses the server/client boundary.** Server Components own every engine type. If a Client Component ever needs a money value it receives the integer cents as a **decimal string** and reconstructs with `BigInt()` — never a preformatted display string as its source of truth, because sorting and summing a formatted string is where this goes wrong.
+- **`lib/compound/present/` imports no React, no `next`, and no `db/`.** Enforced by a test in Task 2.
+- **`lib/compound/ui/` imports no `db/`, no `pg`, and no `next/headers`.** It renders what it is handed. Enforced by a test in Task 4.
+- **Every ledger read orders by `seq`.** `seq`, not `occurred_on`, defines replay order. (§6.2)
+- **Committed versus live.** The desk displays live equity from `account_snapshots_current`, and every live figure is labelled `Live · not yet posted` with its `pushed_at`. **A payout never settles against a drifting intraday figure** — it writes an equity reading capturing the exact equity used, then the payout entry, in one transaction. (§5.2)
+- **The interlock is visible.** When a pending candidate exists, every account surface carries the frozen-figures banner. NAV never crosses an unclassified capital event. (§5.3)
+- **Ledger entry types:** exactly `('deposit','payout','exit','equity_reading','adjustment')`. No `fee` type, no `payout_mode`. (§6, §6.1)
+- **`compound_ledger_entry` is INSERT and SELECT only.** No screen offers an edit or a delete. A correction is a reversing entry. (§9, §3.5)
+- **Single-tenant (D1), multi-account (D5).** The manager is an `admin`. No route may assume there is one account.
+- **The repository is public (§10).** No project ref, no real account number, no broker name, no real holder name, no key, in any tracked file. Every fixture uses fictional values.
+- **TypeScript** `strict: true`, `target: "ES2022"`, `noUncheckedIndexedAccess: true`.
+- **Gates:** `pnpm typecheck`, `pnpm test`, `pnpm test:db`, `pnpm build`. Do **not** add ESLint; `eslint-config-next` is broken against ESLint 9 in the sibling project.
+
+---
+
+## Lessons carried in — UI testing has its own unfalsifiable assertions
+
+The engine build shipped **nine assertions that could not fail**; plan 3 catalogued the database versions of the same disease. This is the UI catalogue. Every row is a shape to refuse, not a shape to be careful with.
+
+| Shape | What it looks like here | Why it hides |
+|---|---|---|
+| **Snapshot test** | `expect(container).toMatchSnapshot()` | Proves the output did not change. A receipt that has shown the wrong fee since the day it was written passes forever, and the diff that would have caught it gets committed as "updated snapshot". **No snapshot tests in this plan.** |
+| **Renders without throwing** | `expect(() => render(<Desk …/>)).not.toThrow()` | Says nothing about what it rendered. A component that returns `<div/>` passes. |
+| **Mock asserted against itself** | `jest.mock("@/lib/compound/db/compound"); expect(getLedgerEntries).toHaveBeenCalledWith(7)` | Tests the mock. **No test in this plan mocks the data layer.** Components take engine types directly; loaders are covered by plan 3's integration suite. |
+| **Text presence without value** | `expect(screen.getByText(/fee/i)).toBeInTheDocument()` | The label is hard-coded in the component. It is there whatever the number says. **Assert the figure, by its label.** |
+| **Round fixture** | Equity $1,000 across 500 units, NAV exactly $2.00 | `$2.00` divides `UNIT_SCALE` evenly for *every* whole-cent input, so floor equals ceil and allocated equals floored. Correct and incorrect implementations agree. **This plan's fixture is $55,743.91 across 40,222.4547963043 units — NAV 1.3858… — where they disagree by a cent.** |
+| **Regex that matches anything** | `expect(html).toMatch(/\d/)` | Every rendered page contains a digit. |
+| **Asserting on markup instead of on meaning** | `expect(html).toContain('<td class="num">')` | Passes when the number inside is wrong and fails when the class name is refactored. Exactly backwards. |
+
+Three rules, applied in every task below.
+
+1. **Prove the test bites.** Every task ends with a step that changes one operator, one rounding direction, or one token, and confirms the right test — and ideally only that test — goes red. Where a probe cannot make a test go red, the step says so out loud rather than pretending.
+2. **Assert figures, by their label.** `within(row("Ada Lovelace")).getByLabelText("Value now")` reading `"$12,630.61"`. Not the presence of a heading, not a count of rows.
+3. **Pick awkward numbers.** Every fixture in this plan was computed by running the real engine, and the values are transcribed from that run. Where a figure looks strange — a one-cent gap, a 999,998 ppm share total — that is the point of the fixture.
+
+---
+
+## The canonical fixture
+
+Defined once in Task 2, imported by every test in Tasks 2 through 15. **Computed by running `fold` and `quote` against the merged engine; the figures below are transcribed from that run, not calculated by hand.**
+
+Three holders, awkward denominators throughout:
+
+| seq | date | type | holder | amount | equity after | units after | NAV after |
+|---|---|---|---|---|---|---|---|
+| 1 | 2026-03-02 | deposit | Manager | $25,000.00 | $25,000.00 | 25,000.0000 | 1.0000 |
+| 2 | 2026-04-30 | equity_reading | — | $27,431.19 | $27,431.19 | 25,000.0000 | 1.0972 |
+| 3 | 2026-05-04 | deposit | Ada | $10,000.00 | $37,431.19 | 34,113.7132 | 1.0972 |
+| 4 | 2026-06-30 | equity_reading | — | $41,883.07 | $41,883.07 | 34,113.7132 | 1.2277 |
+| 5 | 2026-07-06 | deposit | Grace | $7,500.00 | $49,383.07 | 40,222.4547 | 1.2277 |
+| 6 | 2026-08-14 | equity_reading | — | $55,743.91 | $55,743.91 | 40,222.4547 | 1.3858 |
+
+Terms: Manager `splitBps 0` `isManager true`; Ada `splitBps 4000`; **Grace `splitBps 3700`** — a non-default split, so a component that hard-codes 40% fails.
+
+Final state:
+
+| Holder | Units | Capital in | Value (allocated) | Value (floored) | Share | P/L | Fee on full exit |
+|---|---|---|---|---|---|---|---|
+| Manager | 25,000.0000 | $25,000.00 | $34,647.26 | $34,647.25 | 62.1543% | +$9,647.26 | $0.00 |
+| Ada | 9,113.7132 | $10,000.00 | **$12,630.61** | **$12,630.60** | 22.6583% | +$2,630.61 | $1,052.24 |
+| Grace | 6,108.7415 | $7,500.00 | $8,466.04 | $8,466.04 | 15.1874% | +$966.04 | $357.43 |
+| **Σ** | 40,222.4547 | | **$55,743.91** = equity | $55,743.89 | 999,998 ppm | | $1,409.67 |
+
+Three properties of this fixture that a round one does not have, and that this plan tests directly:
+
+- **Allocated and floored differ by a cent** for two of three holders, and the floored column is **two cents short of equity**. That is why `allocateValues` exists and why D-A is a decision rather than an accident.
+- **Floored shares sum to 999,998 ppm, not 1,000,000.** A rail built from floored percentages does not fill its container. Task 3's `allocateShares` fixes it by largest remainder and Task 4's rail test asserts the segments sum to exactly 100%.
+- **NAV is 1.3858…, non-terminating.** Floor and ceil disagree on every issuance and redemption in it.
+
+---
+
+# Phase A — the shell and the read-only desk
+
+### Task 1: A component-test harness, and tokens that are checked rather than trusted
+
+Two things nothing else can proceed without: a Jest project that can render React, and a stylesheet whose accessibility claims are assertions rather than comments.
+
+Spec §8 states four contrast ratios as facts. This task turns them into tests. Running them found a defect the spec did not: **`--ink-3` (`#8A96A6`) is 3.00:1 on `--card` and 2.49:1 on `--paper`**, and the current `globals.css` uses it for every eyebrow, column header and secondary label. §8.4 requires body text at ≥ 4.5:1. That is a real failure of the spec's own floor, in shipped code.
+
+> **Decision D-L: `--ink-3` may not carry text below 24px.** Every small label moves to `--ink-2` (7.36:1 on card, 6.10:1 on paper). `--ink-3` survives for rules, dividers, decorative separators and large display text, where 3:1 is the floor and it passes. The alternative — keeping light grey labels by changing the token to `#5F6B7C` (5.41:1 card, 4.49:1 paper) — is a **spec change**, not a plan change, and would need §8.1 edited. This plan takes the non-spec-changing option and the test enforces it.
+
+**Files:**
+- Modify: `package.json`
+- Modify: `jest.config.mjs`
+- Modify: `tsconfig.json`
+- Create: `jest.setup.ui.ts`
+- Modify: `app/globals.css`
+- Create: `lib/compound/ui/tokens.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: a `ui` Jest project running under jsdom over `lib/compound/ui/**`; the complete token set and utility classes in `app/globals.css`; `pnpm test` covering both projects
+
+- [ ] **Step 1: Add the component-test dependencies**
+
+```bash
+pnpm add -D jest-environment-jsdom@^29.7.0 @testing-library/react@^16.1.0 @testing-library/dom@^10.4.0 @testing-library/jest-dom@^6.6.3
+```
+
+Four, and no more. No `user-event` — nothing in this plan has client-side interaction to simulate; every flow is a server-rendered form. No `next/jest` — it pulls in the SWC transform and this repo's `ts-jest` setup already works.
+
+- [ ] **Step 2: Rewrite `jest.config.mjs` as two projects**
+
+Plan 3 left `jest.config.mjs` ignoring `*.db.test.ts` and put the integration suite in `jest.db.config.mjs`. Preserve both facts. `lib/compound/ui/**` moves to a jsdom project; everything else in `lib/` stays on node.
+
+```javascript
+/** @type {import('jest').Config} */
+const shared = {
+  preset: "ts-jest",
+  moduleNameMapper: { "^@/(.*)$": "<rootDir>/$1" },
+  transform: {
+    "^.+\\.tsx?$": [
+      "ts-jest",
+      { tsconfig: { target: "ES2022", module: "CommonJS", jsx: "react-jsx" } },
+    ],
+  },
+};
+
+export default {
+  projects: [
+    {
+      ...shared,
+      displayName: "unit",
+      testEnvironment: "node",
+      roots: ["<rootDir>/lib"],
+      testPathIgnorePatterns: [
+        "/node_modules/",
+        "\\.db\\.test\\.ts$",
+        "<rootDir>/lib/compound/ui/",
+      ],
+    },
+    {
+      ...shared,
+      displayName: "ui",
+      testEnvironment: "jsdom",
+      roots: ["<rootDir>/lib/compound/ui"],
+      testPathIgnorePatterns: ["/node_modules/", "\\.db\\.test\\.ts$"],
+      setupFilesAfterEnv: ["<rootDir>/jest.setup.ui.ts"],
+    },
+  ],
+};
+```
+
+Note for plan 5: its components live under `lib/compound/ui/journal|calendar|performance/` and will therefore run in the `ui` project. They use `renderToStaticMarkup`, which works unchanged under jsdom. Nothing needs a third project.
+
+- [ ] **Step 3: Create `jest.setup.ui.ts`**
+
+```typescript
+import "@testing-library/jest-dom";
+```
+
+- [ ] **Step 4: Extend `tsconfig.json`'s `include` to reach `.tsx` under `lib/`**
+
+The current `include` lists `lib/**/*.ts` only, so every component in `lib/compound/ui/` would be invisible to `tsc --noEmit` and the typecheck gate would pass on code it never read. Change the array to:
+
+```json
+"include": [
+  "lib/**/*.ts",
+  "lib/**/*.tsx",
+  "app/**/*.ts",
+  "app/**/*.tsx",
+  "*.ts",
+  "next-env.d.ts",
+  ".next/types/**/*.ts",
+  ".next/dev/types/**/*.ts"
+]
+```
+
+- [ ] **Step 5: Write the token guard test first**
+
+Create `lib/compound/ui/tokens.test.ts`. It reads the real stylesheet — not a copy of the values — so it fails when someone edits `globals.css`, which is the whole point.
+
+```typescript
+/**
+ * Spec section 8 states four contrast ratios as facts. Here they are as
+ * assertions, computed from the stylesheet rather than from a transcription.
+ *
+ * Two of these look backwards and are not:
+ *
+ *   - --fee is asserted to be BELOW 4.5:1. It is a structural colour: fills,
+ *     chips and marks. If someone darkens it so it can carry text, this test
+ *     goes red and forces the question "what is amber for?" to be answered in
+ *     the spec rather than in a hurry.
+ *   - --ink-3 is asserted to be below 4.5:1 AND to appear in no `color:`
+ *     declaration. It is 3.00:1 on white. Section 8.4 puts body text at 4.5:1.
+ *     Both facts are true, so the only safe rule is that it never carries small
+ *     text.
+ */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const CSS = readFileSync(join(__dirname, "../../../app/globals.css"), "utf8");
+
+function token(name: string): string {
+  const m = new RegExp(`--${name}\\s*:\\s*(#[0-9a-fA-F]{6})`).exec(CSS);
+  if (!m) throw new Error(`token --${name} is not defined in app/globals.css`);
+  return m[1]!.toLowerCase();
+}
+
+export function luminance(hex: string): number {
+  const channels = [1, 3, 5]
+    .map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!;
+}
+
+export function contrast(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi! + 0.05) / (lo! + 0.05);
+}
+
+const CARD = "#ffffff";
+const PAPER = "#e7eaef";
+
+describe("the tokens are exactly spec section 8.1", () => {
+  const expected: Record<string, string> = {
+    paper: "#e7eaef", card: "#ffffff",
+    ink: "#0f1b2d", "ink-2": "#4a5768", "ink-3": "#8a96a6",
+    rule: "#d2d8e0", "rule-soft": "#e6eaef",
+    gain: "#0b6b45", loss: "#a32a2b",
+    own: "#14532d", "own-2": "#d6e9de",
+    fee: "#f59e0b", "fee-ink": "#b45309", "fee-bg": "#fef6e4",
+  };
+  for (const [name, hex] of Object.entries(expected)) {
+    it(`--${name} is ${hex}`, () => expect(token(name)).toBe(hex));
+  }
+});
+
+describe("figure and body colours clear the 4.5:1 floor on both grounds", () => {
+  it.each([
+    ["gain", 6.56], ["loss", 7.18], ["own", 9.11], ["fee-ink", 5.02],
+    ["ink", 17.28], ["ink-2", 7.36],
+  ])("--%s is %f:1 on --card", (name, ratio) => {
+    expect(contrast(token(name), CARD)).toBeCloseTo(ratio, 2);
+    expect(contrast(token(name), CARD)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it.each([["gain"], ["loss"], ["own"], ["fee-ink"], ["ink"], ["ink-2"]])(
+    "--%s also clears 4.5:1 on --paper",
+    (name) => expect(contrast(token(name), PAPER)).toBeGreaterThanOrEqual(4.5),
+  );
+});
+
+describe("amber is structural, and the stylesheet does not forget it", () => {
+  it("--fee is 2.15:1 on white and therefore cannot carry text", () => {
+    expect(contrast(token("fee"), CARD)).toBeCloseTo(2.15, 2);
+    expect(contrast(token("fee"), CARD)).toBeLessThan(4.5);
+  });
+
+  it("no rule sets `color` to var(--fee)", () => {
+    const offenders = CSS.split("\n").filter((l) => /(^|[^-])color\s*:\s*var\(--fee\)/.test(l));
+    expect(offenders).toEqual([]);
+  });
+
+  it("--ink on --fee is 8.05:1, so amber may back dark text", () => {
+    expect(contrast(token("ink"), token("fee"))).toBeCloseTo(8.05, 2);
+  });
+
+  it("--fee-ink on --fee-bg is 4.67:1, so the fee chip is legible", () => {
+    expect(contrast(token("fee-ink"), token("fee-bg"))).toBeCloseTo(4.67, 2);
+  });
+});
+
+describe("--ink-3 never carries small text (decision D-L)", () => {
+  it("is 3.00:1 on --card, which is below the body floor", () => {
+    expect(contrast(token("ink-3"), CARD)).toBeCloseTo(3.0, 2);
+  });
+
+  it("no rule sets `color` to var(--ink-3)", () => {
+    const offenders = CSS.split("\n").filter((l) =>
+      /(^|[^-])color\s*:\s*var\(--ink-3\)/.test(l),
+    );
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("every figure is monospaced and tabular (section 8.3)", () => {
+  it(".num sets both the family and tabular-nums", () => {
+    const rule = /\.num\s*\{([^}]*)\}/.exec(CSS)?.[1] ?? "";
+    expect(rule).toMatch(/font-family:\s*var\(--mono\)/);
+    expect(rule).toMatch(/font-variant-numeric:\s*tabular-nums/);
+  });
+});
+
+describe("reduced motion is respected (section 8.4)", () => {
+  it("the stylesheet carries a prefers-reduced-motion block", () => {
+    expect(CSS).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  });
+});
+
+describe("focus is visible (section 8.4)", () => {
+  it("a :focus-visible rule sets an outline", () => {
+    expect(CSS).toMatch(/:focus-visible\s*\{[^}]*outline:/);
+  });
+});
+```
+
+**How these bite.** Change `--gain` to `#2E9E6B` and the ratio assertion fails. Delete the `prefers-reduced-motion` block and one test fails. Write `color: var(--fee)` anywhere and the amber test names the line. Revert an eyebrow to `--ink-3` and D-L's test names it. None of them can pass on an empty stylesheet — `token()` throws.
+
+- [ ] **Step 6: Rewrite `app/globals.css`**
+
+Keeps every token at its spec value. Moves every small label from `--ink-3` to `--ink-2`. Adds the classes A9 claims. Replaces the shell's `.equity`/`.navbox`/`.leg` with the kit's names.
+
+```css
+/* Design tokens, spec section 8.1. Statement direction: paper ground, green
+   ownership ramp, amber reserved for the fee.
+
+   Two rules this file obeys and lib/compound/ui/tokens.test.ts enforces:
+     - `color: var(--fee)` never appears. Amber is 2.15:1 on white. Fee TEXT is
+       --fee-ink at 5.02:1. Amber fills, chips and marks; it never sets type.
+     - `color: var(--ink-3)` never appears. It is 3.00:1 on white and section
+       8.4 puts body text at 4.5:1. Secondary labels are --ink-2 at 7.36:1.
+       --ink-3 survives for rules and decoration. */
+:root {
+  --paper: #e7eaef;
+  --card: #ffffff;
+  --ink: #0f1b2d;
+  --ink-2: #4a5768;
+  --ink-3: #8a96a6;
+  --rule: #d2d8e0;
+  --rule-soft: #e6eaef;
+
+  --gain: #0b6b45;
+  --loss: #a32a2b;
+
+  --own: #14532d;
+  --own-2: #d6e9de;
+
+  --fee: #f59e0b;
+  --fee-ink: #b45309;
+  --fee-bg: #fef6e4;
+
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --serif: "Instrument Serif", Georgia, serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  padding: 0 0 64px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Every figure in the product. Section 8.3. */
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.pos { color: var(--gain); }
+.neg { color: var(--loss); }
+.fee { color: var(--fee-ink); }
+.muted { color: var(--ink-2); }
+
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+.hairline { border: 0; border-top: 1px solid var(--rule); margin: 16px 0; }
+
+/* Masthead, switcher, sub-nav */
+.mast {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 22px 0 14px; flex-wrap: wrap;
+}
+.mark { font-family: var(--serif); font-size: 27px; line-height: 1; }
+.sub {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .18em;
+  color: var(--ink-2); border-left: 1px solid var(--rule);
+  padding-left: 10px; margin-left: 10px;
+}
+.switcher { position: relative; font-family: var(--mono); font-size: 12px; }
+.switcher > summary {
+  list-style: none; cursor: pointer; background: var(--card);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 7px 12px;
+  color: var(--ink); display: flex; align-items: center; gap: 8px;
+}
+.switcher > summary::-webkit-details-marker { display: none; }
+.switcher > div {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+  min-width: 260px; background: var(--card); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 4px;
+}
+.switcher a {
+  display: block; padding: 8px 10px; color: var(--ink);
+  text-decoration: none; border-radius: 2px;
+}
+.switcher a:hover, .switcher a[aria-current="true"] { background: var(--paper); }
+
+.subnav {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--rule);
+  margin-bottom: 14px; overflow-x: auto;
+}
+.subnav a {
+  padding: 9px 14px; font-size: 12.5px; color: var(--ink-2);
+  text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap;
+}
+.subnav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
+
+/* Panels */
+.panel {
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 20px; margin-bottom: 12px;
+}
+.panel.flush { padding: 0; overflow: hidden; }
+.eyebrow {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .16em;
+  color: var(--ink-2); font-weight: 600;
+}
+
+/* Statement head */
+.erow {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap; margin-top: 8px;
+}
+.equity {
+  font-family: var(--mono); font-weight: 500;
+  font-size: clamp(32px, 6vw, 48px); letter-spacing: -.035em; line-height: 1;
+}
+.equity .cents { color: var(--ink-2); }
+
+/* KPI strip */
+.kpi {
+  display: grid; gap: 1px; background: var(--rule-soft);
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  border: 1px solid var(--rule); border-radius: 3px; overflow: hidden;
+  margin-bottom: 12px;
+}
+.kpi-item { background: var(--card); padding: 14px 16px; }
+.kpi-item .k {
+  display: block; font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: .14em; color: var(--ink-2); font-weight: 600; margin-bottom: 4px;
+}
+.kpi-item .v { display: block; font-family: var(--mono); font-size: 18px; }
+.kpi-item.is-fee { background: var(--fee-bg); }
+.kpi-item.is-fee .v { color: var(--fee-ink); }
+
+/* Ownership rail. Green means the pool, divided. Never gain, never "yours". */
+.rail {
+  display: flex; height: 32px; border: 1px solid var(--ink);
+  border-radius: 2px; overflow: hidden; margin-top: 18px;
+}
+.seg { border-right: 1px solid var(--ink); }
+.seg:last-child { border-right: none; }
+.seg.hatched {
+  background-image: repeating-linear-gradient(
+    45deg, rgba(15, 27, 45, .22) 0 3px, transparent 3px 7px
+  );
+}
+.leg { display: flex; gap: 18px; margin-top: 9px; font-size: 11.5px; color: var(--ink-2); flex-wrap: wrap; }
+.leg i { width: 9px; height: 9px; border: 1px solid var(--ink); display: inline-block; margin-right: 7px; }
+.leg b { font-family: var(--mono); font-weight: 500; color: var(--ink); }
+
+/* Tables */
+.scroller { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; background: var(--card); }
+caption { text-align: left; padding: 14px 16px 0; }
+th {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .13em;
+  color: var(--ink-2); font-weight: 600; text-align: right;
+  padding: 10px 16px; border-bottom: 1px solid var(--rule); white-space: nowrap;
+}
+td {
+  padding: 12px 16px; border-bottom: 1px solid var(--rule-soft);
+  text-align: right; white-space: nowrap; font-size: 13px;
+}
+th:first-child, td:first-child { text-align: left; }
+tr.own td { background: var(--fee-bg); }
+tr.closed td { color: var(--ink-2); }
+tr.voided td { color: var(--ink-2); text-decoration: line-through; }
+tfoot td { background: #fbfcfd; border-top: 1px solid var(--ink); border-bottom: none; font-weight: 600; }
+
+.tag, .chip {
+  display: inline-block; font-size: 9px; text-transform: uppercase;
+  letter-spacing: .1em; font-weight: 600; padding: 2px 6px;
+  border: 1px solid var(--ink); border-radius: 2px; margin-left: 6px;
+  color: var(--ink);
+}
+.tag { background: var(--fee); }
+.chip { background: transparent; border-color: var(--rule); color: var(--ink-2); }
+.chip.is-live { border-color: var(--gain); color: var(--gain); }
+.chip.is-fee { background: var(--fee-bg); border-color: var(--fee-ink); color: var(--fee-ink); }
+
+/* Banners */
+.banner {
+  background: var(--fee-bg); border: 1px solid #e8c77a; border-radius: 3px;
+  padding: 11px 14px; font-size: 12.5px; color: var(--fee-ink); margin-bottom: 12px;
+}
+.banner-halt {
+  background: var(--card); border: 1px solid var(--loss); border-left-width: 4px;
+  border-radius: 3px; padding: 12px 15px; margin-bottom: 12px; color: var(--ink);
+}
+.banner-halt strong { color: var(--loss); }
+
+/* Sheets — the money flows. Routes, not overlays (decision D-B). */
+.sheet-scrim { background: var(--paper); min-height: 100vh; padding: 28px 20px 64px; }
+.sheet {
+  max-width: 640px; margin: 0 auto; background: var(--card);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 24px;
+}
+.sheet h1 { font-family: var(--serif); font-size: 28px; font-weight: 400; margin: 0 0 4px; }
+.sheet .lede { color: var(--ink-2); font-size: 13px; margin: 0 0 18px; }
+
+/* Receipts — the arithmetic, before it commits. */
+.receipt { border-top: 1px solid var(--ink); margin-top: 16px; }
+.receipt-line {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--rule-soft);
+}
+.receipt-line .l { font-size: 13px; color: var(--ink); }
+.receipt-line .l small { display: block; color: var(--ink-2); font-size: 11px; }
+.receipt-line .r { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 14px; }
+.receipt-line.is-fee { background: var(--fee-bg); padding-left: 10px; padding-right: 10px; }
+.receipt-line.is-fee .r { color: var(--fee-ink); }
+.receipt-total { border-top: 1px solid var(--ink); border-bottom: none; padding-top: 14px; }
+.receipt-total .l { font-weight: 600; }
+.receipt-total .r { font-size: 24px; }
+.split-note { font-size: 11.5px; color: var(--ink-2); margin-top: 10px; line-height: 1.6; }
+
+/* Review queue */
+.queue { display: grid; gap: 12px; }
+.queue-item {
+  background: var(--card); border: 1px solid var(--rule);
+  border-left: 4px solid var(--fee); border-radius: 3px; padding: 18px 20px;
+}
+
+/* Forms */
+.field { display: block; margin-bottom: 14px; }
+.field > span {
+  display: block; font-size: 10px; text-transform: uppercase; letter-spacing: .14em;
+  color: var(--ink-2); font-weight: 600; margin-bottom: 5px;
+}
+.field input, .field select, .field textarea {
+  width: 100%; font-family: var(--mono); font-size: 14px; color: var(--ink);
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 9px 11px;
+}
+.field-error {
+  border-left: 4px solid var(--loss); background: var(--card);
+  border: 1px solid var(--loss); border-left-width: 4px; border-radius: 3px;
+  padding: 11px 14px; margin-bottom: 14px; font-size: 12.5px;
+}
+.field-error strong { color: var(--loss); }
+
+.btn {
+  display: inline-block; font-family: var(--sans); font-size: 13px; font-weight: 500;
+  padding: 9px 16px; border: 1px solid var(--ink); border-radius: 3px;
+  background: var(--card); color: var(--ink); cursor: pointer; text-decoration: none;
+}
+.btn[aria-disabled="true"], .btn:disabled {
+  border-color: var(--rule); color: var(--ink-2); cursor: not-allowed; background: var(--paper);
+}
+.btn-primary { background: var(--ink); color: var(--card); }
+.btn-danger { border-color: var(--loss); color: var(--loss); }
+.actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
+
+.foot { padding: 18px 0; font-size: 11.5px; color: var(--ink-2); line-height: 1.6; }
+.ok { color: var(--gain); font-weight: 600; }
+```
+
+- [ ] **Step 7: Run the gates**
+
+```bash
+pnpm typecheck && pnpm test
+```
+
+Expected: two projects report, `unit` runs the engine and reconcile suites unchanged, `ui` runs `tokens.test.ts` and it passes.
+
+- [ ] **Step 8: Prove the tests bite**
+
+Do all four, one at a time, reverting each:
+
+1. Change `--gain` to `#2e9e6b` → the `--gain is 6.56:1` test fails and no other.
+2. Add `color: var(--fee);` to `.chip.is-fee` → the amber `color` test fails and names the line.
+3. Change `.eyebrow`'s colour back to `var(--ink-3)` → D-L's test fails.
+4. Delete the `@media (prefers-reduced-motion: reduce)` block → the reduced-motion test fails.
+
+If any of the four leaves the suite green, the test is not reading what it claims to read. Fix it before continuing.
+
+---
+
+### Task 2: `present/format.ts` — every figure that reaches a screen
+
+The presentation boundary. Spec §4 says NAV is rounded to 4dp **here and nowhere else**; this is that place. Nothing in this module performs money arithmetic — it formats what the engine already computed.
+
+**Files:**
+- Create: `lib/compound/present/format.ts`
+- Create: `lib/compound/present/fixture.ts`
+- Test: `lib/compound/present/format.test.ts`
+- Test: `lib/compound/present/purity.test.ts`
+
+**Interfaces:**
+- Consumes: `Cents`, `Units`, `formatCents`, `formatUnits`, `UNIT_SCALE` from `@/lib/compound/engine/money`; `PoolTotals`, `navTimes1e4` from `@/lib/compound/engine/nav`
+- Produces:
+  - `formatMoney(c: Cents, opts?: { currency?: string; sign?: "auto" | "always" }): string`
+  - `splitMoney(c: Cents, currency?: string): { whole: string; cents: string }`
+  - `formatUnitsDp(u: Units, dp?: number): string`
+  - `formatNav(t: PoolTotals): string`
+  - `formatSinceInception(t: PoolTotals): string`
+  - `formatPpm(ppm: number): string`
+  - `formatSplit(splitBps: number): string`
+  - `formatSplitWords(splitBps: number, holderName: string): string`
+  - `formatDate(isoDate: string): string`
+  - `formatUtcStamp(iso: string): string`
+  - `signOf(c: Cents): "pos" | "neg" | "zero"`
+
+- [ ] **Step 1: Create `lib/compound/present/format.ts`**
+
+```typescript
+/**
+ * The presentation boundary. Spec section 4: "Where a NAV figure must be
+ * displayed it is computed and rounded to 4dp at the presentation boundary
+ * only." This module is that boundary and nothing downstream of it does
+ * arithmetic.
+ *
+ * Two rules hold throughout:
+ *
+ *   1. No floating point. Group separators, sign handling and decimal
+ *      placement are all string operations on the exact integer the engine
+ *      produced. A money value never becomes a Number on its way to a screen.
+ *   2. Unit counts TRUNCATE, they do not round. formatUnits already truncates,
+ *      and rounding up would print a holding larger than the holder owns —
+ *      which contradicts the floor bias every value-moving operation in the
+ *      engine uses. Four decimal places: two hides differences that matter on
+ *      a small pool, ten is unreadable.
+ */
+import {
+  formatCents,
+  formatUnits,
+  type Cents,
+  type Units,
+} from "@/lib/compound/engine/money";
+import { navTimes1e4, type PoolTotals } from "@/lib/compound/engine/nav";
+
+const SYMBOLS: Record<string, string> = { USD: "$", EUR: "€", GBP: "£" };
+
+function symbolFor(currency: string): string {
+  return SYMBOLS[currency] ?? `${currency} `;
+}
+
+/** Inserts thousands separators into a run of digits. String work, never math. */
+function group(digits: string): string {
+  let out = "";
+  for (let i = digits.length; i > 0; i -= 3) {
+    out = digits.slice(Math.max(0, i - 3), i) + (out === "" ? "" : ",") + out;
+  }
+  return out;
+}
+
+/**
+ * Splits a money figure into its major and minor parts so the statement head
+ * can render the cents smaller. Returns the parts, never a concatenation, so
+ * a caller cannot accidentally style them as one run.
+ */
+export function splitMoney(c: Cents, currency = "USD"): { whole: string; cents: string } {
+  const raw = formatCents(c);                       // "-55743.91"
+  const negative = raw.startsWith("-");
+  const [whole = "0", cents = "00"] = (negative ? raw.slice(1) : raw).split(".");
+  return {
+    whole: `${negative ? "-" : ""}${symbolFor(currency)}${group(whole)}`,
+    cents,
+  };
+}
+
+/**
+ * `sign: "always"` prefixes a non-negative figure with "+". Use it for P/L and
+ * for nothing else — a balance with a plus sign reads as a change.
+ */
+export function formatMoney(
+  c: Cents,
+  opts: { currency?: string; sign?: "auto" | "always" } = {},
+): string {
+  const { whole, cents } = splitMoney(c, opts.currency ?? "USD");
+  const plus = opts.sign === "always" && c >= 0n ? "+" : "";
+  return `${plus}${whole}.${cents}`;
+}
+
+export function formatUnitsDp(u: Units, dp = 4): string {
+  const raw = formatUnits(u, dp);                   // truncates, by design
+  const negative = raw.startsWith("-");
+  const [whole = "0", frac] = (negative ? raw.slice(1) : raw).split(".");
+  return `${negative ? "-" : ""}${group(whole)}${frac === undefined ? "" : `.${frac}`}`;
+}
+
+/** NAV per unit, 4dp, truncated. navTimes1e4 is NAV x 10^4. */
+export function formatNav(t: PoolTotals): string {
+  const n = navTimes1e4(t);
+  return `${group((n / 10_000n).toString())}.${(n % 10_000n).toString().padStart(4, "0")}`;
+}
+
+/** Growth since inception: (NAV - 1) x 100, two decimals, always signed. */
+export function formatSinceInception(t: PoolTotals): string {
+  const bp = navTimes1e4(t) - 10_000n;              // basis points
+  const negative = bp < 0n;
+  const abs = negative ? -bp : bp;
+  return `${negative ? "-" : "+"}${group((abs / 100n).toString())}.${(abs % 100n)
+    .toString()
+    .padStart(2, "0")}%`;
+}
+
+/** A share expressed in parts per million, rendered at 2dp. */
+export function formatPpm(ppm: number): string {
+  if (!Number.isInteger(ppm) || ppm < 0 || ppm > 1_000_000) {
+    throw new RangeError(`ppm must be an integer 0..1000000, got ${ppm}`);
+  }
+  const hundredths = Math.round(ppm / 100);         // exact: ppm is an integer
+  return `${Math.trunc(hundredths / 100)}.${(hundredths % 100).toString().padStart(2, "0")}%`;
+}
+
+/** "60 / 40" — investor first, manager second, matching how terms are spoken. */
+export function formatSplit(splitBps: number): string {
+  if (!Number.isInteger(splitBps) || splitBps < 0 || splitBps > 10_000) {
+    throw new RangeError(`splitBps must be an integer 0..10000, got ${splitBps}`);
+  }
+  const pct = (bps: number) =>
+    bps % 100 === 0 ? `${bps / 100}` : (bps / 100).toFixed(2);
+  return `${pct(10_000 - splitBps)} / ${pct(splitBps)}`;
+}
+
+/** The same terms in a sentence, for a sheet that must be read rather than scanned. */
+export function formatSplitWords(splitBps: number, holderName: string): string {
+  const investor = formatSplit(splitBps).split(" / ")[0]!;
+  const manager = formatSplit(splitBps).split(" / ")[1]!;
+  return (
+    `${holderName} keeps ${investor}% of profit and you keep ${manager}%. ` +
+    `The fee is charged only when ${holderName} withdraws, and only on profit ` +
+    `above what ${holderName} has put in.`
+  );
+}
+
+/** YYYY-MM-DD to "14 Aug 2026". No Date object: the input is a broker-server
+ *  date string and constructing a Date from it resolves it in the local zone. */
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+export function formatDate(isoDate: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (!m) throw new RangeError(`not a YYYY-MM-DD date: ${JSON.stringify(isoDate)}`);
+  return `${Number(m[3])} ${MONTHS[Number(m[2]) - 1]} ${m[1]}`;
+}
+
+/** An ISO 8601 UTC timestamp to "18 Aug 2026, 09:14 UTC". Parsed, not
+ *  constructed: `new Date(iso).getHours()` renders in the reader's zone, and a
+ *  pushed_at that moves with the reader is a support ticket waiting to happen. */
+export function formatUtcStamp(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso);
+  if (!m) throw new RangeError(`not an ISO 8601 timestamp: ${JSON.stringify(iso)}`);
+  return `${formatDate(`${m[1]}-${m[2]}-${m[3]}`)}, ${m[4]}:${m[5]} UTC`;
+}
+
+export function signOf(c: Cents): "pos" | "neg" | "zero" {
+  return c > 0n ? "pos" : c < 0n ? "neg" : "zero";
+}
+```
+
+- [ ] **Step 2: Create the canonical fixture, `lib/compound/present/fixture.ts`**
+
+Every figure in the comments below was produced by running the merged engine over this ledger. Do not adjust an amount for legibility — the awkwardness is load-bearing.
+
+```typescript
+/**
+ * The fixture every test in plans 4 renders against. Fictional names, fictional
+ * amounts, deliberately awkward denominators.
+ *
+ * Final state, from fold():
+ *   equity  55743.91      units 40222.4547963043      NAV 1.3858...
+ *   Manager  25000.0000u  basis 25000.00  alloc 34647.26  floor 34647.25  62.1543%
+ *   Ada       9113.7132u  basis 10000.00  alloc 12630.61  floor 12630.60  22.6583%
+ *   Grace     6108.7415u  basis  7500.00  alloc  8466.04  floor  8466.04  15.1874%
+ *
+ * Three properties a round fixture does not have:
+ *   - allocated and floored value differ by a cent for two of three holders,
+ *     and the floored column is two cents short of equity;
+ *   - floored shares sum to 999998 ppm, not 1000000;
+ *   - NAV does not terminate, so floor and ceil disagree on every issuance.
+ *
+ * Grace's split is 3700, not the 4000 default, so a component that hard-codes
+ * 40 percent fails against her row.
+ */
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import type { HolderSeed, LedgerEntry } from "@/lib/compound/engine/replay";
+
+export const MANAGER_ID = 1;
+export const ADA_ID = 2;
+export const GRACE_ID = 3;
+
+export const HOLDER_NAMES: Record<number, string> = {
+  [MANAGER_ID]: "J. Marsh",
+  [ADA_ID]: "Ada Lovelace",
+  [GRACE_ID]: "Grace Hopper",
+};
+
+export const SEEDS: HolderSeed[] = [
+  { holderId: MANAGER_ID, isManager: true, splitBps: 0 },
+  { holderId: ADA_ID, isManager: false, splitBps: 4000 },
+  { holderId: GRACE_ID, isManager: false, splitBps: 3700 },
+];
+
+function entry(
+  id: number,
+  seq: number,
+  holderId: number | null,
+  occurredOn: string,
+  type: LedgerEntry["type"],
+  amount: string,
+  feeSettlement: LedgerEntry["feeSettlement"] = null,
+  splitBpsApplied: number | null = null,
+): LedgerEntry {
+  return {
+    id, seq, holderId, occurredOn, type,
+    amountCents: centsFromDecimal(amount),
+    feeSettlement, splitBpsApplied, reversesId: null,
+  };
+}
+
+export const LEDGER: LedgerEntry[] = [
+  entry(1, 1, MANAGER_ID, "2026-03-02", "deposit", "25000.00"),
+  entry(2, 2, null, "2026-04-30", "equity_reading", "27431.19"),
+  entry(3, 3, ADA_ID, "2026-05-04", "deposit", "10000.00"),
+  entry(4, 4, null, "2026-06-30", "equity_reading", "41883.07"),
+  entry(5, 5, GRACE_ID, "2026-07-06", "deposit", "7500.00"),
+  entry(6, 6, null, "2026-08-14", "equity_reading", "55743.91"),
+];
+
+/** The same account after a reading that puts everyone under water.
+ *  Recovery figures: Manager 1312.71, Ada 1364.84, Grace 1712.02. */
+export const LEDGER_UNDERWATER: LedgerEntry[] = [
+  ...LEDGER,
+  entry(7, 7, null, "2026-08-18", "equity_reading", "38110.44"),
+];
+
+/** Live figures from account_snapshots_current, ahead of the last reading. */
+export const LIVE = {
+  balanceCents: centsFromDecimal("55805.00"),
+  equityCents: centsFromDecimal("55930.00"),
+  floatingPnlCents: centsFromDecimal("125.00"),
+  pushedAt: "2026-08-18T09:14:22.000Z",
+};
+```
+
+- [ ] **Step 3: Write the format tests**
+
+Create `lib/compound/present/format.test.ts`:
+
+```typescript
+import { centsFromDecimal, unitsFromDecimal } from "@/lib/compound/engine/money";
+import { fold, totalsOf } from "@/lib/compound/engine/replay";
+import { LEDGER, SEEDS } from "./fixture";
+import {
+  formatDate, formatMoney, formatNav, formatPpm, formatSinceInception,
+  formatSplit, formatSplitWords, formatUnitsDp, formatUtcStamp, signOf, splitMoney,
+} from "./format";
+
+const TOTALS = totalsOf(fold(LEDGER, SEEDS));
+
+describe("formatMoney", () => {
+  it("groups thousands and keeps both cents", () => {
+    expect(formatMoney(centsFromDecimal("55743.91"))).toBe("$55,743.91");
+  });
+
+  it("groups millions", () => {
+    expect(formatMoney(centsFromDecimal("1234567.08"))).toBe("$1,234,567.08");
+  });
+
+  it("keeps a trailing zero in the cents", () => {
+    // "1000.50" -> 100050 cents. A Number round trip renders "1000.5".
+    expect(formatMoney(centsFromDecimal("1000.50"))).toBe("$1,000.50");
+  });
+
+  it("puts the minus outside the symbol", () => {
+    expect(formatMoney(centsFromDecimal("-1364.84"))).toBe("-$1,364.84");
+  });
+
+  it("signs a positive figure only when asked", () => {
+    expect(formatMoney(centsFromDecimal("2630.61"))).toBe("$2,630.61");
+    expect(formatMoney(centsFromDecimal("2630.61"), { sign: "always" })).toBe("+$2,630.61");
+  });
+
+  it("signs zero as positive under sign:always, because zero P/L is not a loss", () => {
+    expect(formatMoney(0n, { sign: "always" })).toBe("+$0.00");
+  });
+
+  it("renders a sub-dollar figure without losing the leading zero", () => {
+    expect(formatMoney(centsFromDecimal("0.07"))).toBe("$0.07");
+  });
+
+  it("uses the account currency symbol", () => {
+    expect(formatMoney(centsFromDecimal("12.34"), { currency: "EUR" })).toBe("€12.34");
+  });
+
+  it("falls back to the code for a currency it has no symbol for", () => {
+    expect(formatMoney(centsFromDecimal("12.34"), { currency: "PHP" })).toBe("PHP 12.34");
+  });
+
+  it("survives a figure past Number.MAX_SAFE_INTEGER", () => {
+    // 9007199254740993 cents. As a double this is 9007199254740992.
+    expect(formatMoney(9_007_199_254_740_993n)).toBe("$90,071,992,547,409.93");
+  });
+});
+
+describe("splitMoney", () => {
+  it("separates the major and minor parts", () => {
+    expect(splitMoney(centsFromDecimal("55743.91"))).toEqual({ whole: "$55,743", cents: "91" });
+  });
+
+  it("keeps the sign with the major part", () => {
+    expect(splitMoney(centsFromDecimal("-8.05"))).toEqual({ whole: "-$8", cents: "05" });
+  });
+});
+
+describe("formatUnitsDp", () => {
+  it("truncates rather than rounds, at 4dp (decision D-K)", () => {
+    // 9113.71329... truncates to .7132. Rounding would give .7133.
+    const ada = fold(LEDGER, SEEDS).holders.find((h) => h.holderId === 2)!;
+    expect(formatUnitsDp(ada.units)).toBe("9,113.7132");
+  });
+
+  it("groups thousands", () => {
+    expect(formatUnitsDp(unitsFromDecimal("40222.4547963043"))).toBe("40,222.4547");
+  });
+
+  it("keeps ten places when asked", () => {
+    expect(formatUnitsDp(unitsFromDecimal("40222.4547963043"), 10)).toBe("40,222.4547963043");
+  });
+
+  it("renders zero units without a stray separator", () => {
+    expect(formatUnitsDp(0n)).toBe("0.0000");
+  });
+});
+
+describe("formatNav", () => {
+  it("is 1.3858 on the fixture, truncated at 4dp", () => {
+    expect(formatNav(TOTALS)).toBe("1.3858");
+  });
+
+  it("is 1.0000 at genesis", () => {
+    expect(formatNav({ equityCents: 0n, units: 0n })).toBe("1.0000");
+  });
+
+  it("pads a NAV whose fraction has leading zeros", () => {
+    // equity 1000.50 across 1000 units is NAV 1.0005. Without padStart the
+    // fraction renders as "5" and the figure reads 1.5.
+    expect(formatNav({
+      equityCents: centsFromDecimal("1000.50"),
+      units: unitsFromDecimal("1000"),
+    })).toBe("1.0005");
+  });
+});
+
+describe("formatSinceInception", () => {
+  it("is +38.58% on the fixture", () => {
+    expect(formatSinceInception(TOTALS)).toBe("+38.58%");
+  });
+
+  it("is +0.00% at genesis, not an empty string", () => {
+    expect(formatSinceInception({ equityCents: 0n, units: 0n })).toBe("+0.00%");
+  });
+
+  it("signs a loss", () => {
+    // 0.9474 NAV -> -5.26%
+    expect(formatSinceInception({
+      equityCents: centsFromDecimal("38110.44"),
+      units: unitsFromDecimal("40222.4547963043"),
+    })).toBe("-5.26%");
+  });
+});
+
+describe("formatPpm", () => {
+  it("renders a share at 2dp", () => {
+    expect(formatPpm(621_543)).toBe("62.15%");
+  });
+
+  it("renders a whole hundred percent", () => {
+    expect(formatPpm(1_000_000)).toBe("100.00%");
+  });
+
+  it("pads a small share", () => {
+    expect(formatPpm(407)).toBe("0.04%");
+  });
+
+  it("refuses a share outside 0..1000000", () => {
+    expect(() => formatPpm(1_000_001)).toThrow(/ppm must be an integer/);
+  });
+});
+
+describe("formatSplit", () => {
+  it("renders the default as 60 / 40", () => {
+    expect(formatSplit(4000)).toBe("60 / 40");
+  });
+
+  it("renders Grace's 3700 as 63 / 37, not 60 / 40", () => {
+    expect(formatSplit(3700)).toBe("63 / 37");
+  });
+
+  it("keeps two decimals for a split that is not a whole percent", () => {
+    expect(formatSplit(3750)).toBe("62.50 / 37.50");
+  });
+
+  it("refuses a split outside 0..10000", () => {
+    expect(() => formatSplit(10_001)).toThrow(/splitBps must be an integer/);
+  });
+});
+
+describe("formatSplitWords", () => {
+  it("names the holder, both percentages, and when the fee applies", () => {
+    const words = formatSplitWords(3700, "Grace Hopper");
+    expect(words).toContain("Grace Hopper keeps 63% of profit and you keep 37%");
+    expect(words).toContain("only when Grace Hopper withdraws");
+    expect(words).toContain("only on profit above what Grace Hopper has put in");
+  });
+});
+
+describe("formatDate", () => {
+  it("renders a broker-server date without constructing a Date", () => {
+    expect(formatDate("2026-08-14")).toBe("14 Aug 2026");
+  });
+
+  it("does not shift the day west of UTC", () => {
+    // A Date built from "2026-01-01" is midnight UTC, which is 31 Dec locally
+    // anywhere west of Greenwich. This function never builds one.
+    expect(formatDate("2026-01-01")).toBe("1 Jan 2026");
+  });
+
+  it("refuses a timestamp", () => {
+    expect(() => formatDate("2026-08-14T00:00:00Z")).toThrow(/not a YYYY-MM-DD date/);
+  });
+});
+
+describe("formatUtcStamp", () => {
+  it("renders the UTC wall clock, whatever zone the reader is in", () => {
+    expect(formatUtcStamp("2026-08-18T09:14:22.000Z")).toBe("18 Aug 2026, 09:14 UTC");
+  });
+
+  it("does not shift a stamp near midnight", () => {
+    // new Date("2026-01-01T00:30:00Z") is 31 Dec locally west of Greenwich.
+    expect(formatUtcStamp("2026-01-01T00:30:00.000Z")).toBe("1 Jan 2026, 00:30 UTC");
+  });
+
+  it("refuses a bare date", () => {
+    expect(() => formatUtcStamp("2026-08-18")).toThrow(/not an ISO 8601 timestamp/);
+  });
+});
+
+describe("signOf", () => {
+  it("distinguishes zero from positive", () => {
+    expect(signOf(0n)).toBe("zero");
+    expect(signOf(1n)).toBe("pos");
+    expect(signOf(-1n)).toBe("neg");
+  });
+});
+```
+
+**How these bite.** Delete the `padStart(2, "0")` in `splitMoney` and `$1,000.50` becomes `$1,000.5` — one test, named. Swap `formatUnits`'s truncation for rounding and Ada's `9,113.7132` becomes `9,113.7133`. Convert any figure to `Number` on the way through and the `MAX_SAFE_INTEGER` test fails. Hard-code the default split and Grace's row fails. Build a `Date` in `formatDate` and the `2026-01-01` test fails on any machine west of UTC — including CI, if it runs in a non-UTC zone, which is the point.
+
+- [ ] **Step 4: Write the purity guard**
+
+Create `lib/compound/present/purity.test.ts`:
+
+```typescript
+/**
+ * present/ is pure. It formats and derives; it renders nothing and reads
+ * nothing. Keeping React out of it is what lets every arithmetic test in this
+ * plan run in the fast node project rather than under jsdom, and keeping db/
+ * out of it is what lets those tests run with no database at all.
+ */
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const DIR = __dirname;
+const FORBIDDEN: [RegExp, string][] = [
+  [/from\s+["']react/, "react"],
+  [/from\s+["']next/, "next"],
+  [/from\s+["']@\/lib\/compound\/db/, "the db layer"],
+  [/from\s+["']pg["']/, "pg"],
+  [/\bMath\.random\b/, "Math.random"],
+  [/\bDate\.now\b/, "Date.now"],
+  [/\bnew Date\b/, "new Date"],
+];
+
+function sources(): string[] {
+  return readdirSync(DIR)
+    .filter((f) => (f.endsWith(".ts") || f.endsWith(".tsx")) && !f.endsWith(".test.ts"))
+    .map((f) => join(DIR, f));
+}
+
+describe("present/ purity", () => {
+  it("has sources to check", () => {
+    expect(sources().length).toBeGreaterThan(0);
+  });
+
+  it.each(FORBIDDEN)("imports nothing matching %s (%s)", (pattern, label) => {
+    const offenders = sources().filter((f) => pattern.test(readFileSync(f, "utf8")));
+    expect({ label, offenders }).toEqual({ label, offenders: [] });
+  });
+
+  it("contains no floating-point literal in a money or unit expression", () => {
+    // A decimal literal in this module is either a percentage divisor or a
+    // bug. The engine has none at all; present/ is allowed /100 and /10000 in
+    // formatSplit, and nothing else.
+    const offenders: string[] = [];
+    for (const f of sources()) {
+      for (const [i, line] of readFileSync(f, "utf8").split("\n").entries()) {
+        if (/\b\d+\.\d+\b/.test(line) && !/toFixed|@|\/\//.test(line)) {
+          offenders.push(`${f}:${i + 1}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+```
+
+**How this bites.** Add `import { useMemo } from "react"` to `format.ts` and the react case names the file. Replace `formatDate`'s regex parse with `new Date(isoDate)` and the `new Date` case fires — which is the second line of defence behind the `2026-01-01` test.
+
+- [ ] **Step 5: Run the gates and prove one probe**
+
+```bash
+pnpm typecheck && pnpm test
+```
+
+Then temporarily change `formatUnitsDp`'s default `dp` from `4` to `2` and confirm exactly the two `formatUnitsDp` truncation tests fail — not the whole file. Revert.
+
+---
+
+### Task 3: `present/rail.ts` and `present/derive.ts` — shares, the green ramp, and everything derived from a ledger
+
+Two modules, one task, because they share one fixture and one discipline. `rail.ts` answers "who owns how much of this pool, and what colour is that". `derive.ts` answers "what does this ledger look like step by step, and what would this proposed entry do".
+
+The load-bearing idea is D-D: **a preview is `fold(existing ++ [proposed])`.** The receipt a manager confirms is produced by the same reducer that will process the entry, so the two cannot disagree.
+
+**Files:**
+- Create: `lib/compound/present/rail.ts`
+- Create: `lib/compound/present/derive.ts`
+- Test: `lib/compound/present/rail.test.ts`
+- Test: `lib/compound/present/derive.test.ts`
+
+**Interfaces:**
+- Consumes: `Cents`, `Units` from `@/lib/compound/engine/money`; `PoolTotals`, `allocateValues`, `navTimes1e4` from `@/lib/compound/engine/nav`; `LedgerEntry`, `LedgerEntryType`, `HolderSeed`, `HolderState`, `PoolState`, `fold`, `totalsOf` from `@/lib/compound/engine/replay`; `quote`, `Quote` from `@/lib/compound/engine/quote`
+- Produces:
+  - `allocateShares(holderUnits: readonly Units[], totalUnits: Units): number[]`
+  - `railTint(index: number, count: number): string`
+  - `railIsHatched(index: number, count: number): boolean`
+  - `railSegments(state: PoolState, names: Record<number, string>): RailSegment[]`
+  - `interface RailSegment { holderId; label; ppm; tint; hatched; isManager }`
+  - `interface LedgerStep { entry; voided; before; after; unitsDelta; holderUnitsDelta; equityDelta }`
+  - `ledgerSteps(entries: readonly LedgerEntry[], seeds: readonly HolderSeed[]): LedgerStep[]`
+  - `interface CapitalMark { occurredOn; type; amountCents; direction }`
+  - `capitalMarks(entries: readonly LedgerEntry[], seeds: readonly HolderSeed[]): CapitalMark[]`
+  - `interface ProposedEntry { holderId; occurredOn; type; amountCents; feeSettlement; splitBpsApplied }`
+  - `interface Fingerprint { accountId; seq; equityCents; units }`
+  - `fingerprintOf(accountId: number, state: PoolState): Fingerprint`
+  - `assertNavDidNotFall(type: LedgerEntryType, beforeX1e4: bigint, afterX1e4: bigint): void`
+  - `previewEntry(input: PreviewInput): Preview`
+  - `interface DeskRow { holderId; name; isManager; status; units; ppm; basisCents; valueCents; profitCents; splitBps; feeIfExitCents }`
+  - `deskFigures(state: PoolState, names: Record<number, string>): DeskFigures`
+
+- [ ] **Step 1: Create `lib/compound/present/rail.ts`**
+
+```typescript
+/**
+ * The ownership rail. Green means THE POOL, DIVIDED — darkest first — and it
+ * means neither "yours" nor "gain", both of which are carried by other hues.
+ * Spec section 8.2.
+ *
+ * The ramp interpolates --own (#14532D, 9.11:1 on white) to --own-2 (#D6E9DE)
+ * in integer sRGB. Teal and emerald were rejected in the spec because they sit
+ * at 1.20:1 against --gain and separate by hue alone; only a markedly darker
+ * green separates by lightness, which is what a colourblind reader has.
+ *
+ * The ramp is a FUNCTION, not a set of tokens. Spec section 8.1 defines two
+ * green values and says additional holders take progressively lighter tints of
+ * the same green; inventing a custom property per holder would not scale and
+ * would put presentation decisions in a stylesheet that cannot count holders.
+ *
+ * Beyond six holders the ramp cycles and every repeated tint is hatched, so no
+ * two adjacent segments are the same fill. The legend always labels every
+ * segment: section 8.4 forbids colour as the sole carrier of meaning, so the
+ * ramp is a convenience, never the information.
+ */
+import type { Units } from "@/lib/compound/engine/money";
+import type { PoolState } from "@/lib/compound/engine/replay";
+
+const OWN = [0x14, 0x53, 0x2d] as const;
+const OWN_2 = [0xd6, 0xe9, 0xde] as const;
+
+/** Six solid tints. Past that the ramp repeats with a hatch. */
+export const RAIL_MAX_SOLID = 6;
+
+const PPM = 1_000_000n;
+
+/**
+ * Shares in parts per million, allocated by largest remainder so they sum to
+ * exactly 1,000,000.
+ *
+ * Flooring each share independently is short by up to one ppm per holder. On
+ * this project's fixture the floors sum to 999,998 — so a rail built from them
+ * leaves a two-ppm gap at the end and does not fill its container. The same
+ * argument allocateValues makes about cents, made about percentages.
+ *
+ * This allocates a REPORTING quantity and never moves value, so the
+ * conservative floor/ceil rule that governs issuance and redemption does not
+ * apply. Ties break by holder order, matching allocateValues.
+ */
+export function allocateShares(holderUnits: readonly Units[], totalUnits: Units): number[] {
+  if (holderUnits.length === 0) return [];
+  if (totalUnits <= 0n) return holderUnits.map(() => 0);
+
+  const sum = holderUnits.reduce((s, u) => s + u, 0n);
+  if (sum !== totalUnits) {
+    throw new RangeError(`holder units ${sum} do not sum to pool units ${totalUnits}`);
+  }
+
+  const floors = holderUnits.map((u) => (u * PPM) / totalUnits);
+  const remainders = holderUnits.map((u, i) => u * PPM - floors[i]! * totalUnits);
+  let short = PPM - floors.reduce((s, p) => s + p, 0n);
+
+  const order = remainders
+    .map((r, i) => [r, i] as const)
+    .sort((a, b) => (a[0] !== b[0] ? (a[0] > b[0] ? -1 : 1) : a[1] - b[1]));
+
+  const out = [...floors];
+  for (let k = 0; short > 0n && k < order.length; k += 1, short -= 1n) {
+    const idx = order[k]![1];
+    out[idx] = out[idx]! + 1n;
+  }
+  return out.map((p) => Number(p));
+}
+
+/** Integer interpolation. No float touches a colour channel. */
+function rampAt(position: number, steps: number): string {
+  if (steps <= 1 || position <= 0) return "#14532d";
+  const span = steps - 1;
+  const k = Math.min(position, span);
+  const channel = (i: 0 | 1 | 2) =>
+    Math.trunc((OWN[i] * (span - k) + OWN_2[i] * k + Math.trunc(span / 2)) / span);
+  return `#${[0, 1, 2].map((i) => channel(i as 0 | 1 | 2).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** Index 0 is always --own. The manager is always index 0. */
+export function railTint(index: number, count: number): string {
+  if (!Number.isInteger(index) || index < 0) throw new RangeError(`bad index ${index}`);
+  if (!Number.isInteger(count) || count < 1) throw new RangeError(`bad count ${count}`);
+  const solid = Math.min(count, RAIL_MAX_SOLID);
+  return rampAt(index % solid, solid);
+}
+
+export function railIsHatched(index: number, count: number): boolean {
+  return index >= Math.min(count, RAIL_MAX_SOLID);
+}
+
+export interface RailSegment {
+  holderId: number;
+  label: string;
+  /** Parts per million. The segments sum to exactly 1,000,000. */
+  ppm: number;
+  tint: string;
+  hatched: boolean;
+  isManager: boolean;
+}
+
+/**
+ * The manager first, then investors by descending stake, then by holder id.
+ * Darkest first is the spec's phrasing and the manager is always darkest.
+ * Holders with no units are omitted: a zero-width segment is invisible and its
+ * legend entry says nothing a reader can use.
+ */
+export function railSegments(state: PoolState, names: Record<number, string>): RailSegment[] {
+  const held = state.holders.filter((h) => h.units > 0n);
+  const ordered = [...held].sort((a, b) => {
+    if (a.isManager !== b.isManager) return a.isManager ? -1 : 1;
+    if (a.units !== b.units) return a.units > b.units ? -1 : 1;
+    return a.holderId - b.holderId;
+  });
+
+  const shares = allocateShares(
+    ordered.map((h) => h.units),
+    ordered.reduce((s, h) => s + h.units, 0n),
+  );
+
+  return ordered.map((h, i) => ({
+    holderId: h.holderId,
+    label: names[h.holderId] ?? `Holder #${h.holderId}`,
+    ppm: shares[i]!,
+    tint: railTint(i, ordered.length),
+    hatched: railIsHatched(i, ordered.length),
+    isManager: h.isManager,
+  }));
+}
+```
+
+- [ ] **Step 2: Write `lib/compound/present/rail.test.ts`**
+
+```typescript
+import { unitsFromDecimal } from "@/lib/compound/engine/money";
+import { fold } from "@/lib/compound/engine/replay";
+import { HOLDER_NAMES, LEDGER, SEEDS } from "./fixture";
+import {
+  RAIL_MAX_SOLID, allocateShares, railIsHatched, railSegments, railTint,
+} from "./rail";
+
+const STATE = fold(LEDGER, SEEDS);
+
+function luminance(hex: string): number {
+  const c = [1, 3, 5]
+    .map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * c[0]! + 0.7152 * c[1]! + 0.0722 * c[2]!;
+}
+function contrast(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi! + 0.05) / (lo! + 0.05);
+}
+
+describe("allocateShares", () => {
+  it("sums to exactly 1,000,000 ppm where flooring sums to 999,998", () => {
+    const shares = allocateShares(STATE.holders.map((h) => h.units), STATE.units);
+    const floors = STATE.holders.map((h) => Number((h.units * 1_000_000n) / STATE.units));
+    expect(floors.reduce((a, b) => a + b, 0)).toBe(999_998);   // the gap being fixed
+    expect(shares.reduce((a, b) => a + b, 0)).toBe(1_000_000);
+  });
+
+  it("awards the two spare ppm to the two largest remainders", () => {
+    // Remainders rank Grace > Ada > Manager, so Grace and Ada each gain one.
+    expect(allocateShares(STATE.holders.map((h) => h.units), STATE.units))
+      .toEqual([621_543, 226_583, 151_874]);
+  });
+
+  it("gives a sole holder the entire pool", () => {
+    expect(allocateShares([unitsFromDecimal("7")], unitsFromDecimal("7"))).toEqual([1_000_000]);
+  });
+
+  it("returns zeros for an empty pool rather than dividing by zero", () => {
+    expect(allocateShares([0n, 0n], 0n)).toEqual([0, 0]);
+  });
+
+  it("refuses units that do not sum to the pool", () => {
+    expect(() => allocateShares([unitsFromDecimal("1")], unitsFromDecimal("2")))
+      .toThrow(/do not sum to pool units/);
+  });
+
+  it("splits three equal holders 333334 / 333333 / 333333, summing to a million", () => {
+    const u = unitsFromDecimal("1");
+    const shares = allocateShares([u, u, u], u * 3n);
+    expect(shares).toEqual([333_334, 333_333, 333_333]);
+    expect(shares.reduce((a, b) => a + b, 0)).toBe(1_000_000);
+  });
+});
+
+describe("railTint", () => {
+  it("puts --own at index 0 for every pool size", () => {
+    for (let n = 1; n <= 9; n += 1) expect(railTint(0, n)).toBe("#14532d");
+  });
+
+  it("ends a full ramp at --own-2", () => {
+    expect(railTint(2, 3)).toBe("#d6e9de");
+    expect(railTint(5, 6)).toBe("#d6e9de");
+  });
+
+  it("produces the documented ramp for six holders", () => {
+    expect([0, 1, 2, 3, 4, 5].map((i) => railTint(i, 6)))
+      .toEqual(["#14532d", "#3b7150", "#628f74", "#88ad97", "#afcbbb", "#d6e9de"]);
+  });
+
+  it("gets lighter monotonically, for every pool size up to the solid limit", () => {
+    for (let n = 2; n <= RAIL_MAX_SOLID; n += 1) {
+      const lums = [...Array(n)].map((_, i) => luminance(railTint(i, n)));
+      for (let i = 1; i < n; i += 1) expect(lums[i]!).toBeGreaterThan(lums[i - 1]!);
+    }
+  });
+
+  it("separates adjacent segments by lightness, not by hue alone", () => {
+    // 1.371 is the tightest pair, at n=6. Below about 1.35 the boundary stops
+    // reading as a boundary in greyscale.
+    for (let n = 2; n <= RAIL_MAX_SOLID; n += 1) {
+      for (let i = 1; i < n; i += 1) {
+        expect(contrast(railTint(i, n), railTint(i - 1, n))).toBeGreaterThanOrEqual(1.35);
+      }
+    }
+  });
+
+  it("cycles past six and hatches every repeat", () => {
+    expect(railTint(6, 8)).toBe(railTint(0, 8));
+    expect(railIsHatched(5, 8)).toBe(false);
+    expect(railIsHatched(6, 8)).toBe(true);
+  });
+
+  it("never hatches inside the solid run", () => {
+    for (let n = 1; n <= RAIL_MAX_SOLID; n += 1) {
+      for (let i = 0; i < n; i += 1) expect(railIsHatched(i, n)).toBe(false);
+    }
+  });
+
+  it("refuses a negative index", () => {
+    expect(() => railTint(-1, 3)).toThrow(/bad index/);
+  });
+});
+
+describe("railSegments", () => {
+  const segs = railSegments(STATE, HOLDER_NAMES);
+
+  it("puts the manager first, at the darkest tint", () => {
+    expect(segs[0]!.label).toBe("J. Marsh");
+    expect(segs[0]!.isManager).toBe(true);
+    expect(segs[0]!.tint).toBe("#14532d");
+  });
+
+  it("orders investors by descending stake", () => {
+    expect(segs.map((s) => s.label)).toEqual(["J. Marsh", "Ada Lovelace", "Grace Hopper"]);
+  });
+
+  it("fills the rail exactly", () => {
+    expect(segs.reduce((a, s) => a + s.ppm, 0)).toBe(1_000_000);
+  });
+
+  it("labels every segment, so colour is never the sole carrier", () => {
+    for (const s of segs) expect(s.label.length).toBeGreaterThan(0);
+  });
+
+  it("omits a holder with no units", () => {
+    const withGhost = {
+      ...STATE,
+      holders: [...STATE.holders, {
+        holderId: 9, isManager: false, splitBps: 4000,
+        units: 0n, basisCents: 0n, status: "closed" as const,
+      }],
+    };
+    expect(railSegments(withGhost, HOLDER_NAMES).map((s) => s.holderId)).toEqual([1, 2, 3]);
+  });
+
+  it("names an unnamed holder rather than rendering undefined", () => {
+    expect(railSegments(STATE, {})[0]!.label).toBe("Holder #1");
+  });
+});
+```
+
+**How these bite.** Replace `allocateShares`'s largest-remainder loop with a plain floor and the 1,000,000 assertion fails while the 999,998 assertion still passes — which is the pair that makes the failure legible. Change the ramp's endpoint from `--own-2` to `--gain` and the monotonic-lightness test fails, because `--gain` is darker than three of the tints. Sort investors ascending and the order test names it. Drop the `units > 0n` filter and the ghost-holder test fails.
+
+- [ ] **Step 3: Create `lib/compound/present/derive.ts`**
+
+```typescript
+/**
+ * Everything a screen needs that is derived from a ledger rather than
+ * formatted from a figure.
+ *
+ * The rule this module exists to enforce (decision D-D): A PREVIEW IS A FOLD.
+ * previewEntry appends the proposed entry to the real ledger and replays. The
+ * receipt a manager reads is therefore produced by the same reducer that will
+ * process the entry when they confirm it, and the two cannot drift. A
+ * hand-written "here is what will happen" calculation is a second truth, and
+ * this product's whole claim is that it has one.
+ *
+ * ledgerSteps folds every prefix rather than keeping a running total, for the
+ * same reason (decision D-E). It is O(n^2) at a few thousand entries, which
+ * spec section D7 explicitly says is irrelevant at this scale, and it is the
+ * only construction under which the ledger page cannot disagree with the desk.
+ */
+import type { Cents, Units } from "@/lib/compound/engine/money";
+import { allocateValues, navTimes1e4, type PoolTotals } from "@/lib/compound/engine/nav";
+import { quote, type Quote } from "@/lib/compound/engine/quote";
+import {
+  fold, totalsOf,
+  type HolderSeed, type LedgerEntry, type LedgerEntryType, type PoolState,
+} from "@/lib/compound/engine/replay";
+import { allocateShares } from "./rail";
+
+/** fold's voiding rule, restated: a reversal voids both entries. */
+function voidedIds(entries: readonly LedgerEntry[]): Set<number> {
+  const voided = new Set<number>();
+  for (const e of entries) {
+    if (e.reversesId !== null) {
+      voided.add(e.reversesId);
+      voided.add(e.id);
+    }
+  }
+  return voided;
+}
+
+function bySeq(entries: readonly LedgerEntry[]): LedgerEntry[] {
+  return [...entries].sort((a, b) => a.seq - b.seq);
+}
+
+export interface LedgerStep {
+  entry: LedgerEntry;
+  /** True when this entry, or the entry that reverses it, is a reversal. */
+  voided: boolean;
+  before: PoolState;
+  after: PoolState;
+  /** Signed. Pool units issued or redeemed by this entry. */
+  unitsDelta: Units;
+  /** Signed, for the entry's own holder. Null for readings and adjustments. */
+  holderUnitsDelta: Units | null;
+  /** Signed. Cash that entered or left the account. */
+  equityDelta: Cents;
+}
+
+export function ledgerSteps(
+  entries: readonly LedgerEntry[],
+  seeds: readonly HolderSeed[],
+): LedgerStep[] {
+  const ordered = bySeq(entries);
+  const voided = voidedIds(ordered);
+  const empty = fold([], seeds);
+
+  const steps: LedgerStep[] = [];
+  let before = empty;
+  for (let i = 0; i < ordered.length; i += 1) {
+    const entry = ordered[i]!;
+    const after = fold(ordered.slice(0, i + 1), seeds);
+    const holderUnitsOf = (s: PoolState) =>
+      entry.holderId === null
+        ? null
+        : (s.holders.find((h) => h.holderId === entry.holderId)?.units ?? 0n);
+    const hb = holderUnitsOf(before);
+    const ha = holderUnitsOf(after);
+    steps.push({
+      entry,
+      voided: voided.has(entry.id),
+      before,
+      after,
+      unitsDelta: after.units - before.units,
+      holderUnitsDelta: hb === null || ha === null ? null : ha - hb,
+      equityDelta: after.equityCents - before.equityCents,
+    });
+    before = after;
+  }
+  return steps;
+}
+
+export interface CapitalMark {
+  /** YYYY-MM-DD, broker-server date. */
+  occurredOn: string;
+  type: "deposit" | "payout" | "exit";
+  /** Always positive. The cash that actually moved. */
+  amountCents: Cents;
+  direction: "in" | "out";
+}
+
+/**
+ * Capital events for an equity curve. Spec R4.
+ *
+ * The amount is taken from the EQUITY DELTA, not from entry.amountCents. For a
+ * deposit the two agree. For a payout they do not: replay.ts recomputes the
+ * payout from quote() and never reads amountCents, so the ledger's figure is
+ * the amount that was requested and the equity delta is the amount that left.
+ * Marking the requested figure would put a mark of the wrong height on the
+ * curve, which is exactly the class of error R4 exists to prevent.
+ *
+ * Voided entries are excluded, so a reversed deposit leaves no phantom step.
+ */
+export function capitalMarks(
+  entries: readonly LedgerEntry[],
+  seeds: readonly HolderSeed[],
+): CapitalMark[] {
+  const out: CapitalMark[] = [];
+  for (const step of ledgerSteps(entries, seeds)) {
+    if (step.voided) continue;
+    const t = step.entry.type;
+    if (t !== "deposit" && t !== "payout" && t !== "exit") continue;
+    const delta = step.equityDelta;
+    if (delta === 0n) continue;
+    out.push({
+      occurredOn: step.entry.occurredOn,
+      type: t,
+      amountCents: delta < 0n ? -delta : delta,
+      direction: delta > 0n ? "in" : "out",
+    });
+  }
+  return out;
+}
+
+export interface ProposedEntry {
+  holderId: number | null;
+  occurredOn: string;
+  type: LedgerEntryType;
+  amountCents: Cents;
+  feeSettlement: "units" | "cash" | null;
+  splitBpsApplied: number | null;
+}
+
+/**
+ * What the preview was computed against. Carried through the sheet as strings
+ * and checked at commit time, so a receipt can never be confirmed against a
+ * pool that moved after it was rendered.
+ */
+export interface Fingerprint {
+  accountId: number;
+  seq: number;
+  /** Decimal string. bigint does not survive JSON or a form field. */
+  equityCents: string;
+  units: string;
+}
+
+export function fingerprintOf(accountId: number, state: PoolState): Fingerprint {
+  return {
+    accountId,
+    seq: state.seq,
+    equityCents: state.equityCents.toString(),
+    units: state.units.toString(),
+  };
+}
+
+/**
+ * Spec section 3.5, invariant 3, at the presentation boundary.
+ *
+ * "Only an equity reading may move NAV downward. Every other operation leaves
+ * NAV equal or very slightly higher, by at most the rounding residual."
+ *
+ * An adjustment is a correction to equity and is exempt for the same reason a
+ * reading is: it restates what the account is worth. A deposit, payout or exit
+ * that lowers NAV means a holder extracted more than they were owed, and a
+ * receipt must never be able to render one.
+ */
+export function assertNavDidNotFall(
+  type: LedgerEntryType,
+  beforeX1e4: bigint,
+  afterX1e4: bigint,
+): void {
+  if (type === "equity_reading" || type === "adjustment") return;
+  if (afterX1e4 < beforeX1e4) {
+    throw new Error(
+      `${type} would move NAV down from ${beforeX1e4} to ${afterX1e4} (x1e4). ` +
+        `Only an equity reading may lower NAV; a fall here means value left the pool.`,
+    );
+  }
+}
+
+export interface PreviewInput {
+  accountId: number;
+  entries: readonly LedgerEntry[];
+  seeds: readonly HolderSeed[];
+  proposed: ProposedEntry;
+}
+
+export interface Preview {
+  before: PoolState;
+  after: PoolState;
+  navBeforeX1e4: bigint;
+  navAfterX1e4: bigint;
+  /** after - before. Non-negative for every type assertNavDidNotFall guards. */
+  navResidualX1e4: bigint;
+  equityDelta: Cents;
+  unitsDelta: Units;
+  /** Aligned to before.holders / after.holders, which fold keeps in seed order. */
+  sharesBefore: number[];
+  sharesAfter: number[];
+  valuesBefore: Cents[];
+  valuesAfter: Cents[];
+  fingerprint: Fingerprint;
+}
+
+export function previewEntry(input: PreviewInput): Preview {
+  const { accountId, entries, seeds, proposed } = input;
+  const ordered = bySeq(entries);
+  const before = fold(ordered, seeds);
+
+  const nextSeq = (ordered[ordered.length - 1]?.seq ?? 0) + 1;
+  const nextId = ordered.reduce((m, e) => (e.id > m ? e.id : m), 0) + 1;
+  const after = fold(
+    [...ordered, { ...proposed, id: nextId, seq: nextSeq, reversesId: null }],
+    seeds,
+  );
+
+  const navBeforeX1e4 = navTimes1e4(totalsOf(before));
+  const navAfterX1e4 = navTimes1e4(totalsOf(after));
+  assertNavDidNotFall(proposed.type, navBeforeX1e4, navAfterX1e4);
+
+  return {
+    before,
+    after,
+    navBeforeX1e4,
+    navAfterX1e4,
+    navResidualX1e4: navAfterX1e4 - navBeforeX1e4,
+    equityDelta: after.equityCents - before.equityCents,
+    unitsDelta: after.units - before.units,
+    sharesBefore: allocateShares(before.holders.map((h) => h.units), before.units),
+    sharesAfter: allocateShares(after.holders.map((h) => h.units), after.units),
+    valuesBefore: allocateValues(totalsOf(before), before.holders.map((h) => h.units)),
+    valuesAfter: allocateValues(totalsOf(after), after.holders.map((h) => h.units)),
+    fingerprint: fingerprintOf(accountId, before),
+  };
+}
+
+export interface DeskRow {
+  holderId: number;
+  name: string;
+  isManager: boolean;
+  status: "active" | "closed";
+  units: Units;
+  /** Parts per million. The rows sum to 1,000,000. */
+  ppm: number;
+  basisCents: Cents;
+  /** ALLOCATED, per decision D-A. The column sums to equity exactly. */
+  valueCents: Cents;
+  profitCents: Cents;
+  splitBps: number;
+  /** What the manager would earn if this holder exited today. Zero for the manager. */
+  feeIfExitCents: Cents;
+}
+
+export interface DeskFigures {
+  totals: PoolTotals;
+  navX1e4: bigint;
+  rows: DeskRow[];
+  /** Active non-manager holders only. */
+  investorBasisCents: Cents;
+  investorValueCents: Cents;
+  investorProfitCents: Cents;
+  /** Sum of every holder's fee on a full exit today. The accrued, uncrystallised fee. */
+  feeIfAllExitCents: Cents;
+  managerValueCents: Cents;
+  holderCount: number;
+}
+
+/**
+ * Every figure on the desk, in one pass.
+ *
+ * valueCents is allocated (largest remainder) so the column sums to equity
+ * exactly — invariant 2. feeIfExitCents comes from quote(), which values the
+ * holding by FLOORING. The two can differ by a cent for the same holder, and
+ * both are correct: see decision D-A. Do not "reconcile" them here.
+ */
+export function deskFigures(state: PoolState, names: Record<number, string>): DeskFigures {
+  const totals = totalsOf(state);
+  const values = allocateValues(totals, state.holders.map((h) => h.units));
+  const shares = allocateShares(state.holders.map((h) => h.units), state.units);
+
+  const rows: DeskRow[] = state.holders.map((h, i) => {
+    const q: Quote = quote({
+      totals,
+      holderUnits: h.units,
+      basisCents: h.basisCents,
+      splitBps: h.splitBps,
+      isManager: h.isManager,
+      mode: "exit",
+    });
+    return {
+      holderId: h.holderId,
+      name: names[h.holderId] ?? `Holder #${h.holderId}`,
+      isManager: h.isManager,
+      status: h.status,
+      units: h.units,
+      ppm: shares[i]!,
+      basisCents: h.basisCents,
+      valueCents: values[i]!,
+      profitCents: values[i]! - h.basisCents,
+      splitBps: h.splitBps,
+      feeIfExitCents: q.feeCents,
+    };
+  });
+
+  const investors = rows.filter((r) => !r.isManager && r.status === "active");
+  return {
+    totals,
+    navX1e4: navTimes1e4(totals),
+    rows,
+    investorBasisCents: investors.reduce((s, r) => s + r.basisCents, 0n),
+    investorValueCents: investors.reduce((s, r) => s + r.valueCents, 0n),
+    investorProfitCents: investors.reduce((s, r) => s + r.profitCents, 0n),
+    feeIfAllExitCents: rows.reduce((s, r) => s + r.feeIfExitCents, 0n),
+    managerValueCents: rows.filter((r) => r.isManager).reduce((s, r) => s + r.valueCents, 0n),
+    holderCount: rows.filter((r) => r.units > 0n).length,
+  };
+}
+```
+
+- [ ] **Step 4: Write `lib/compound/present/derive.test.ts`**
+
+```typescript
+import { centsFromDecimal, unitsFromDecimal } from "@/lib/compound/engine/money";
+import { fold, type LedgerEntry } from "@/lib/compound/engine/replay";
+import { ADA_ID, GRACE_ID, HOLDER_NAMES, LEDGER, MANAGER_ID, SEEDS } from "./fixture";
+import {
+  assertNavDidNotFall, capitalMarks, deskFigures, fingerprintOf, ledgerSteps, previewEntry,
+} from "./derive";
+
+const c = centsFromDecimal;
+const u = unitsFromDecimal;
+
+describe("ledgerSteps", () => {
+  const steps = ledgerSteps(LEDGER, SEEDS);
+
+  it("produces one step per entry", () => {
+    expect(steps).toHaveLength(6);
+  });
+
+  it("carries the running equity, units and NAV of every prefix", () => {
+    expect(steps.map((s) => s.after.equityCents.toString())).toEqual([
+      "2500000", "2743119", "3743119", "4188307", "4938307", "5574391",
+    ]);
+    expect(steps.map((s) => s.after.units)).toEqual([
+      u("25000"), u("25000"), u("34113.7132"), u("34113.7132"),
+      u("40222.4547963043"), u("40222.4547963043"),
+    ]);
+  });
+
+  it("ends where fold(all) ends — the ledger page cannot drift from the desk", () => {
+    expect(steps[steps.length - 1]!.after).toEqual(fold(LEDGER, SEEDS));
+  });
+
+  it("chains: each step's before is the previous step's after", () => {
+    for (let i = 1; i < steps.length; i += 1) {
+      expect(steps[i]!.before).toEqual(steps[i - 1]!.after);
+    }
+  });
+
+  it("reports units issued only on the entries that issue them", () => {
+    expect(steps.map((s) => s.unitsDelta > 0n)).toEqual([true, false, true, false, true, false]);
+  });
+
+  it("reports the holder's own unit change, and null for a reading", () => {
+    expect(steps[0]!.holderUnitsDelta).toBe(u("25000"));
+    expect(steps[1]!.holderUnitsDelta).toBeNull();
+  });
+
+  it("orders by seq, not by array position", () => {
+    const shuffled = [LEDGER[3]!, LEDGER[0]!, LEDGER[5]!, LEDGER[2]!, LEDGER[4]!, LEDGER[1]!];
+    expect(ledgerSteps(shuffled, SEEDS).map((s) => s.entry.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("marks both sides of a reversal as voided", () => {
+    const reversal: LedgerEntry = {
+      id: 7, seq: 7, holderId: GRACE_ID, occurredOn: "2026-08-20",
+      type: "deposit", amountCents: c("-7500.00"), feeSettlement: null,
+      splitBpsApplied: null, reversesId: 5,
+    };
+    const withReversal = ledgerSteps([...LEDGER, reversal], SEEDS);
+    expect(withReversal.filter((s) => s.voided).map((s) => s.entry.id)).toEqual([5, 7]);
+  });
+});
+
+describe("capitalMarks", () => {
+  it("marks each deposit once, in date order, as money in", () => {
+    expect(capitalMarks(LEDGER, SEEDS)).toEqual([
+      { occurredOn: "2026-03-02", type: "deposit", amountCents: c("25000.00"), direction: "in" },
+      { occurredOn: "2026-05-04", type: "deposit", amountCents: c("10000.00"), direction: "in" },
+      { occurredOn: "2026-07-06", type: "deposit", amountCents: c("7500.00"), direction: "in" },
+    ]);
+  });
+
+  it("marks a readings-only ledger with nothing", () => {
+    expect(capitalMarks(LEDGER.filter((e) => e.type === "equity_reading"), SEEDS)).toEqual([]);
+  });
+
+  it("marks a payout with the cash that LEFT, not the amount that was requested", () => {
+    // Ada's profit payout: amountCents on the entry is the requested 2630.60.
+    // The cash that left is toHolderCents, 1578.36 — the fee stayed in the
+    // pool as units. Reading amountCents would put a mark of the wrong height
+    // on the equity curve.
+    const payout: LedgerEntry = {
+      id: 7, seq: 7, holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+      amountCents: c("2630.60"), feeSettlement: "units", splitBpsApplied: 4000,
+      reversesId: null,
+    };
+    expect(capitalMarks([...LEDGER, payout], SEEDS).at(-1)).toEqual({
+      occurredOn: "2026-08-18", type: "payout",
+      amountCents: c("1578.36"), direction: "out",
+    });
+  });
+
+  it("leaves no phantom step where a deposit was reversed", () => {
+    const reversal: LedgerEntry = {
+      id: 7, seq: 7, holderId: GRACE_ID, occurredOn: "2026-08-20",
+      type: "deposit", amountCents: c("-7500.00"), feeSettlement: null,
+      splitBpsApplied: null, reversesId: 5,
+    };
+    const marks = capitalMarks([...LEDGER, reversal], SEEDS);
+    expect(marks.map((m) => m.occurredOn)).toEqual(["2026-03-02", "2026-05-04"]);
+  });
+});
+
+describe("assertNavDidNotFall", () => {
+  it("permits a reading to lower NAV", () => {
+    expect(() => assertNavDidNotFall("equity_reading", 13_858n, 9_474n)).not.toThrow();
+  });
+
+  it("permits an adjustment to lower NAV", () => {
+    expect(() => assertNavDidNotFall("adjustment", 13_858n, 13_857n)).not.toThrow();
+  });
+
+  it("refuses a deposit that lowers NAV, naming both figures", () => {
+    expect(() => assertNavDidNotFall("deposit", 13_858n, 13_857n))
+      .toThrow(/deposit would move NAV down from 13858 to 13857/);
+  });
+
+  it("refuses a payout that lowers NAV", () => {
+    expect(() => assertNavDidNotFall("payout", 13_858n, 13_857n)).toThrow(/NAV down/);
+  });
+
+  it("permits NAV rising by a rounding residual", () => {
+    expect(() => assertNavDidNotFall("deposit", 13_858n, 13_859n)).not.toThrow();
+  });
+
+  it("permits NAV unchanged", () => {
+    expect(() => assertNavDidNotFall("exit", 13_858n, 13_858n)).not.toThrow();
+  });
+});
+
+describe("previewEntry — a deposit", () => {
+  const p = previewEntry({
+    accountId: 7,
+    entries: LEDGER,
+    seeds: SEEDS,
+    proposed: {
+      holderId: ADA_ID, occurredOn: "2026-08-18", type: "deposit",
+      amountCents: c("4250.00"), feeSettlement: null, splitBpsApplied: null,
+    },
+  });
+
+  it("is exactly fold(existing ++ proposed)", () => {
+    expect(p.after).toEqual(fold([...LEDGER, {
+      id: 7, seq: 7, holderId: ADA_ID, occurredOn: "2026-08-18", type: "deposit",
+      amountCents: c("4250.00"), feeSettlement: null, splitBpsApplied: null, reversesId: null,
+    }], SEEDS));
+  });
+
+  it("issues the floor of the units the deposit buys", () => {
+    // 4250.00 at NAV 1.3858... is 3066.6207821498... units. Ceil would be
+    // 3066.6207821499 and would lower NAV, which assertNavDidNotFall forbids.
+    expect(p.unitsDelta).toBe(u("3066.6207821498"));
+  });
+
+  it("adds exactly the deposit to equity", () => {
+    expect(p.equityDelta).toBe(c("4250.00"));
+  });
+
+  it("leaves NAV where it was", () => {
+    expect(p.navBeforeX1e4).toBe(13_858n);
+    expect(p.navAfterX1e4).toBe(13_858n);
+    expect(p.navResidualX1e4).toBe(0n);
+  });
+
+  it("dilutes shares and leaves the other holders' values alone", () => {
+    expect(p.sharesBefore).toEqual([621_543, 226_583, 151_874]);
+    expect(p.sharesAfter).toEqual([577_513, 281_372, 141_115]);
+    expect(p.valuesBefore).toEqual([c("34647.26"), c("12630.61"), c("8466.04")]);
+    expect(p.valuesAfter).toEqual([c("34647.26"), c("16880.61"), c("8466.04")]);
+  });
+
+  it("keeps both share rows summing to a full pool", () => {
+    expect(p.sharesBefore.reduce((a, b) => a + b, 0)).toBe(1_000_000);
+    expect(p.sharesAfter.reduce((a, b) => a + b, 0)).toBe(1_000_000);
+  });
+
+  it("fingerprints the state the preview was computed against", () => {
+    expect(p.fingerprint).toEqual({
+      accountId: 7, seq: 6, equityCents: "5574391", units: "402224547963043",
+    });
+  });
+});
+
+describe("previewEntry — a profit payout with the fee retained as units", () => {
+  const p = previewEntry({
+    accountId: 7,
+    entries: LEDGER,
+    seeds: SEEDS,
+    proposed: {
+      holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+      amountCents: c("2630.60"), feeSettlement: "units", splitBpsApplied: 4000,
+    },
+  });
+
+  it("takes only the cash the holder receives out of the account", () => {
+    expect(p.equityDelta).toBe(c("-1578.36"));
+  });
+
+  it("nets units: Ada surrenders 1898.13, the manager is issued 759.2520121904", () => {
+    expect(p.unitsDelta).toBe(u("759.2520121904") - u("1898.1300304762"));
+  });
+
+  it("leaves NAV where it was — the settlement is NAV-neutral", () => {
+    expect(p.navAfterX1e4).toBe(p.navBeforeX1e4);
+  });
+
+  it("returns Ada to her cost basis, which is what a high-water mark means", () => {
+    const ada = p.after.holders.findIndex((h) => h.holderId === ADA_ID);
+    expect(p.after.holders[ada]!.basisCents).toBe(c("10000.00"));
+    expect(p.valuesAfter[ada]).toBe(c("10000.01")); // allocated; floored is 10000.00
+  });
+
+  it("raises the manager's cost basis by the fee they took as units", () => {
+    const mgr = p.after.holders.find((h) => h.holderId === MANAGER_ID)!;
+    expect(mgr.basisCents).toBe(c("26052.24"));  // 25000.00 + 1052.24
+  });
+});
+
+describe("previewEntry — the same payout settled in cash", () => {
+  const p = previewEntry({
+    accountId: 7,
+    entries: LEDGER,
+    seeds: SEEDS,
+    proposed: {
+      holderId: ADA_ID, occurredOn: "2026-08-18", type: "payout",
+      amountCents: c("2630.60"), feeSettlement: "cash", splitBpsApplied: 4000,
+    },
+  });
+
+  it("takes the holder's cash AND the fee out of the account", () => {
+    expect(p.equityDelta).toBe(c("-2630.60"));
+  });
+
+  it("issues the manager no units", () => {
+    expect(p.after.holders.find((h) => h.holderId === MANAGER_ID)!.units).toBe(u("25000"));
+  });
+
+  it("still leaves NAV where it was", () => {
+    expect(p.navAfterX1e4).toBe(p.navBeforeX1e4);
+  });
+});
+
+describe("deskFigures", () => {
+  const d = deskFigures(fold(LEDGER, SEEDS), HOLDER_NAMES);
+
+  it("values holders by allocation, so the column sums to equity exactly", () => {
+    expect(d.rows.map((r) => r.valueCents))
+      .toEqual([c("34647.26"), c("12630.61"), c("8466.04")]);
+    expect(d.rows.reduce((s, r) => s + r.valueCents, 0n)).toBe(c("55743.91"));
+  });
+
+  it("does not reconcile the allocated value with the floored one", () => {
+    // Ada reads 12630.61 here and 12630.60 on her payout receipt. Decision
+    // D-A. If this ever becomes equal, one of the two is now wrong.
+    const ada = d.rows.find((r) => r.holderId === ADA_ID)!;
+    expect(ada.valueCents).toBe(c("12630.61"));
+  });
+
+  it("measures profit against cost basis", () => {
+    expect(d.rows.map((r) => r.profitCents))
+      .toEqual([c("9647.26"), c("2630.61"), c("966.04")]);
+  });
+
+  it("charges the manager no fee on their own holding", () => {
+    expect(d.rows.find((r) => r.isManager)!.feeIfExitCents).toBe(0n);
+  });
+
+  it("applies each holder's own split, not the default", () => {
+    // Grace is 3700, not 4000. 966.04 x 37% floors to 357.43; at 40% it would
+    // be 386.41, so a hard-coded default fails here and only here.
+    expect(d.rows.find((r) => r.holderId === GRACE_ID)!.feeIfExitCents).toBe(c("357.43"));
+    expect(d.rows.find((r) => r.holderId === ADA_ID)!.feeIfExitCents).toBe(c("1052.24"));
+  });
+
+  it("totals the accrued fee across every holder", () => {
+    expect(d.feeIfAllExitCents).toBe(c("1409.67"));  // 1052.24 + 357.43
+  });
+
+  it("totals investor capital, value and profit, excluding the manager", () => {
+    expect(d.investorBasisCents).toBe(c("17500.00"));
+    expect(d.investorValueCents).toBe(c("21096.65"));
+    expect(d.investorProfitCents).toBe(c("3596.65"));
+  });
+
+  it("reports the manager's own value separately", () => {
+    expect(d.managerValueCents).toBe(c("34647.26"));
+  });
+
+  it("counts only holders who hold something", () => {
+    expect(d.holderCount).toBe(3);
+  });
+
+  it("carries NAV as an integer, for the presentation layer to format", () => {
+    expect(d.navX1e4).toBe(13_858n);
+  });
+});
+
+describe("deskFigures — everyone under water", () => {
+  const d = deskFigures(
+    fold([...LEDGER, {
+      id: 7, seq: 7, holderId: null, occurredOn: "2026-08-18",
+      type: "equity_reading", amountCents: c("38110.44"),
+      feeSettlement: null, splitBpsApplied: null, reversesId: null,
+    }], SEEDS),
+    HOLDER_NAMES,
+  );
+
+  it("charges no fee at all", () => {
+    expect(d.feeIfAllExitCents).toBe(0n);
+    expect(d.rows.every((r) => r.feeIfExitCents === 0n)).toBe(true);
+  });
+
+  it("reports negative profit for every holder", () => {
+    expect(d.rows.map((r) => r.profitCents))
+      .toEqual([c("-1312.71"), c("-1364.84"), c("-1712.02")]);
+  });
+
+  it("still sums holder value to equity exactly", () => {
+    expect(d.rows.reduce((s, r) => s + r.valueCents, 0n)).toBe(c("38110.44"));
+  });
+});
+
+describe("fingerprintOf", () => {
+  it("carries bigints as decimal strings, because a form field is text", () => {
+    const f = fingerprintOf(3, fold(LEDGER, SEEDS));
+    expect(f).toEqual({ accountId: 3, seq: 6, equityCents: "5574391", units: "402224547963043" });
+    expect(typeof f.units).toBe("string");
+  });
+});
+```
+
+**How these bite.**
+
+| Change | What goes red |
+|---|---|
+| `capitalMarks` reads `entry.amountCents` instead of the equity delta | the payout mark test — 2630.60 where 1578.36 is right |
+| `capitalMarks` drops the voided filter | the phantom-step test |
+| `ledgerSteps` keeps a running total instead of folding each prefix | nothing immediately, which is why the `ends where fold(all) ends` and `chains` assertions exist — they are what catches the drift the first time an entry type is added |
+| `ledgerSteps` iterates the array instead of sorting by seq | the shuffled-order test |
+| `deskFigures` uses `allocateValues` for the fee too | Ada's fee moves off 1052.24 |
+| `deskFigures` uses `h.splitBps` from the account default | Grace's 357.43 becomes 386.41 |
+| `previewEntry` drops `assertNavDidNotFall` | nothing on this fixture — which is why `assertNavDidNotFall` has its own six direct tests rather than relying on being reached |
+| `unitsForDeposit` switched to ceil in the engine | `previewEntry` throws and four tests fail at once, which is the cross-module alarm working |
+
+- [ ] **Step 5: Run the gates and prove three probes**
+
+```bash
+pnpm typecheck && pnpm test
+```
+
+Then, one at a time, reverting each:
+
+1. In `capitalMarks`, change `const delta = step.equityDelta` to `const delta = step.entry.amountCents`. Expect exactly the payout-mark test to fail. The three deposit marks still pass, because for a deposit the two agree — which is precisely why the fixture needs a payout in it.
+2. In `deskFigures`, replace `splitBps: h.splitBps` with `splitBps: 4000`. Expect exactly the Grace fee test and the `feeIfAllExitCents` total to fail.
+3. In `allocateShares`, delete the largest-remainder loop and return the floors. Expect the two share-sum assertions in `derive.test.ts` and three in `rail.test.ts` to fail.
+
+---
+
+### Task 4: `lib/compound/ui/` — the statement kit
+
+The components that put figures on a screen. They take engine types and return markup; they read nothing and fetch nothing. That is what makes the arithmetic on screen testable by handing a component a known `PoolState` and reading the cells back.
+
+**Every value in the kit carries an accessible name**, either through real table semantics (`<th scope="col">` and `<th scope="row">`) or through `aria-labelledby` pointing at its own label. This is not test scaffolding that happens to help a screen reader — it is the screen-reader affordance that happens to make the tests possible. Tests locate a figure the way a reader does.
+
+**Files:**
+- Create: `lib/compound/ui/primitives.tsx`
+- Create: `lib/compound/ui/banner.tsx`
+- Create: `lib/compound/ui/rail.tsx`
+- Create: `lib/compound/ui/statement.tsx`
+- Create: `lib/compound/ui/holder-table.tsx`
+- Create: `lib/compound/ui/receipt.tsx`
+- Create: `lib/compound/ui/sheet.tsx`
+- Create: `lib/compound/ui/routes.ts`
+- Test: `lib/compound/ui/purity.test.ts`
+- Test: `lib/compound/ui/holder-table.test.tsx`
+- Test: `lib/compound/ui/statement.test.tsx`
+- Test: `lib/compound/ui/rail.test.tsx`
+- Test: `lib/compound/ui/routes.test.ts`
+
+**Interfaces:**
+- Consumes: everything from `@/lib/compound/present/format`, `@/lib/compound/present/rail`, `@/lib/compound/present/derive`; `Cents`, `Units` from `@/lib/compound/engine/money`; `PoolTotals` from `@/lib/compound/engine/nav`
+- Produces:
+  - `primitives.tsx`: `Panel`, `Eyebrow`, `Money`, `DeltaMoney`, `FeeMoney`, `UnitCount`, `Share`, `Tag`, `Chip`, `EmptyState`, `LabelledFigure`
+  - `banner.tsx`: `InterlockBanner`, `LiveChip`, `Notice`
+  - `rail.tsx`: `OwnershipRail`
+  - `statement.tsx`: `StatementHead`, `KpiStrip`, `type KpiItem`
+  - `holder-table.tsx`: `HolderTable`
+  - `receipt.tsx`: `Receipt`, `ReceiptLine`, `ReceiptTotal`
+  - `sheet.tsx`: `Sheet`, `SheetActions`, `Field`, `FieldError`
+  - `routes.ts`: `deskHref`, `ledgerHref`, `reviewHref`, `holderHref`, `journalHref`, `calendarHref`, `performanceHref`, `SUBNAV`, `activeNavKey`
+
+- [ ] **Step 1: Create `lib/compound/ui/routes.ts`**
+
+```typescript
+/**
+ * Every route in the account shell, in one place, so plan 5's three surfaces
+ * and this plan's five appear in the same nav without either side hard-coding
+ * the other's paths.
+ *
+ * Order is agreed with plan 5: Desk, then the three trading surfaces, then the
+ * two accounting ones. There is no Holders entry — spec section 7 has no
+ * holder index route and the desk's holder table is the index.
+ */
+export const deskHref = (accountId: number) => `/a/${accountId}`;
+export const ledgerHref = (accountId: number) => `/a/${accountId}/ledger`;
+export const reviewHref = (accountId: number) => `/a/${accountId}/review`;
+export const holderHref = (accountId: number, holderId: number) =>
+  `/a/${accountId}/holders/${holderId}`;
+export const journalHref = (accountId: number) => `/a/${accountId}/journal`;
+export const calendarHref = (accountId: number) => `/a/${accountId}/calendar`;
+export const performanceHref = (accountId: number) => `/a/${accountId}/performance`;
+
+export const readingHref = (accountId: number) => `/a/${accountId}/actions/reading`;
+export const investorHref = (accountId: number) => `/a/${accountId}/actions/investor`;
+export const capitalHref = (accountId: number) => `/a/${accountId}/actions/capital`;
+export const payoutHref = (accountId: number, holderId: number) =>
+  `/a/${accountId}/actions/payout/${holderId}`;
+export const classifyHref = (accountId: number, candidateId: number) =>
+  `/a/${accountId}/review/${candidateId}`;
+
+export interface NavEntry {
+  key: string;
+  label: string;
+  href: (accountId: number) => string;
+  /** Only Review carries one. */
+  badge?: "pending";
+}
+
+export const SUBNAV: NavEntry[] = [
+  { key: "desk", label: "Desk", href: deskHref },
+  { key: "journal", label: "Journal", href: journalHref },
+  { key: "calendar", label: "Calendar", href: calendarHref },
+  { key: "performance", label: "Performance", href: performanceHref },
+  { key: "ledger", label: "Ledger", href: ledgerHref },
+  { key: "review", label: "Review", href: reviewHref, badge: "pending" },
+];
+
+/**
+ * Which nav entry a pathname belongs to.
+ *
+ * Longest match wins, so /a/7/ledger is "ledger" and not "desk". A holder
+ * statement and an action sheet both belong to "desk", because that is where
+ * the reader came from and where Back should feel like it leads.
+ */
+export function activeNavKey(pathname: string, accountId: number): string {
+  const base = `/a/${accountId}`;
+  if (!pathname.startsWith(base)) return "";
+  const rest = pathname.slice(base.length).replace(/^\//, "");
+  const first = rest.split("/")[0] ?? "";
+  if (first === "") return "desk";
+  if (first === "holders" || first === "actions") return "desk";
+  return SUBNAV.some((n) => n.key === first) ? first : "";
+}
+```
+
+- [ ] **Step 2: Create `lib/compound/ui/primitives.tsx`**
+
+```tsx
+/**
+ * The smallest pieces. Three money components rather than one with a `tone`
+ * prop, because spec section 8.2 gives three colours three meanings and a
+ * single component with a switch invites a fourth.
+ *
+ *   Money       plain figure, --ink
+ *   DeltaMoney  P/L direction, --gain or --loss, always signed
+ *   FeeMoney    the fee, --fee-ink
+ *
+ * Amber never sets type: --fee is 2.15:1 on white. FeeMoney uses --fee-ink at
+ * 5.02:1. The amber itself appears as fills and chips only.
+ */
+import type { ReactNode } from "react";
+import type { Cents, Units } from "@/lib/compound/engine/money";
+import {
+  formatMoney, formatPpm, formatUnitsDp, signOf,
+} from "@/lib/compound/present/format";
+
+let seq = 0;
+/** Stable within a render pass; only ever used to tie a label to its value. */
+function nextId(prefix: string): string {
+  seq += 1;
+  return `${prefix}-${seq}`;
+}
+
+export function Panel({ children, flush = false }: { children: ReactNode; flush?: boolean }) {
+  return <section className={flush ? "panel flush" : "panel"}>{children}</section>;
+}
+
+export function Eyebrow({ children }: { children: ReactNode }) {
+  return <span className="eyebrow">{children}</span>;
+}
+
+export function Money({ cents, currency = "USD" }: { cents: Cents; currency?: string }) {
+  return <span className="num">{formatMoney(cents, { currency })}</span>;
+}
+
+export function DeltaMoney({ cents, currency = "USD" }: { cents: Cents; currency?: string }) {
+  const sign = signOf(cents);
+  return (
+    <span className={`num ${sign === "neg" ? "neg" : sign === "pos" ? "pos" : ""}`.trim()}>
+      {formatMoney(cents, { currency, sign: "always" })}
+    </span>
+  );
+}
+
+export function FeeMoney({
+  cents, currency = "USD", zeroAs = "figure",
+}: { cents: Cents; currency?: string; zeroAs?: "figure" | "dash" }) {
+  if (cents === 0n && zeroAs === "dash") return <span className="num">—</span>;
+  return <span className="num fee">{formatMoney(cents, { currency })}</span>;
+}
+
+export function UnitCount({ units, dp = 4 }: { units: Units; dp?: number }) {
+  return (
+    <span className="num">
+      {formatUnitsDp(units, dp)}
+      <span className="muted"> units</span>
+    </span>
+  );
+}
+
+export function Share({ ppm }: { ppm: number }) {
+  return <span className="num">{formatPpm(ppm)}</span>;
+}
+
+export function Tag({ children }: { children: ReactNode }) {
+  return <span className="tag">{children}</span>;
+}
+
+export function Chip({ children, tone }: { children: ReactNode; tone?: "live" | "fee" }) {
+  return (
+    <span className={`chip${tone ? ` is-${tone}` : ""}`}>{children}</span>
+  );
+}
+
+export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
+  return (
+    <div style={{ padding: "36px 20px", textAlign: "center" }}>
+      <p style={{ margin: "0 0 6px", fontFamily: "var(--serif)", fontSize: 20 }}>{title}</p>
+      {children ? <p className="muted" style={{ margin: 0, fontSize: 13 }}>{children}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * A label and its figure, tied by aria-labelledby.
+ *
+ * aria-labelledby NAMES the value element without replacing its contents, so a
+ * screen reader announces "Fee if everyone paid out today, $1,409.67" and a
+ * test can ask for the figure by the label a reader would use. aria-label
+ * would suppress the number, which is the opposite of what is wanted.
+ */
+export function LabelledFigure({
+  label, children, className = "", labelClassName = "k", valueClassName = "v num",
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+  labelClassName?: string;
+  valueClassName?: string;
+}) {
+  const id = nextId("lf");
+  return (
+    <div className={className}>
+      <span className={labelClassName} id={id}>{label}</span>
+      <span className={valueClassName} aria-labelledby={id}>{children}</span>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 3: Create `lib/compound/ui/banner.tsx`**
+
+The two states spec §5.2 and §5.3 describe, and the wording plan 5 imports rather than re-phrasing.
+
+```tsx
+/**
+ * Two states that look similar and are not, and conflating them is the bug.
+ *
+ * LiveChip — the figure beside it is intraday, from account_snapshots_current,
+ * and no reading has been posted for it. NAV is fine; the number is simply not
+ * committed. Spec section 5.2.
+ *
+ * InterlockBanner — the reconciler found a balance move that closed trades do
+ * not explain, so readings have STOPPED. Every figure on the account is as of
+ * the frozen date and will stay there until the event is classified. Spec
+ * section 5.3. This is not a staleness warning; it is a refusal to guess.
+ */
+import type { ReactNode } from "react";
+import { formatDate, formatUtcStamp } from "@/lib/compound/present/format";
+import { Chip } from "./primitives";
+
+export function LiveChip({ pushedAt }: { pushedAt: string }) {
+  return (
+    <Chip tone="live">
+      <span>Live · not yet posted</span>
+      <span className="muted"> · {formatUtcStamp(pushedAt)}</span>
+    </Chip>
+  );
+}
+
+export function InterlockBanner({
+  frozenAt, candidateDate, reviewHref,
+}: { frozenAt: string | null; candidateDate: string; reviewHref: string }) {
+  return (
+    <div className="banner-halt" role="status">
+      <strong>Figures frozen at {frozenAt === null ? "inception" : formatDate(frozenAt)}.</strong>{" "}
+      An unexplained balance move on {formatDate(candidateDate)} is waiting to be classified.
+      NAV will not advance past {frozenAt === null ? "inception" : formatDate(frozenAt)} until
+      it is. <a href={reviewHref}>Review it</a>.
+    </div>
+  );
+}
+
+export function Notice({ children }: { children: ReactNode }) {
+  return <div className="banner" role="status">{children}</div>;
+}
+```
+
+- [ ] **Step 4: Create `lib/compound/ui/rail.tsx`**
+
+```tsx
+/**
+ * The ownership rail. Green means the pool, divided — darkest first.
+ *
+ * Widths come from allocateShares, which sums to exactly 1,000,000 ppm, so the
+ * segments fill the rail exactly. Flooring each share leaves a visible gap: on
+ * this project's fixture the floors sum to 999,998.
+ *
+ * The percentage string is built with integer arithmetic. ppm / 10000 as a
+ * float is fine for a CSS length, but there is no reason to introduce one.
+ */
+import type { RailSegment } from "@/lib/compound/present/rail";
+import { formatPpm } from "@/lib/compound/present/format";
+
+function widthPercent(ppm: number): string {
+  return `${Math.trunc(ppm / 10_000)}.${(ppm % 10_000).toString().padStart(4, "0")}%`;
+}
+
+export function OwnershipRail({ segments }: { segments: RailSegment[] }) {
+  if (segments.length === 0) return null;
+  return (
+    <>
+      <div className="rail" role="img" aria-label="Ownership by holder">
+        {segments.map((s) => (
+          <div
+            key={s.holderId}
+            className={s.hatched ? "seg hatched" : "seg"}
+            style={{ width: widthPercent(s.ppm), background: s.tint }}
+          />
+        ))}
+      </div>
+      <ul className="leg" aria-label="Ownership legend">
+        {segments.map((s) => (
+          <li key={s.holderId}>
+            <i style={{ background: s.tint }} aria-hidden="true" />
+            {s.label}
+            {s.isManager ? " (manager)" : ""} <b>{formatPpm(s.ppm)}</b>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+```
+
+- [ ] **Step 5: Create `lib/compound/ui/statement.tsx`**
+
+```tsx
+/**
+ * The statement head and the KPI strip.
+ *
+ * The head shows the COMMITTED equity — the figure from the last posted
+ * reading — as the large number, and the live figure beside it under a label
+ * that says it is not posted. Spec section 5.2 keeps the two apart because a
+ * payout may never settle against a drifting intraday figure, and a screen
+ * that shows only one of them cannot make that distinction visible.
+ */
+import type { Cents } from "@/lib/compound/engine/money";
+import type { PoolTotals } from "@/lib/compound/engine/nav";
+import {
+  formatDate, formatNav, formatSinceInception, formatUnitsDp, splitMoney,
+} from "@/lib/compound/present/format";
+import { LiveChip } from "./banner";
+import { DeltaMoney, Eyebrow, LabelledFigure } from "./primitives";
+
+export interface LiveFigures {
+  equityCents: Cents;
+  floatingPnlCents: Cents;
+  pushedAt: string;
+}
+
+export function StatementHead({
+  totals, currency, asOf, entryCount, holderCount, live,
+}: {
+  totals: PoolTotals;
+  currency: string;
+  asOf: string | null;
+  entryCount: number;
+  holderCount: number;
+  live: LiveFigures | null;
+}) {
+  const { whole, cents } = splitMoney(totals.equityCents, currency);
+  const navUp = totals.units === 0n || formatSinceInception(totals).startsWith("+");
+  return (
+    <>
+      <Eyebrow>
+        Account equity · derived from {entryCount} ledger{" "}
+        {entryCount === 1 ? "entry" : "entries"} ·{" "}
+        {asOf === null ? "no reading posted yet" : `as of ${formatDate(asOf)}`}
+      </Eyebrow>
+      <div className="erow">
+        <p className="equity num" aria-label="Account equity" style={{ margin: "8px 0 0" }}>
+          {whole}
+          <span className="cents">.{cents}</span>
+        </p>
+        <div className="navbox" style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+          <LabelledFigure label="NAV / unit">{formatNav(totals)}</LabelledFigure>
+          <LabelledFigure label="Since inception">
+            <span className={navUp ? "pos" : "neg"}>{formatSinceInception(totals)}</span>
+          </LabelledFigure>
+          <LabelledFigure label="Units issued">{formatUnitsDp(totals.units)}</LabelledFigure>
+          <LabelledFigure label="Holders">{holderCount}</LabelledFigure>
+        </div>
+      </div>
+      {live === null ? null : (
+        <p style={{ margin: "14px 0 0", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <LiveChip pushedAt={live.pushedAt} />
+          <LabelledFigure
+            label="Live equity"
+            className=""
+            labelClassName="eyebrow"
+            valueClassName="num"
+          >
+            {splitMoney(live.equityCents, currency).whole}.
+            {splitMoney(live.equityCents, currency).cents}
+          </LabelledFigure>
+          <LabelledFigure
+            label="Floating P/L"
+            className=""
+            labelClassName="eyebrow"
+            valueClassName="num"
+          >
+            <DeltaMoney cents={live.floatingPnlCents} currency={currency} />
+          </LabelledFigure>
+        </p>
+      )}
+    </>
+  );
+}
+
+export interface KpiItem {
+  key: string;
+  label: string;
+  value: React.ReactNode;
+  /** `fee` paints the tile amber. Reserved for the fee, per spec section 8.2. */
+  tone?: "fee";
+}
+
+export function KpiStrip({ items }: { items: KpiItem[] }) {
+  return (
+    <div className="kpi">
+      {items.map((i) => (
+        <LabelledFigure
+          key={i.key}
+          label={i.label}
+          className={i.tone === "fee" ? "kpi-item is-fee" : "kpi-item"}
+        >
+          {i.value}
+        </LabelledFigure>
+      ))}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Create `lib/compound/ui/holder-table.tsx`**
+
+```tsx
+/**
+ * The holder table. Every figure here is ALLOCATED (decision D-A): the value
+ * column sums to account equity exactly, because invariant 2 says it does.
+ *
+ * A holder's payout receipt shows a floored value that can be one cent lower.
+ * That is correct on both screens and the holder statement page explains it in
+ * words. Do not make them agree here.
+ *
+ * Real table semantics throughout: scope="col" on headers, scope="row" on the
+ * holder name. That is how a screen reader associates $12,630.61 with "Ada
+ * Lovelace, Value now", and it is how the tests find it too.
+ */
+import type { DeskFigures } from "@/lib/compound/present/derive";
+import { formatSplit, formatUnitsDp } from "@/lib/compound/present/format";
+import { DeltaMoney, FeeMoney, Money, Share, Tag } from "./primitives";
+import { holderHref, payoutHref } from "./routes";
+
+export function HolderTable({
+  accountId, figures, currency, showActions = true,
+}: {
+  accountId: number;
+  figures: DeskFigures;
+  currency: string;
+  showActions?: boolean;
+}) {
+  const investorProfit = figures.investorValueCents - figures.investorBasisCents;
+  return (
+    <div className="scroller">
+      <table>
+        <caption className="eyebrow">Holders</caption>
+        <thead>
+          <tr>
+            <th scope="col">Holder</th>
+            <th scope="col">Capital in</th>
+            <th scope="col">Units</th>
+            <th scope="col">Share</th>
+            <th scope="col">Value now</th>
+            <th scope="col">P/L</th>
+            <th scope="col">Split</th>
+            <th scope="col">Fee if paid out</th>
+            {showActions ? <th scope="col">&nbsp;</th> : null}
+          </tr>
+        </thead>
+        <tbody>
+          {figures.rows.map((r) => (
+            <tr
+              key={r.holderId}
+              className={r.isManager ? "own" : r.status === "closed" ? "closed" : ""}
+            >
+              <th scope="row" style={{ fontWeight: 400 }}>
+                <a href={holderHref(accountId, r.holderId)}>{r.name}</a>
+                {r.isManager ? <Tag>Manager</Tag> : null}
+                {r.status === "closed" ? <Tag>Closed</Tag> : null}
+              </th>
+              <td><Money cents={r.basisCents} currency={currency} /></td>
+              <td className="num">{r.units === 0n ? "—" : formatUnitsDp(r.units)}</td>
+              <td><Share ppm={r.ppm} /></td>
+              <td><Money cents={r.valueCents} currency={currency} /></td>
+              <td><DeltaMoney cents={r.profitCents} currency={currency} /></td>
+              <td className="num">{r.isManager ? "—" : formatSplit(r.splitBps)}</td>
+              <td><FeeMoney cents={r.feeIfExitCents} currency={currency} zeroAs="dash" /></td>
+              {showActions ? (
+                <td>
+                  {r.status === "active" && r.units > 0n ? (
+                    <a className="btn" href={payoutHref(accountId, r.holderId)}>Pay out</a>
+                  ) : null}
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr>
+            <th scope="row" style={{ fontWeight: 600 }}>Investors, active</th>
+            <td><Money cents={figures.investorBasisCents} currency={currency} /></td>
+            <td />
+            <td />
+            <td><Money cents={figures.investorValueCents} currency={currency} /></td>
+            <td><DeltaMoney cents={investorProfit} currency={currency} /></td>
+            <td />
+            <td><FeeMoney cents={figures.feeIfAllExitCents} currency={currency} /></td>
+            {showActions ? <td /> : null}
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 7: Create `lib/compound/ui/receipt.tsx`**
+
+The component the whole product turns on. See Task 13 for the payout receipt's exact wording; this is the frame it renders in.
+
+```tsx
+/**
+ * A receipt: label on the left, figure on the right, one line per fact, and a
+ * total that is visually distinct from every line above it.
+ *
+ * Every line carries a sub-label slot. The payout receipt uses it to say what
+ * an accounting term means in plain words — "What Ada has put in" with "her
+ * high-water mark: profit is measured against this" underneath — because the
+ * person who reads this back in a dispute is not an accountant.
+ */
+import type { ReactNode } from "react";
+
+export function Receipt({ children, label }: { children: ReactNode; label: string }) {
+  return (
+    <dl className="receipt" aria-label={label}>
+      {children}
+    </dl>
+  );
+}
+
+export function ReceiptLine({
+  label, hint, children, tone,
+}: {
+  label: string;
+  hint?: ReactNode;
+  children: ReactNode;
+  /** `fee` paints the line amber. Reserved for the fee. */
+  tone?: "fee";
+}) {
+  const id = `rl-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+  return (
+    <div className={tone === "fee" ? "receipt-line is-fee" : "receipt-line"}>
+      <dt className="l" id={id}>
+        {label}
+        {hint ? <small>{hint}</small> : null}
+      </dt>
+      <dd className="r" aria-labelledby={id} style={{ margin: 0 }}>{children}</dd>
+    </div>
+  );
+}
+
+export function ReceiptTotal({
+  label, hint, children,
+}: { label: string; hint?: ReactNode; children: ReactNode }) {
+  const id = `rt-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+  return (
+    <div className="receipt-line receipt-total">
+      <dt className="l" id={id}>
+        {label}
+        {hint ? <small>{hint}</small> : null}
+      </dt>
+      <dd className="r" aria-labelledby={id} style={{ margin: 0 }}>{children}</dd>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 8: Create `lib/compound/ui/sheet.tsx`**
+
+```tsx
+/**
+ * The frame every money flow renders in. A route, not an overlay (decision
+ * D-B): no parallel routes, no interception, no client state. A half-finished
+ * flow is a URL that can be reopened, and the back button does what it looks
+ * like it does.
+ */
+import type { ReactNode } from "react";
+
+export function Sheet({
+  title, lede, children, backHref, backLabel = "Cancel",
+}: {
+  title: string;
+  lede?: ReactNode;
+  children: ReactNode;
+  backHref: string;
+  backLabel?: string;
+}) {
+  return (
+    <div className="sheet-scrim">
+      <div className="sheet">
+        <h1>{title}</h1>
+        {lede ? <p className="lede">{lede}</p> : null}
+        {children}
+        <p style={{ marginTop: 22, marginBottom: 0 }}>
+          <a href={backHref}>{backLabel}</a>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export function SheetActions({ children }: { children: ReactNode }) {
+  return <div className="actions">{children}</div>;
+}
+
+export function Field({
+  name, label, hint, children,
+}: { name: string; label: string; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <label className="field" htmlFor={name}>
+      <span>{label}</span>
+      {children}
+      {hint ? <small className="muted" style={{ display: "block", marginTop: 4 }}>{hint}</small> : null}
+    </label>
+  );
+}
+
+export function FieldError({ children }: { children: ReactNode }) {
+  return (
+    <div className="field-error" role="alert">
+      <strong>Nothing was committed.</strong> {children}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 9: Write `lib/compound/ui/purity.test.ts`**
+
+```typescript
+/**
+ * ui/ renders. It does not read.
+ *
+ * If a component can reach the database, then testing what it renders means
+ * standing up a database, which means the arithmetic tests get slow and then
+ * get skipped. Every component in here takes engine types as props and the
+ * route decides where they came from.
+ */
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+const DIR = __dirname;
+const FORBIDDEN: [RegExp, string][] = [
+  [/from\s+["']@\/lib\/compound\/db/, "the db layer"],
+  [/from\s+["']@\/lib\/compound\/load/, "the loaders"],
+  [/from\s+["']pg["']/, "pg"],
+  [/from\s+["']next\/headers["']/, "next/headers"],
+  [/from\s+["']@supabase/, "supabase"],
+  [/\bnew Date\b/, "new Date"],
+  [/\bDate\.now\b/, "Date.now"],
+];
+
+function sources(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) { out.push(...sources(full)); continue; }
+    if (!/\.tsx?$/.test(name)) continue;
+    if (/\.test\.tsx?$/.test(name)) continue;
+    out.push(full);
+  }
+  return out;
+}
+
+describe("ui/ purity", () => {
+  it("has sources to check", () => {
+    expect(sources(DIR).length).toBeGreaterThan(0);
+  });
+
+  it.each(FORBIDDEN)("imports nothing matching %s (%s)", (pattern, label) => {
+    const offenders = sources(DIR).filter((f) => pattern.test(readFileSync(f, "utf8")));
+    expect({ label, offenders }).toEqual({ label, offenders: [] });
+  });
+
+  it("declares no client component that takes a bigint prop", () => {
+    // A bigint does not survive the server/client boundary and a formatted
+    // string is not a value. If a component ever needs "use client", its
+    // money props must be decimal strings.
+    const offenders = sources(DIR)
+      .map((f) => [f, readFileSync(f, "utf8")] as const)
+      .filter(([, src]) => /^["']use client["']/m.test(src))
+      .filter(([, src]) => /:\s*(Cents|Units|bigint)\b/.test(src))
+      .map(([f]) => f);
+    expect(offenders).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 10: Write `lib/compound/ui/holder-table.test.tsx`**
+
+This is the shape every component test in this plan follows: a known `PoolState` in, figures out, located the way a reader locates them.
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import { fold } from "@/lib/compound/engine/replay";
+import { deskFigures } from "@/lib/compound/present/derive";
+import { ADA_ID, GRACE_ID, HOLDER_NAMES, LEDGER, SEEDS } from "@/lib/compound/present/fixture";
+import { HolderTable } from "./holder-table";
+
+const FIGURES = deskFigures(fold(LEDGER, SEEDS), HOLDER_NAMES);
+
+function cells(holderName: string): string[] {
+  const row = screen.getByRole("row", { name: new RegExp(holderName) });
+  return [
+    ...within(row).getAllByRole("rowheader"),
+    ...within(row).getAllByRole("cell"),
+  ].map((c) => c.textContent ?? "");
+}
+
+beforeEach(() => {
+  render(<HolderTable accountId={7} figures={FIGURES} currency="USD" />);
+});
+
+describe("HolderTable — the figures", () => {
+  it("renders Ada's row exactly", () => {
+    expect(cells("Ada Lovelace")).toEqual([
+      "Ada Lovelace",
+      "$10,000.00",
+      "9,113.7132",
+      "22.66%",
+      "$12,630.61",
+      "+$2,630.61",
+      "60 / 40",
+      "$1,052.24",
+      "Pay out",
+    ]);
+  });
+
+  it("renders Grace's row with her own 63 / 37 split and the fee it produces", () => {
+    // Grace is 3700 bps. At the 4000 default her fee would read $386.41.
+    const c = cells("Grace Hopper");
+    expect(c[6]).toBe("63 / 37");
+    expect(c[7]).toBe("$357.43");
+  });
+
+  it("shows the manager no split and no fee", () => {
+    const c = cells("J. Marsh");
+    expect(c[6]).toBe("—");
+    expect(c[7]).toBe("—");
+  });
+
+  it("totals investors, excluding the manager", () => {
+    const foot = screen.getByRole("row", { name: /Investors, active/ });
+    const c = [
+      ...within(foot).getAllByRole("rowheader"),
+      ...within(foot).getAllByRole("cell"),
+    ].map((x) => x.textContent ?? "");
+    expect(c[1]).toBe("$17,500.00");   // capital in
+    expect(c[4]).toBe("$21,096.65");   // value now
+    expect(c[5]).toBe("+$3,596.65");   // P/L
+    expect(c[7]).toBe("$1,409.67");    // fee if all paid out
+  });
+
+  it("sums the value column to account equity, to the cent", () => {
+    const values = ["J. Marsh", "Ada Lovelace", "Grace Hopper"]
+      .map((n) => cells(n)[4]!)
+      .map((s) => BigInt(s.replace(/[^0-9]/g, "")));
+    expect(values.reduce((a, b) => a + b, 0n)).toBe(5_574_391n);
+  });
+
+  it("sums the share column to 100.00 percent", () => {
+    const shares = ["J. Marsh", "Ada Lovelace", "Grace Hopper"]
+      .map((n) => Number(cells(n)[3]!.replace("%", "")));
+    expect(shares.reduce((a, b) => a + b, 0)).toBeCloseTo(100, 2);
+  });
+
+  it("marks the manager's row and only the manager's row", () => {
+    expect(within(screen.getByRole("row", { name: /J. Marsh/ })).getByText("Manager"))
+      .toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /Ada Lovelace/ })).queryByText("Manager"))
+      .toBeNull();
+  });
+
+  it("links each holder to their statement and offers a payout", () => {
+    const row = screen.getByRole("row", { name: /Ada Lovelace/ });
+    expect(within(row).getByRole("link", { name: "Ada Lovelace" }))
+      .toHaveAttribute("href", `/a/7/holders/${ADA_ID}`);
+    expect(within(row).getByRole("link", { name: "Pay out" }))
+      .toHaveAttribute("href", `/a/7/actions/payout/${ADA_ID}`);
+  });
+
+  it("gives every column a header, so a figure is never orphaned", () => {
+    expect(screen.getAllByRole("columnheader").map((h) => h.textContent)).toEqual([
+      "Holder", "Capital in", "Units", "Share", "Value now",
+      "P/L", "Split", "Fee if paid out", " ",
+    ]);
+  });
+});
+
+describe("HolderTable — a pool under water", () => {
+  it("shows every P/L negative and every fee as a dash", () => {
+    const under = deskFigures(
+      fold([...LEDGER, {
+        id: 7, seq: 7, holderId: null, occurredOn: "2026-08-18",
+        type: "equity_reading" as const, amountCents: 3_811_044n,
+        feeSettlement: null, splitBpsApplied: null, reversesId: null,
+      }], SEEDS),
+      HOLDER_NAMES,
+    );
+    render(<HolderTable accountId={7} figures={under} currency="USD" />);
+    const rows = screen.getAllByRole("row", { name: /Hopper/ });
+    const c = [
+      ...within(rows[rows.length - 1]!).getAllByRole("rowheader"),
+      ...within(rows[rows.length - 1]!).getAllByRole("cell"),
+    ].map((x) => x.textContent ?? "");
+    expect(c[5]).toBe("-$1,712.02");
+    expect(c[7]).toBe("—");
+  });
+});
+
+describe("HolderTable — currency", () => {
+  it("uses the account's symbol, not a hard-coded dollar", () => {
+    render(<HolderTable accountId={7} figures={FIGURES} currency="EUR" />);
+    expect(screen.getAllByRole("row", { name: /Ada Lovelace/ }).at(-1)!.textContent)
+      .toContain("€12,630.61");
+  });
+});
+```
+
+**How these bite.** This is the block the brief calls the point of the exercise, so each assertion's failure mode is named:
+
+| Change | What goes red |
+|---|---|
+| swap `valueCents` for a floored value | Ada's row reads `$12,630.60`; the equity-sum test reads `5,574,389n` |
+| hard-code the split at 4000 | Grace's split and fee cells |
+| charge the manager a fee | the manager's `—` becomes a figure |
+| include the manager in the investor totals | all four footer figures |
+| use floored shares instead of allocated | the share column sums to 99.99 |
+| drop `scope="row"` from the holder name | every `getByRole("row", { name: … })` stops finding its row — the accessibility regression and the test failure are the same event |
+| render `Money` where `DeltaMoney` belongs | the `+` disappears from the P/L cells and three tests fail |
+| hard-code `$` | the EUR test |
+
+- [ ] **Step 11: Write `lib/compound/ui/statement.test.tsx` and `rail.test.tsx`**
+
+```tsx
+// lib/compound/ui/statement.test.tsx
+import { render, screen } from "@testing-library/react";
+import { fold, totalsOf } from "@/lib/compound/engine/replay";
+import { deskFigures } from "@/lib/compound/present/derive";
+import { HOLDER_NAMES, LEDGER, LIVE, SEEDS } from "@/lib/compound/present/fixture";
+import { Money, FeeMoney, DeltaMoney } from "./primitives";
+import { KpiStrip, StatementHead } from "./statement";
+
+const STATE = fold(LEDGER, SEEDS);
+const FIGURES = deskFigures(STATE, HOLDER_NAMES);
+
+describe("StatementHead", () => {
+  beforeEach(() => {
+    render(
+      <StatementHead
+        totals={totalsOf(STATE)}
+        currency="USD"
+        asOf={STATE.lastReadingOn}
+        entryCount={LEDGER.length}
+        holderCount={FIGURES.holderCount}
+        live={LIVE}
+      />,
+    );
+  });
+
+  it("shows the committed equity as the headline figure", () => {
+    expect(screen.getByLabelText("Account equity").textContent).toBe("$55,743.91");
+  });
+
+  it("shows NAV per unit at four places", () => {
+    expect(screen.getByLabelText("NAV / unit").textContent).toBe("1.3858");
+  });
+
+  it("shows growth since inception, signed", () => {
+    expect(screen.getByLabelText("Since inception").textContent).toBe("+38.58%");
+  });
+
+  it("shows units issued and the holder count", () => {
+    expect(screen.getByLabelText("Units issued").textContent).toBe("40,222.4547");
+    expect(screen.getByLabelText("Holders").textContent).toBe("3");
+  });
+
+  it("says how many ledger entries the figure came from and as of when", () => {
+    expect(screen.getByText(/derived from 6 ledger entries · as of 14 Aug 2026/))
+      .toBeInTheDocument();
+  });
+
+  it("labels the live figure as not posted, and keeps it apart from equity", () => {
+    // 55,930.00 is the live equity. It must never appear as the headline.
+    expect(screen.getByLabelText("Account equity").textContent).not.toContain("55,930");
+    expect(screen.getByLabelText("Live equity").textContent).toBe("$55,930.00");
+    expect(screen.getByText(/Live · not yet posted/)).toBeInTheDocument();
+    expect(screen.getByText(/18 Aug 2026, 09:14 UTC/)).toBeInTheDocument();
+  });
+
+  it("shows floating P/L with a sign", () => {
+    expect(screen.getByLabelText("Floating P/L").textContent).toBe("+$125.00");
+  });
+});
+
+describe("StatementHead — before any reading is posted", () => {
+  it("says so rather than printing a date", () => {
+    const empty = fold([], SEEDS);
+    render(
+      <StatementHead
+        totals={totalsOf(empty)} currency="USD" asOf={null}
+        entryCount={0} holderCount={0} live={null}
+      />,
+    );
+    expect(screen.getByText(/derived from 0 ledger entries · no reading posted yet/))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText("NAV / unit").textContent).toBe("1.0000");
+  });
+});
+
+describe("KpiStrip", () => {
+  it("labels each figure so it can be read without its neighbours", () => {
+    render(
+      <KpiStrip
+        items={[
+          { key: "in", label: "Investor capital in", value: <Money cents={FIGURES.investorBasisCents} /> },
+          { key: "val", label: "Investor value now", value: <Money cents={FIGURES.investorValueCents} /> },
+          { key: "pl", label: "Investor P/L", value: <DeltaMoney cents={FIGURES.investorProfitCents} /> },
+          { key: "fee", label: "Fee if everyone paid out today", tone: "fee",
+            value: <FeeMoney cents={FIGURES.feeIfAllExitCents} /> },
+        ]}
+      />,
+    );
+    expect(screen.getByLabelText("Investor capital in").textContent).toBe("$17,500.00");
+    expect(screen.getByLabelText("Investor value now").textContent).toBe("$21,096.65");
+    expect(screen.getByLabelText("Investor P/L").textContent).toBe("+$3,596.65");
+    expect(screen.getByLabelText("Fee if everyone paid out today").textContent).toBe("$1,409.67");
+  });
+
+  it("paints only the fee tile amber", () => {
+    const { container } = render(
+      <KpiStrip items={[
+        { key: "a", label: "Investor capital in", value: <Money cents={1n} /> },
+        { key: "b", label: "Fee if everyone paid out today", tone: "fee", value: <FeeMoney cents={1n} /> },
+      ]} />,
+    );
+    expect(container.querySelectorAll(".kpi-item.is-fee")).toHaveLength(1);
+  });
+});
+```
+
+```tsx
+// lib/compound/ui/rail.test.tsx
+import { render, screen } from "@testing-library/react";
+import { fold } from "@/lib/compound/engine/replay";
+import { railSegments } from "@/lib/compound/present/rail";
+import { HOLDER_NAMES, LEDGER, SEEDS } from "@/lib/compound/present/fixture";
+import { OwnershipRail } from "./rail";
+
+const SEGMENTS = railSegments(fold(LEDGER, SEEDS), HOLDER_NAMES);
+
+describe("OwnershipRail", () => {
+  it("fills the rail exactly — the widths sum to 100 percent", () => {
+    const { container } = render(<OwnershipRail segments={SEGMENTS} />);
+    const widths = [...container.querySelectorAll<HTMLElement>(".seg")]
+      .map((s) => Number(s.style.width.replace("%", "")));
+    expect(widths.reduce((a, b) => a + b, 0)).toBeCloseTo(100, 4);
+  });
+
+  it("gives the manager the darkest segment", () => {
+    const { container } = render(<OwnershipRail segments={SEGMENTS} />);
+    const first = container.querySelector<HTMLElement>(".seg")!;
+    expect(first.style.background).toBe("rgb(20, 83, 45)");   // #14532d
+  });
+
+  it("labels every segment with a name and a percentage", () => {
+    render(<OwnershipRail segments={SEGMENTS} />);
+    const items = screen.getByRole("list", { name: "Ownership legend" });
+    expect(items.textContent).toContain("J. Marsh (manager)");
+    expect(items.textContent).toContain("62.15%");
+    expect(items.textContent).toContain("Ada Lovelace");
+    expect(items.textContent).toContain("22.66%");
+    expect(items.textContent).toContain("Grace Hopper");
+    expect(items.textContent).toContain("15.19%");
+  });
+
+  it("names the rail for a screen reader rather than leaving a bare div", () => {
+    render(<OwnershipRail segments={SEGMENTS} />);
+    expect(screen.getByRole("img", { name: "Ownership by holder" })).toBeInTheDocument();
+  });
+
+  it("renders nothing at all when no one holds units", () => {
+    const { container } = render(<OwnershipRail segments={[]} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+});
+```
+
+- [ ] **Step 12: Write `lib/compound/ui/routes.test.ts`**
+
+```typescript
+import { SUBNAV, activeNavKey, deskHref, holderHref, payoutHref } from "./routes";
+
+describe("SUBNAV", () => {
+  it("carries the six agreed entries in the agreed order", () => {
+    expect(SUBNAV.map((n) => n.key))
+      .toEqual(["desk", "journal", "calendar", "performance", "ledger", "review"]);
+  });
+
+  it("has no Holders entry — the desk table is the index", () => {
+    expect(SUBNAV.some((n) => n.key === "holders")).toBe(false);
+  });
+
+  it("badges Review and nothing else", () => {
+    expect(SUBNAV.filter((n) => n.badge).map((n) => n.key)).toEqual(["review"]);
+  });
+
+  it("builds every href from the account id", () => {
+    expect(SUBNAV.map((n) => n.href(7))).toEqual([
+      "/a/7", "/a/7/journal", "/a/7/calendar", "/a/7/performance", "/a/7/ledger", "/a/7/review",
+    ]);
+  });
+});
+
+describe("activeNavKey", () => {
+  it.each([
+    ["/a/7", "desk"],
+    ["/a/7/", "desk"],
+    ["/a/7/ledger", "ledger"],
+    ["/a/7/review", "review"],
+    ["/a/7/review/12", "review"],
+    ["/a/7/journal", "journal"],
+    ["/a/7/holders/2", "desk"],
+    ["/a/7/actions/payout/2", "desk"],
+  ])("maps %s to %s", (path, key) => {
+    expect(activeNavKey(path, 7)).toBe(key);
+  });
+
+  it("does not match another account's path", () => {
+    expect(activeNavKey("/a/8/ledger", 7)).toBe("");
+  });
+
+  it("does not match a prefix collision", () => {
+    // /a/71 starts with /a/7. A naive startsWith on the id alone gets this
+    // wrong and highlights the wrong tab on every page of account 71.
+    expect(activeNavKey("/a/71/ledger", 7)).toBe("");
+  });
+
+  it("returns empty for an unknown segment rather than guessing", () => {
+    expect(activeNavKey("/a/7/settings", 7)).toBe("");
+  });
+});
+
+describe("href builders", () => {
+  it("builds the routes the sheets and tables link to", () => {
+    expect(deskHref(7)).toBe("/a/7");
+    expect(holderHref(7, 2)).toBe("/a/7/holders/2");
+    expect(payoutHref(7, 2)).toBe("/a/7/actions/payout/2");
+  });
+});
+```
+
+> **The prefix-collision test fails against the implementation in Step 1.** `"/a/71/ledger".startsWith("/a/7")` is `true`, so `activeNavKey` returns `"ledger"` for account 7. Fix it before moving on: compare the segment, not the prefix.
+>
+> ```typescript
+> export function activeNavKey(pathname: string, accountId: number): string {
+>   const parts = pathname.split("/").filter((p) => p !== "");
+>   if (parts[0] !== "a" || parts[1] !== String(accountId)) return "";
+>   const first = parts[2] ?? "";
+>   if (first === "") return "desk";
+>   if (first === "holders" || first === "actions") return "desk";
+>   return SUBNAV.some((n) => n.key === first) ? first : "";
+> }
+> ```
+
+- [ ] **Step 13: Run the gates and prove three probes**
+
+```bash
+pnpm typecheck && pnpm test
+```
+
+Then, one at a time, reverting each:
+
+1. In `deskFigures`, change `valueCents: values[i]!` to the floored value from `quote`. Expect Ada's row assertion and the equity-sum assertion in `holder-table.test.tsx` to fail, and nothing else.
+2. In `HolderTable`, change `<th scope="row">` to `<td>`. Expect every `getByRole("row", { name: … })` lookup to fail. This is the test suite noticing an accessibility regression, which is the only kind of a11y check worth having.
+3. In `StatementHead`, render `live.equityCents` as the headline. Expect the "must never appear as the headline" assertion to fail. That assertion exists because showing a live figure where a committed one belongs is spec §5.2's exact failure.
+
+---
+
+### Task 5: The gate, the loaders, and the broker offset
+
+Everything between a URL and a `PoolState`. Three concerns, one task, because none of them is testable without the others: the session gate decides who is asking, the account resolver decides what they may see, and the loaders fetch it once per request.
+
+**The gate matters more than it looks.** Plan 3's decision P4 makes every pooled connection run as `service_role`, which carries `BYPASSRLS`. The RLS policies plan 3 wrote are real and are defence in depth for any other client, but **they are not what protects these pages**. Shipping routes that lean on a policy the connection bypasses would be the twelfth unfalsifiable safety net in this project. Spec §9's AND gate is therefore implemented here, in application code, and tested here.
+
+**Files:**
+- Create: `supabase/migrations/<generated>_compound_account_broker_offset.sql`
+- Modify: `lib/compound/db/compound.ts`
+- Create: `lib/compound/db/holders.ts`
+- Create: `lib/compound/db/users.ts`
+- Create: `lib/compound/load/supabase.ts`
+- Create: `lib/compound/load/session.ts`
+- Create: `lib/compound/load/account.ts`
+- Create: `lib/compound/load/ledger.ts`
+- Create: `lib/compound/load/interlock.ts`
+- Create: `middleware.ts`
+- Create: `app/sign-in/page.tsx`
+- Modify: `.env.example`
+- Test: `lib/compound/db/holders.db.test.ts`
+- Test: `lib/compound/load/gate.db.test.ts`
+
+**Interfaces:**
+- Consumes: `getAccountById`, `listAccountsForManager`, `getHolderSeeds`, `getLedgerEntries`, `getReconcileCursor`, `listCandidates` from `@/lib/compound/db/compound`; `getLiveSnapshot` from `@/lib/compound/db/copytraderx`; `withDb` from `@/lib/compound/db/client`; `fold` from `@/lib/compound/engine/replay`
+- Produces:
+  - `interface SessionUser { id: string; email: string | null }`
+  - `requireManager(): Promise<SessionUser>`
+  - `interface ResolvedAccount { id; mt5Account; label; broker; currency; defaultSplitBps; inceptionDate; managerUserId; brokerOffsetHours }`
+  - `requireAccount(idParam: string): Promise<ResolvedAccount>`
+  - `listManagerAccounts(): Promise<ResolvedAccount[]>`
+  - `interface HolderRow { id; accountId; name; email; userId; isManager; splitBps; joinedAt; status }`
+  - `listHolders(c: Queryable, accountId: number): Promise<HolderRow[]>`
+  - `loadLedger(accountId: number): Promise<LedgerEntry[]>`
+  - `loadSeeds(accountId: number): Promise<HolderSeed[]>`
+  - `loadHolderNames(accountId: number): Promise<Record<number, string>>`
+  - `loadPoolState(accountId: number): Promise<PoolState>`
+  - `loadLive(mt5Account: number): Promise<LiveFigures | null>`
+  - `interface InterlockState { frozenAt; pendingCandidateDate; pendingCount }`
+  - `loadInterlock(accountId: number): Promise<InterlockState>`
+
+> **Decision D-M, closing plan 3's carried-forward gap.** `compound_holder.status` is stored *and* derived. **No screen reads the stored column** — `fold` decides a holder's status, and `HolderRow.status` exists only so the database is not misleading to someone reading it directly. Task 13's exit writer updates the column inside the same transaction as the exit entry, and its integration test asserts the stored value and `fold`'s value agree. Plan 3 could not write that test because none of its fixtures had a payout; this plan's do.
+
+- [ ] **Step 1: Add the broker offset column**
+
+```bash
+supabase migration new compound_account_broker_offset
+```
+
+```sql
+-- ============================================================================
+-- The broker's UTC offset, per account.
+-- ============================================================================
+--
+-- reconcile/dedupe.ts groups duplicate deals on (symbol, side, volume, profit,
+-- swap) and keeps the lowest ticket where close times differ by exactly the
+-- broker's offset. The offset is a property of the broker's server, so it
+-- belongs on the account and not in configuration.
+--
+-- NULLABLE, and with NO DEFAULT, deliberately. A default of 0 would mean "no
+-- shift", and dedupe at a zero shift is a no-op — so a brand-new account would
+-- silently run with duplicate-deal protection disabled and nobody would know.
+-- Null means NOT CONFIGURED, and the application refuses to reconcile until it
+-- is set. Reconciling undeduplicated inflates the explained figure and can hide
+-- a real capital event, which is the most expensive failure this product has.
+--
+-- Range is -12..14, the real span of UTC offsets. Brokers are commonly at +2 or
+-- +3; the sign is kept because the column describes the server, not the
+-- correction, and dedupeDeals is passed the magnitude.
+-- ============================================================================
+
+alter table public.compound_account
+  add column broker_offset_hours int;
+
+alter table public.compound_account
+  add constraint compound_account_broker_offset_hours_range
+  check (broker_offset_hours is null or broker_offset_hours between -12 and 14);
+
+comment on column public.compound_account.broker_offset_hours is
+  'Broker server UTC offset in hours. NULL means not configured, and disables '
+  'reconciliation rather than running the duplicate-deal guard as a no-op.';
+```
+
+- [ ] **Step 2: Carry the column through plan 3's account reader**
+
+Edit `lib/compound/db/compound.ts`. Four edits, all mechanical:
+
+```typescript
+// 1. the interface
+export interface CompoundAccount {
+  id: number;
+  mt5Account: number;
+  label: string;
+  broker: string | null;
+  currency: string;
+  defaultSplitBps: number;
+  /** YYYY-MM-DD. */
+  inceptionDate: string;
+  /** public.users id. */
+  managerUserId: string;
+  /** Broker server UTC offset. Null means not configured; see the migration. */
+  brokerOffsetHours: number | null;
+}
+
+// 2. the column list
+const ACCOUNT_COLUMNS = `
+  id,
+  mt5_account,
+  label,
+  broker,
+  currency,
+  default_split_bps,
+  ${dateKeyExpr("inception_date")} as inception_date,
+  manager_user_id,
+  broker_offset_hours
+`;
+
+// 3. the row type
+interface AccountRow {
+  id: string;
+  mt5_account: string;
+  label: string;
+  broker: string | null;
+  currency: string;
+  default_split_bps: number;
+  inception_date: string;
+  manager_user_id: string;
+  broker_offset_hours: number | null;
+}
+
+// 4. the mapper gains one line
+//    brokerOffsetHours: r.broker_offset_hours,
+```
+
+- [ ] **Step 3: Create `lib/compound/db/holders.ts`**
+
+Plan 3 reads holder *seeds* — the three fields `fold` needs. Screens need names and terms too.
+
+```typescript
+/**
+ * Holder identity and terms.
+ *
+ * getHolderSeeds (plan 3) returns what fold needs and nothing else, on purpose:
+ * it must not be able to disagree with the engine. This reader returns what a
+ * SCREEN needs — names, contact, joined date, the stored status.
+ *
+ * The stored status is returned and never used to decide anything. fold derives
+ * a holder's status from the ledger, and a stored column that can drift from a
+ * derived one is exactly the second truth D7 exists to avoid. See decision D-M.
+ */
+import type { Queryable } from "./types";
+import { dateKeyExpr, toId } from "./sql";
+
+export interface HolderRow {
+  id: number;
+  accountId: number;
+  name: string;
+  email: string | null;
+  /** public.users id, set when portal access lands in v2. */
+  userId: string | null;
+  isManager: boolean;
+  splitBps: number;
+  /** YYYY-MM-DD, or null. */
+  joinedAt: string | null;
+  /** STORED. Never read to decide anything — fold decides. See decision D-M. */
+  status: "active" | "closed";
+}
+
+interface Row {
+  id: string;
+  account_id: string;
+  name: string;
+  email: string | null;
+  user_id: string | null;
+  is_manager: boolean;
+  split_bps: number;
+  joined_at: string | null;
+  status: string;
+}
+
+export async function listHolders(c: Queryable, accountId: number): Promise<HolderRow[]> {
+  const { rows } = await c.query<Row>(
+    `select id, account_id, name, email, user_id, is_manager, split_bps,
+            ${dateKeyExpr("joined_at")} as joined_at, status
+       from public.compound_holder
+      where account_id = $1
+      order by is_manager desc, id asc`,
+    [accountId],
+  );
+  return rows.map((r) => {
+    if (r.status !== "active" && r.status !== "closed") {
+      throw new Error(`compound_holder.status is ${JSON.stringify(r.status)} for holder ${r.id}`);
+    }
+    return {
+      id: toId(r.id, "compound_holder.id"),
+      accountId: toId(r.account_id, "compound_holder.account_id"),
+      name: r.name,
+      email: r.email,
+      userId: r.user_id,
+      isManager: r.is_manager,
+      splitBps: r.split_bps,
+      joinedAt: r.joined_at,
+      status: r.status,
+    };
+  });
+}
+```
+
+- [ ] **Step 4: Create `lib/compound/db/users.ts`**
+
+```typescript
+/**
+ * The application-level role, read once per request as a cross-check on the
+ * JWT claim.
+ *
+ * Spec section 9's policies read the claim, so the claim is authoritative. This
+ * reader exists to catch the one misconfiguration that is otherwise silent: a
+ * user whose JWT says admin and whose public.users row does not, or the
+ * reverse. Under D1 there is one admin and the two can only disagree by
+ * accident — which is exactly when you want to hear about it.
+ */
+import type { Queryable } from "./types";
+
+export async function getUserRole(c: Queryable, userId: string): Promise<string | null> {
+  const { rows } = await c.query<{ role: string }>(
+    `select role from public.users where id = $1`,
+    [userId],
+  );
+  return rows[0]?.role ?? null;
+}
+```
+
+- [ ] **Step 5: Create `lib/compound/load/supabase.ts` and `middleware.ts`**
+
+```bash
+pnpm add @supabase/ssr@^0.5.2 @supabase/supabase-js@^2.47.0
+```
+
+```typescript
+// lib/compound/load/supabase.ts
+/**
+ * The Supabase Auth client. Auth only — Compound reads and writes its data
+ * over pg (plan 3, decision P2), because PostgREST serialises bigint as a JSON
+ * number and every cent figure would become a float.
+ */
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+
+export async function authClient() {
+  const store = await cookies();
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY must be set. See .env.example.",
+    );
+  }
+  return createServerClient(url, key, {
+    cookies: {
+      getAll: () => store.getAll(),
+      setAll: (list) => {
+        // A Server Component cannot set a cookie. middleware.ts refreshes the
+        // session, so this is a no-op on the read path rather than a crash.
+        try {
+          for (const { name, value, options } of list) store.set(name, value, options);
+        } catch {
+          /* called from a Server Component render; middleware handles refresh */
+        }
+      },
+    },
+  });
+}
+```
+
+```typescript
+// middleware.ts
+/**
+ * Refreshes the Supabase session cookie on every request, because a Server
+ * Component cannot write one. Without this, a session expires mid-visit and
+ * the desk bounces to sign-in with no explanation.
+ */
+import { createServerClient } from "@supabase/ssr";
+import { NextResponse, type NextRequest } from "next/server";
+
+export async function middleware(request: NextRequest) {
+  let response = NextResponse.next({ request });
+
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !key) return response;
+
+  const supabase = createServerClient(url, key, {
+    cookies: {
+      getAll: () => request.cookies.getAll(),
+      setAll: (list) => {
+        for (const { name, value } of list) request.cookies.set(name, value);
+        response = NextResponse.next({ request });
+        for (const { name, value, options } of list) response.cookies.set(name, value, options);
+      },
+    },
+  });
+
+  // getUser, not getSession: getSession trusts the cookie, getUser validates
+  // the token with the Auth server. A forged cookie must not reach a page.
+  await supabase.auth.getUser();
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)"],
+};
+```
+
+- [ ] **Step 6: Create `lib/compound/load/session.ts` — spec §9's AND gate**
+
+```typescript
+/**
+ * Who is asking, and may they use this product at all.
+ *
+ * Spec section 9: "The admin claim is an AND gate, not an OR bypass." Every
+ * compound_* policy requires the admin claim AND a manager_user_id match. This
+ * module is the first half. requireAccount is the second.
+ *
+ * WHY THIS IS IN APPLICATION CODE. Plan 3's decision P4 runs every pooled
+ * connection as service_role, which has BYPASSRLS. The policies plan 3 wrote
+ * are real and protect any other client of the database, and they do NOT run
+ * for these pages. A gate that relies on them would pass every test whether it
+ * was right or not, which is the defect class this project has now hit eleven
+ * times.
+ *
+ * getUser, not getSession: getSession decodes the cookie and believes it;
+ * getUser validates the token against the Auth server.
+ */
+import { cache } from "react";
+import { redirect } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { getUserRole } from "@/lib/compound/db/users";
+import { authClient } from "./supabase";
+
+export interface SessionUser {
+  id: string;
+  email: string | null;
+}
+
+export const requireManager = cache(async (): Promise<SessionUser> => {
+  const supabase = await authClient();
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) redirect("/sign-in");
+
+  const claim = (data.user.app_metadata as { role?: unknown } | null)?.role;
+  const claimed = typeof claim === "string" ? claim : null;
+  const stored = await withDb((c) => getUserRole(c, data.user!.id));
+
+  // The claim is authoritative because the policies read it. The stored role
+  // is read to catch the one misconfiguration that is otherwise silent.
+  if (claimed !== null && stored !== null && claimed !== stored) {
+    throw new Error(
+      `Role mismatch for ${data.user.id}: JWT app_metadata.role is ${claimed}, ` +
+        `public.users.role is ${stored}. Compound will not run against a directory ` +
+        `whose two role sources disagree.`,
+    );
+  }
+  if ((claimed ?? stored) !== "admin") redirect("/sign-in?denied=1");
+
+  return { id: data.user.id, email: data.user.email ?? null };
+});
+```
+
+- [ ] **Step 7: Create `lib/compound/load/account.ts` — the second half of the gate**
+
+```typescript
+/**
+ * Resolving a route parameter to an account the signed-in manager owns.
+ *
+ * notFound() rather than a 403 for an account someone does not own: a 403
+ * confirms the account exists, and under D5 there will be more than one
+ * manager's account in this database eventually.
+ *
+ * Wrapped in cache() so the layout and the page inside it resolve the same
+ * account with one query. Plan 5's three surfaces call this too.
+ */
+import { cache } from "react";
+import { notFound } from "next/navigation";
+import { withDb } from "@/lib/compound/db/client";
+import { getAccountById, listAccountsForManager } from "@/lib/compound/db/compound";
+import { requireManager } from "./session";
+
+export interface ResolvedAccount {
+  id: number;
+  mt5Account: number;
+  label: string;
+  broker: string | null;
+  currency: string;
+  defaultSplitBps: number;
+  inceptionDate: string;
+  managerUserId: string;
+  /** Null means not configured. Reconciliation refuses while it is null. */
+  brokerOffsetHours: number | null;
+}
+
+export const listManagerAccounts = cache(async (): Promise<ResolvedAccount[]> => {
+  const user = await requireManager();
+  return withDb((c) => listAccountsForManager(c, user.id));
+});
+
+export const requireAccount = cache(async (idParam: string): Promise<ResolvedAccount> => {
+  const user = await requireManager();
+
+  // Reject anything that is not a plain positive integer before it reaches
+  // SQL. "7abc" parses to 7 under parseInt and would resolve someone's account.
+  if (!/^[1-9][0-9]{0,17}$/.test(idParam)) notFound();
+  const id = Number(idParam);
+
+  const account = await withDb((c) => getAccountById(c, id));
+  if (account === null) notFound();
+  if (account.managerUserId !== user.id) notFound();
+  return account;
+});
+```
+
+- [ ] **Step 8: Create `lib/compound/load/ledger.ts` and `lib/compound/load/interlock.ts`**
+
+```typescript
+// lib/compound/load/ledger.ts
+/**
+ * Request-scoped reads. Each is cache()d, so the layout, the page and any
+ * component that needs the same data pay for one query between them.
+ *
+ * There is no PoolState context provider, by agreement with plan 5: two of its
+ * three surfaces need no ledger at all, and a provider would make them pay for
+ * a replay they do not use.
+ */
+import { cache } from "react";
+import { withDb } from "@/lib/compound/db/client";
+import { getHolderSeeds, getLedgerEntries } from "@/lib/compound/db/compound";
+import { listHolders } from "@/lib/compound/db/holders";
+import { getLiveSnapshot } from "@/lib/compound/db/copytraderx";
+import { fold, type HolderSeed, type LedgerEntry, type PoolState } from "@/lib/compound/engine/replay";
+import type { LiveFigures } from "@/lib/compound/ui/statement";
+
+export const loadLedger = cache(
+  async (accountId: number): Promise<LedgerEntry[]> =>
+    withDb((c) => getLedgerEntries(c, accountId)),
+);
+
+export const loadSeeds = cache(
+  async (accountId: number): Promise<HolderSeed[]> =>
+    withDb((c) => getHolderSeeds(c, accountId)),
+);
+
+export const loadHolderNames = cache(async (accountId: number): Promise<Record<number, string>> => {
+  const holders = await withDb((c) => listHolders(c, accountId));
+  return Object.fromEntries(holders.map((h) => [h.id, h.name]));
+});
+
+export const loadPoolState = cache(async (accountId: number): Promise<PoolState> => {
+  const [entries, seeds] = await Promise.all([loadLedger(accountId), loadSeeds(accountId)]);
+  return fold(entries, seeds);
+});
+
+export const loadLive = cache(async (mt5Account: number): Promise<LiveFigures | null> => {
+  const snap = await withDb((c) => getLiveSnapshot(c, mt5Account));
+  return snap === null
+    ? null
+    : {
+        equityCents: snap.equityCents,
+        floatingPnlCents: snap.floatingPnlCents,
+        pushedAt: snap.pushedAt,
+      };
+});
+```
+
+```typescript
+// lib/compound/load/interlock.ts
+/**
+ * One loader for one question: has the reconciler stopped, and where?
+ *
+ * The sub-nav badge, the frozen-figures banner and plan 5's /performance
+ * notice all need this. Two loaders would be two answers.
+ */
+import { cache } from "react";
+import { withDb } from "@/lib/compound/db/client";
+import { getReconcileCursor, listCandidates } from "@/lib/compound/db/compound";
+
+export interface InterlockState {
+  /** compound_reconcile_cursor.last_reading_date. Null before the first run. */
+  frozenAt: string | null;
+  /** The earliest pending candidate's trade date, or null when nothing is pending. */
+  pendingCandidateDate: string | null;
+  pendingCount: number;
+}
+
+export const loadInterlock = cache(async (accountId: number): Promise<InterlockState> => {
+  const [cursor, pending] = await withDb(async (c) => [
+    await getReconcileCursor(c, accountId),
+    await listCandidates(c, accountId, "pending"),
+  ] as const);
+
+  const earliest = [...pending].sort((a, b) =>
+    a.tradeDate < b.tradeDate ? -1 : a.tradeDate > b.tradeDate ? 1 : 0,
+  )[0];
+
+  return {
+    frozenAt: cursor.lastReadingDate,
+    pendingCandidateDate: earliest?.tradeDate ?? null,
+    pendingCount: pending.length,
+  };
+});
+```
+
+- [ ] **Step 9: Create the sign-in page**
+
+```tsx
+// app/sign-in/page.tsx
+/**
+ * Email and password against Supabase Auth. No sign-up, no reset, no magic
+ * link: single-tenant, one operator (D1), and the directory is CopyTraderX's,
+ * which already has its own account management.
+ */
+import { redirect } from "next/navigation";
+import { authClient } from "@/lib/compound/load/supabase";
+import { Field, FieldError, Sheet, SheetActions } from "@/lib/compound/ui/sheet";
+
+export const dynamic = "force-dynamic";
+
+async function signIn(formData: FormData) {
+  "use server";
+  const email = String(formData.get("email") ?? "");
+  const password = String(formData.get("password") ?? "");
+  const supabase = await authClient();
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) redirect(`/sign-in?error=${encodeURIComponent(error.message)}`);
+  redirect("/");
+}
+
+export default async function SignInPage({
+  searchParams,
+}: { searchParams: Promise<{ error?: string; denied?: string }> }) {
+  const { error, denied } = await searchParams;
+  return (
+    <Sheet
+      title="Compound"
+      lede="Fund administration for pooled MetaTrader accounts."
+      backHref="/sign-in"
+      backLabel=""
+    >
+      {denied ? (
+        <FieldError>
+          That account is signed in but is not an administrator. Compound adds no
+          roles of its own; access is the existing admin claim.
+        </FieldError>
+      ) : null}
+      {error ? <FieldError>{error}</FieldError> : null}
+      <form action={signIn}>
+        <Field name="email" label="Email">
+          <input id="email" name="email" type="email" autoComplete="username" required />
+        </Field>
+        <Field name="password" label="Password">
+          <input
+            id="password" name="password" type="password"
+            autoComplete="current-password" required
+          />
+        </Field>
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Sign in</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 10: Extend `.env.example`**
+
+```bash
+# Supabase — fill locally, never commit real values. The repository is public.
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+
+# Compound connects to Postgres directly; see plan 3, decision P2.
+COMPOUND_DATABASE_URL=
+COMPOUND_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54622/postgres
+```
+
+- [ ] **Step 11: Write `lib/compound/db/holders.db.test.ts`**
+
+```typescript
+/**
+ * Integration. Runs under jest.db.config.mjs against the local stack.
+ * Follows plan 3's harness conventions: two accounts, two managers, unfiltered
+ * selects, and every rejection matched on message as well as class.
+ */
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { listHolders } from "@/lib/compound/db/holders";
+import { seedTwoAccounts } from "@/lib/compound/db/test-harness";
+
+describe("listHolders", () => {
+  it("returns only the requested account's holders", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      const rows = await listHolders(c, mine.accountId);
+      expect(rows.map((r) => r.accountId)).toEqual([mine.accountId, mine.accountId]);
+      expect(rows.some((r) => r.accountId === theirs.accountId)).toBe(false);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("puts the manager first", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const rows = await listHolders(c, mine.accountId);
+      expect(rows[0]!.isManager).toBe(true);
+      expect(rows[0]!.splitBps).toBe(0);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("carries the holder's own split, not the account default", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);   // investor seeded at 3700
+      expect(listHolders(c, mine.accountId).then((r) => r[1]!.splitBps)).resolves.toBe(3700);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("refuses a status the type does not allow, rather than casting it", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      // The CHECK constraint stops this at the database, which is the point:
+      // the reader's throw is a second line of defence, not the first.
+      await expect(
+        c.query(`update public.compound_holder set status = 'paused' where account_id = $1`,
+          [mine.accountId]),
+      ).rejects.toThrow(/compound_holder_status_check|violates check constraint/);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("returns an empty array for an account with no holders, not null", async () => {
+    await withDbTransaction(async (c) => {
+      expect(await listHolders(c, 2_147_483_646)).toEqual([]);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+});
+```
+
+> **`seedTwoAccounts` is plan 3's harness helper (its Task 1).** If plan 3 named it differently, use whatever it produced — do not write a second seeder. If it produced no two-account seeder at all, that is a genuine prerequisite gap: stop and add one to the harness rather than seeding inline here, because every RLS and isolation test in both plans depends on the same one.
+
+- [ ] **Step 12: Write `lib/compound/load/gate.db.test.ts`**
+
+The gate is the one thing in this plan that is worth an integration test of its own, and it is exactly the shape that goes unfalsifiable if written carelessly.
+
+```typescript
+/**
+ * The AND gate, tested with TWO managers and TWO accounts.
+ *
+ * A one-manager test passes with the gate deleted: the only account in the
+ * database is yours, so "I can see my account" is true either way. Every case
+ * below asserts that the OTHER manager's account is not reachable.
+ *
+ * requireAccount calls requireManager, which reads a Supabase session that does
+ * not exist in a Jest process. The gate's ownership half is therefore tested
+ * through a seam: resolveOwnedAccount(userId, idParam) carries the logic and
+ * requireAccount is the four-line wrapper that supplies userId from the
+ * session. If the wrapper is where the bug lands, the smoke test in Task 15
+ * catches it — this test covers the half that has branches in it.
+ */
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { getAccountById } from "@/lib/compound/db/compound";
+import { seedTwoAccounts } from "@/lib/compound/db/test-harness";
+import { resolveOwnedAccount } from "@/lib/compound/load/account";
+
+describe("resolveOwnedAccount", () => {
+  it("returns an account its manager owns", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const acct = await resolveOwnedAccount(c, mine.managerUserId, String(mine.accountId));
+      expect(acct?.id).toBe(mine.accountId);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("refuses another manager's account, even though it exists", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      // It really is there — otherwise this test proves nothing.
+      expect(await getAccountById(c, theirs.accountId)).not.toBeNull();
+      expect(await resolveOwnedAccount(c, mine.managerUserId, String(theirs.accountId)))
+        .toBeNull();
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("refuses an id that is not a plain positive integer", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      for (const bad of [`${mine.accountId}abc`, "0", "-1", "1.5", " 1", "01", ""]) {
+        expect(await resolveOwnedAccount(c, mine.managerUserId, bad)).toBeNull();
+      }
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("refuses an account that does not exist", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      expect(await resolveOwnedAccount(c, mine.managerUserId, "2147483646")).toBeNull();
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("carries the broker offset through, null when it is not configured", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      expect((await resolveOwnedAccount(c, mine.managerUserId, String(mine.accountId)))!
+        .brokerOffsetHours).toBeNull();
+      await c.query(
+        `update public.compound_account set broker_offset_hours = 3 where id = $1`,
+        [mine.accountId],
+      );
+      expect((await resolveOwnedAccount(c, mine.managerUserId, String(mine.accountId)))!
+        .brokerOffsetHours).toBe(3);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+
+  it("refuses an offset outside the real range of UTC offsets", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await expect(
+        c.query(`update public.compound_account set broker_offset_hours = 15 where id = $1`,
+          [mine.accountId]),
+      ).rejects.toThrow(/compound_account_broker_offset_hours_range/);
+      throw new Error("rollback");
+    }).catch((e) => { if (e.message !== "rollback") throw e; });
+  });
+});
+```
+
+Extract the seam into `lib/compound/load/account.ts`:
+
+```typescript
+/** The ownership half of spec section 9's AND gate, as a pure-ish function of
+ *  (connection, user, parameter) so it can be tested with two managers. */
+export async function resolveOwnedAccount(
+  c: Queryable,
+  managerUserId: string,
+  idParam: string,
+): Promise<ResolvedAccount | null> {
+  if (!/^[1-9][0-9]{0,17}$/.test(idParam)) return null;
+  const account = await getAccountById(c, Number(idParam));
+  if (account === null) return null;
+  if (account.managerUserId !== managerUserId) return null;
+  return account;
+}
+
+export const requireAccount = cache(async (idParam: string): Promise<ResolvedAccount> => {
+  const user = await requireManager();
+  const account = await withDb((c) => resolveOwnedAccount(c, user.id, idParam));
+  if (account === null) notFound();
+  return account;
+});
+```
+
+- [ ] **Step 13: Run the gates and prove two probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db
+```
+
+Then, one at a time, reverting each:
+
+1. Delete the `account.managerUserId !== managerUserId` check in `resolveOwnedAccount`. Expect the "refuses another manager's account" test to fail. If it still passes, the fixture has only one account and the test is worthless — fix the fixture, not the assertion.
+2. Change the id pattern to `/^\d+$/`. Expect the `"0"` and `"01"` cases to fail. (`"7abc"` still fails, because `Number("7abc")` is `NaN` and no account has that id — which is why the test lists several bad forms rather than one.)
+
