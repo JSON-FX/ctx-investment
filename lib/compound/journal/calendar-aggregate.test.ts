@@ -171,6 +171,16 @@ describe("monthGrid", () => {
     expect(rows[0]![6]).toBe("2026-05-02");
   });
 
+  // Mutation caught: an off-by-one that only shows up on a single leading
+  // blank, which a 0-blank test (Sunday) and a 5-blank test (Friday) both
+  // miss. 2026-06-01 is a Monday.
+  it("puts a single leading blank when the month starts on a Monday", () => {
+    const rows = monthGrid("2026-06");
+    expect(rows[0]![0]).toBeNull();
+    expect(rows[0]![1]).toBe("2026-06-01");
+    expect(rows[0]![2]).toBe("2026-06-02");
+  });
+
   // Mutation caught: always emitting a leading blank. March 2026 starts on a
   // Sunday, so the first cell is the first of the month.
   it("emits no leading blank when the month starts on a Sunday", () => {
