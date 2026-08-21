@@ -130,6 +130,23 @@ describe("MonthGrid", () => {
     expect(renderGrid("2026-05", "2026-05-04")).toContain('aria-current="true"');
   });
 
+  // Mutation caught, found by an actual probe (see the task report): a day
+  // with no trades rendered as a traded day showing a zero result, rather
+  // than as an empty cell with no figure. Every test above this one stayed
+  // green against that mutation — it touches no total this file already
+  // checks — so this asserts the cell's shape directly. "No data" and
+  // "traded and broke even" are different facts and must not render the
+  // same signedMoney("0.00").
+  it("renders a day with no trades as an empty cell, not a zero result", () => {
+    const firstRow = gridElement().querySelector("tbody tr")!;
+    const may1 = [...firstRow.querySelectorAll("td")][5]!; // see the Friday-column test
+    expect(may1.className).toBe("cal-cell");
+    expect(may1.querySelector("a")).toBeNull();
+    expect(may1.querySelector(".cal-pnl")).toBeNull();
+    expect(may1.querySelector(".cal-count")).toBeNull();
+    expect(may1.textContent).toBe("1");
+  });
+
   it("renders an empty month without crashing", () => {
     expect(renderGrid("2026-06")).toContain("0 trading days");
   });
