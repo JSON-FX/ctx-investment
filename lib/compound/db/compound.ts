@@ -28,6 +28,8 @@ export interface CompoundAccount {
   inceptionDate: string;
   /** public.users id. */
   managerUserId: string;
+  /** Broker server UTC offset. Null means not configured; see the migration. */
+  brokerOffsetHours: number | null;
 }
 
 export interface CapitalEventCandidateRow {
@@ -51,7 +53,8 @@ const ACCOUNT_COLUMNS = `
   currency,
   default_split_bps,
   ${dateKeyExpr("inception_date")} as inception_date,
-  manager_user_id
+  manager_user_id,
+  broker_offset_hours
 `;
 
 interface AccountRow {
@@ -63,6 +66,7 @@ interface AccountRow {
   default_split_bps: number;
   inception_date: string;
   manager_user_id: string;
+  broker_offset_hours: number | null;
 }
 
 function toAccount(r: AccountRow): CompoundAccount {
@@ -75,6 +79,7 @@ function toAccount(r: AccountRow): CompoundAccount {
     defaultSplitBps: r.default_split_bps,
     inceptionDate: toDateKey(r.inception_date, "compound_account.inception_date"),
     managerUserId: r.manager_user_id,
+    brokerOffsetHours: r.broker_offset_hours,
   };
 }
 

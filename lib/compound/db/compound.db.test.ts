@@ -103,6 +103,10 @@ describe("account lookups", () => {
       defaultSplitBps: 4000,
       inceptionDate: "2026-05-01",
       managerUserId: MANAGER,
+      // Task 5 adds this column. Not configured in this fixture, and null
+      // must read back as null, not 0 — the two mean different things (see
+      // the migration).
+      brokerOffsetHours: null,
     });
   });
 
