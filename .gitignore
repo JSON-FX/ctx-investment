@@ -36,3 +36,9 @@ Thumbs.db
 
 # Git worktrees for isolated plan execution.
 .worktrees/
+
+# Execution-process artifacts. These are working notes from building a
+# plan, not project files. They belong beside the plan run, not in history.
+task-*-report.md
+*-setup-report.md
+final-fix-report.md
