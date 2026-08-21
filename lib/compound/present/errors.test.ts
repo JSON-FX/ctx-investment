@@ -22,6 +22,7 @@ describe("explainCommitError", () => {
     "CX001", "CX002", "CX003", "CX004", "CX005", "CX010",
     "CX101", "CX102",
     "CX201", "CX202", "CX203", "CX204", "CX205", "CX206", "CX207", "CX208", "CX209", "CX210", "CX211",
+    "CX301", "CX302", "CX303", "CX304",
   ])(
     "has a sentence for %s",
     (code) => {

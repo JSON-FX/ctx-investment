@@ -12,6 +12,8 @@ export const ledgerHref = (accountId: number) => `/a/${accountId}/ledger`;
 export const reviewHref = (accountId: number) => `/a/${accountId}/review`;
 export const holderHref = (accountId: number, holderId: number) =>
   `/a/${accountId}/holders/${holderId}`;
+export const editHolderHref = (accountId: number, holderId: number) =>
+  `/a/${accountId}/holders/${holderId}/edit`;
 export const journalHref = (accountId: number) => `/a/${accountId}/journal`;
 export const calendarHref = (accountId: number) => `/a/${accountId}/calendar`;
 export const performanceHref = (accountId: number) => `/a/${accountId}/performance`;

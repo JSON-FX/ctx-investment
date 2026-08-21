@@ -23,7 +23,7 @@ import { loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger
 import { ledgerSteps } from "@/lib/compound/present/derive";
 import { holderPosition, holderStatement } from "@/lib/compound/present/holder";
 import { HolderStatement } from "@/lib/compound/ui/holder-statement";
-import { payoutHref } from "@/lib/compound/ui/routes";
+import { editHolderHref, payoutHref } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
 
@@ -64,6 +64,11 @@ export default async function HolderPage({
       withdrawAction={
         <a className="btn btn-primary" href={payoutHref(account.id, holderId)}>
           Pay out
+        </a>
+      }
+      editAction={
+        <a className="btn" href={editHolderHref(account.id, holderId)}>
+          Edit
         </a>
       }
     />

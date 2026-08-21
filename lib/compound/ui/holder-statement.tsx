@@ -55,7 +55,7 @@ const TYPE_LABELS: Record<string, string> = {
 };
 
 export function HolderStatement({
-  holder, position, rows, totals, currency, withdrawAction,
+  holder, position, rows, totals, currency, withdrawAction, editAction,
 }: {
   holder: HolderIdentity;
   position: HolderPosition;
@@ -64,6 +64,8 @@ export function HolderStatement({
   currency: string;
   /** Phase B fills this. */
   withdrawAction?: ReactNode;
+  /** A link to /holders/[hid]/edit. Optional so a caller without one still renders. */
+  editAction?: ReactNode;
 }) {
   const name = holder.name;
   const money = (c: bigint) => formatMoney(c, { currency });
@@ -123,6 +125,8 @@ export function HolderStatement({
             money(position.settlementValueCents),
           )}
         </p>
+
+        {editAction ? <div className="actions">{editAction}</div> : null}
       </Panel>
 
       <Panel>
