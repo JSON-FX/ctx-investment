@@ -7744,3 +7744,1152 @@ MSG
 )"
 ```
 
+---
+
+### Task 12: Adding an investor, and adding capital
+
+Two sheets and two writers. They are one task because the second is meaningless without the first: an investor with no capital holds nothing, and adding capital needs a holder to add it to.
+
+**The deposit receipt shows dilution of *share*, never of *value*.** A deposit issues units at the prevailing NAV, which is arithmetically incapable of moving anyone else's value — that is the whole reason units solve staggered entry. So the receipt shows every holder's share moving and every holder's value standing still, side by side. That contrast **is** the explanation, and it is the thing an existing investor asks about the moment a new one joins.
+
+**Files:**
+- Create: `supabase/migrations/<generated>_compound_add_holder.sql`
+- Create: `supabase/migrations/<generated>_compound_commit_deposit.sql`
+- Create: `lib/compound/db/write-holder.ts`
+- Create: `lib/compound/db/write-deposit.ts`
+- Create: `lib/compound/ui/investor-sheet.tsx`
+- Create: `lib/compound/ui/capital-sheet.tsx`
+- Create: `app/a/[id]/actions/investor/page.tsx`
+- Create: `app/a/[id]/actions/capital/page.tsx`
+- Modify: `app/a/[id]/actions/actions.ts`
+- Test: `lib/compound/db/write-deposit.db.test.ts`
+- Test: `lib/compound/ui/capital-sheet.test.tsx`
+- Test: `lib/compound/ui/investor-sheet.test.tsx`
+
+**Interfaces:**
+- Consumes: `previewEntry` from `@/lib/compound/present/derive`; `PAYOUT_WORDS`, `formatSplitWords` from `@/lib/compound/present/*`
+- Produces:
+  - `public.compound_add_holder(...) returns bigint`
+  - `public.compound_commit_deposit(...) returns jsonb`
+  - `addHolder(c, input): Promise<number>`
+  - `commitDeposit(c, input): Promise<{ ledgerEntryId: number; seq: number }>`
+  - `InvestorSheet`, `CapitalSheet` components
+
+- [ ] **Step 1: The holder writer**
+
+```bash
+supabase migration new compound_add_holder
+```
+
+```sql
+-- ============================================================================
+-- Add a holder to an account.
+-- ============================================================================
+--
+-- No ledger entry. A holder is identity and terms; a holder with no deposit
+-- holds no units and is worth nothing, which is exactly right — joining and
+-- funding are separate events and the ledger records the second one.
+--
+-- is_manager is forced FALSE. Plan 3's P8 puts a one-manager-per-account
+-- partial unique index on this table because replay.ts resolves the
+-- fee-receiving manager with find(h => h.isManager) and would silently pick
+-- whichever row came back first if there were two. The manager is created with
+-- the account and cannot be added later, so this function does not offer it.
+--
+-- Custom SQLSTATEs:
+--   CX102  attempted to add a second manager
+-- ============================================================================
+
+create or replace function public.compound_add_holder(
+  p_account_id bigint,
+  p_name       text,
+  p_email      text,
+  p_split_bps  int,
+  p_joined_at  date,
+  p_actor      uuid
+) returns bigint
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_holder_id bigint;
+begin
+  if not exists (select 1 from public.compound_account a where a.id = p_account_id) then
+    raise exception 'compound: no account %', p_account_id using errcode = 'CX001';
+  end if;
+
+  insert into public.compound_holder
+    (account_id, name, email, is_manager, split_bps, joined_at, status)
+  values
+    (p_account_id, p_name, nullif(p_email, ''), false, p_split_bps, p_joined_at, 'active')
+  returning id into v_holder_id;
+
+  insert into public.compound_audit (actor, action, entity, entity_id, account_id, prior_state)
+  values (p_actor, 'add_holder', 'compound_holder', v_holder_id, p_account_id, null);
+
+  return v_holder_id;
+end;
+$$;
+```
+
+```typescript
+// lib/compound/db/write-holder.ts
+/**
+ * Adding a holder. Terms only — no ledger entry, because joining and funding
+ * are separate events and only the second one moves money.
+ */
+import type { Queryable } from "./types";
+import { toId } from "./sql";
+
+export interface AddHolderInput {
+  accountId: number;
+  name: string;
+  email: string | null;
+  splitBps: number;
+  /** YYYY-MM-DD. */
+  joinedAt: string;
+  actorUserId: string;
+}
+
+export async function addHolder(c: Queryable, input: AddHolderInput): Promise<number> {
+  if (!Number.isInteger(input.splitBps) || input.splitBps < 0 || input.splitBps > 10_000) {
+    throw new RangeError(`splitBps must be an integer 0..10000, got ${input.splitBps}`);
+  }
+  if (input.name.trim() === "") throw new RangeError("a holder needs a name");
+  const { rows } = await c.query<{ id: string }>(
+    `select public.compound_add_holder($1,$2,$3,$4,$5::date,$6::uuid) as id`,
+    [input.accountId, input.name.trim(), input.email ?? "", input.splitBps,
+     input.joinedAt, input.actorUserId],
+  );
+  return toId(rows[0]!.id, "compound_add_holder.id");
+}
+```
+
+- [ ] **Step 2: The deposit writer**
+
+```bash
+supabase migration new compound_commit_deposit
+```
+
+```sql
+-- ============================================================================
+-- Record a deposit. One ledger entry, seq assigned server-side.
+-- ============================================================================
+--
+-- No units_delta and no nav_at_entry (spec 6.1). Both are derived by folding,
+-- and storing either creates a second truth that can disagree with the engine
+-- the first time the engine changes.
+--
+-- The row lock on compound_account is what makes two concurrent writers get
+-- disjoint seq numbers rather than colliding on unique (account_id, seq).
+-- Same mechanism as compound_commit_reading_plan; do not simplify it away.
+--
+-- THE INTERLOCK APPLIES HERE TOO. A deposit dated on or after an unclassified
+-- capital event is refused, for the reason section 5.3 gives: the pool's state
+-- on that date is not known, so the NAV the deposit would issue units at is not
+-- known either, and units issued at a wrong NAV cannot be corrected without
+-- reversing everything after them.
+--
+-- Custom SQLSTATEs:
+--   CX001  no such account
+--   CX002  dated on or after an unclassified capital event
+--   CX205  no such holder on this account
+-- ============================================================================
+
+create or replace function public.compound_commit_deposit(
+  p_account_id   bigint,
+  p_holder_id    bigint,
+  p_occurred_on  date,
+  p_amount_cents bigint,
+  p_note         text,
+  p_actor        uuid
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_locked   bigint;
+  v_next_seq bigint;
+  v_entry_id bigint;
+  v_blocker  date;
+begin
+  if p_amount_cents <= 0 then
+    raise exception 'compound: a deposit must be positive, got %', p_amount_cents
+      using errcode = 'CX206';
+  end if;
+
+  select a.id into v_locked
+    from public.compound_account a where a.id = p_account_id for update;
+  if v_locked is null then
+    raise exception 'compound: no account %', p_account_id using errcode = 'CX001';
+  end if;
+
+  if not exists (
+    select 1 from public.compound_holder h
+     where h.id = p_holder_id and h.account_id = p_account_id
+  ) then
+    raise exception 'compound: holder % is not on account %', p_holder_id, p_account_id
+      using errcode = 'CX205';
+  end if;
+
+  select min(k.trade_date) into v_blocker
+    from public.compound_capital_event_candidate k
+   where k.account_id = p_account_id
+     and k.status = 'pending';
+
+  if v_blocker is not null and p_occurred_on >= v_blocker then
+    raise exception
+      'compound: deposit dated % is on or after the unclassified capital event on %',
+      p_occurred_on, v_blocker using errcode = 'CX002';
+  end if;
+
+  select coalesce(max(l.seq), 0) + 1 into v_next_seq
+    from public.compound_ledger_entry l where l.account_id = p_account_id;
+
+  insert into public.compound_ledger_entry
+    (account_id, holder_id, seq, occurred_on, type, amount_cents, note, created_by)
+  values
+    (p_account_id, p_holder_id, v_next_seq, p_occurred_on, 'deposit',
+     p_amount_cents, nullif(p_note, ''), p_actor)
+  returning id into v_entry_id;
+
+  insert into public.compound_audit (actor, action, entity, entity_id, account_id, prior_state)
+  values (p_actor, 'commit_deposit', 'compound_ledger_entry', v_entry_id, p_account_id, null);
+
+  return jsonb_build_object('ledger_entry_id', v_entry_id, 'seq', v_next_seq);
+end;
+$$;
+```
+
+```typescript
+// lib/compound/db/write-deposit.ts
+/**
+ * Recording a deposit.
+ *
+ * The amount crosses the boundary as a DECIMAL STRING. JSON.stringify throws on
+ * a bigint, and a JSON number above 2^53 is not the number you sent. pg's
+ * parameter binding takes the string and Postgres casts it to bigint exactly.
+ */
+import type { Cents } from "@/lib/compound/engine/money";
+import type { Queryable } from "./types";
+import { toId } from "./sql";
+
+export interface CommitDepositInput {
+  accountId: number;
+  holderId: number;
+  /** YYYY-MM-DD, broker-server date. */
+  occurredOn: string;
+  amountCents: Cents;
+  note: string | null;
+  actorUserId: string;
+}
+
+export async function commitDeposit(
+  c: Queryable,
+  input: CommitDepositInput,
+): Promise<{ ledgerEntryId: number; seq: number }> {
+  if (input.amountCents <= 0n) {
+    throw new RangeError(`a deposit must be positive, got ${input.amountCents}`);
+  }
+  const { rows } = await c.query<{ result: { ledger_entry_id: string; seq: string } }>(
+    `select public.compound_commit_deposit($1,$2,$3::date,$4::bigint,$5,$6::uuid) as result`,
+    [input.accountId, input.holderId, input.occurredOn,
+     input.amountCents.toString(), input.note ?? "", input.actorUserId],
+  );
+  return {
+    ledgerEntryId: toId(rows[0]!.result.ledger_entry_id, "compound_commit_deposit.ledger_entry_id"),
+    seq: toId(rows[0]!.result.seq, "compound_commit_deposit.seq"),
+  };
+}
+```
+
+- [ ] **Step 3: Create `lib/compound/ui/investor-sheet.tsx`**
+
+```tsx
+/**
+ * Adding an investor. No money changes hands, so there is no receipt of
+ * figures — there is a statement of TERMS, which is the thing that will be
+ * argued about later.
+ *
+ * The confirm step spells the split out in a sentence rather than as "4000
+ * bps" or even "60 / 40", because the question this screen has to answer is
+ * "what did I agree to", and a ratio does not answer it.
+ */
+import { formatDate, formatSplit, formatSplitWords } from "@/lib/compound/present/format";
+import { PAYOUT_WORDS } from "@/lib/compound/present/wording";
+import { Receipt, ReceiptLine } from "./receipt";
+import { Field, FieldError, Sheet, SheetActions } from "./sheet";
+
+export function InvestorSheet({
+  accountId, defaultSplitBps, currency, form, error, backHref, commitAction,
+}: {
+  accountId: number;
+  defaultSplitBps: number;
+  currency: string;
+  form: { name?: string; email?: string; split?: string; joinedAt?: string; step?: string };
+  error?: string;
+  backHref: string;
+  commitAction: (formData: FormData) => Promise<void>;
+}) {
+  if (form.step !== "confirm") {
+    return (
+      <Sheet
+        title="Add an investor"
+        lede="Terms only. Nothing moves until you add capital for them, and their units are issued at the NAV on that day."
+        backHref={backHref}
+      >
+        {error ? <FieldError>{error}</FieldError> : null}
+        <form method="get">
+          <input type="hidden" name="step" value="confirm" />
+          <Field name="name" label="Name">
+            <input id="name" name="name" required defaultValue={form.name} />
+          </Field>
+          <Field name="email" label="Email" hint="Optional. Used only for their statement when the portal lands.">
+            <input id="email" name="email" type="email" defaultValue={form.email} />
+          </Field>
+          <Field
+            name="split"
+            label="Your share of their profit, percent"
+            hint={`The account default is ${defaultSplitBps / 100}%. Set a different figure here if you agreed one.`}
+          >
+            <input
+              id="split" name="split" inputMode="decimal" required
+              defaultValue={form.split ?? String(defaultSplitBps / 100)}
+            />
+          </Field>
+          <Field name="joinedAt" label="Joined">
+            <input id="joinedAt" name="joinedAt" type="date" required defaultValue={form.joinedAt} />
+          </Field>
+          <SheetActions>
+            <button className="btn btn-primary" type="submit">Review</button>
+          </SheetActions>
+        </form>
+      </Sheet>
+    );
+  }
+
+  const name = form.name ?? "";
+  const splitBps = Math.round(Number(form.split ?? "0") * 100);
+
+  return (
+    <Sheet title="Add an investor" backHref={`${backHref}`} backLabel="Back">
+      {error ? <FieldError>{error}</FieldError> : null}
+      <Receipt label="Investor to be added">
+        <ReceiptLine label="Name">{name}</ReceiptLine>
+        <ReceiptLine label="Email">{form.email || "—"}</ReceiptLine>
+        <ReceiptLine label="Joined">
+          <span className="num">{form.joinedAt ? formatDate(form.joinedAt) : "—"}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Split" hint={PAYOUT_WORDS.managerFeeHint}>
+          <span className="num">{formatSplit(splitBps)}</span>
+        </ReceiptLine>
+      </Receipt>
+
+      <p className="split-note">{formatSplitWords(splitBps, name)}</p>
+      <p className="split-note">
+        {name} holds no units until capital is added for them. Their {currency} goes in at
+        the NAV on the day it lands, which is what stops a later investor diluting an
+        earlier one.
+      </p>
+
+      <form action={commitAction}>
+        <input type="hidden" name="accountId" value={accountId} />
+        {(["name", "email", "split", "joinedAt"] as const).map((k) => (
+          <input key={k} type="hidden" name={k} value={form[k] ?? ""} />
+        ))}
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Add {name}</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 4: Create `lib/compound/ui/capital-sheet.tsx`**
+
+```tsx
+/**
+ * Adding capital.
+ *
+ * The receipt's job is to make one thing obvious: a deposit dilutes SHARE and
+ * does not touch VALUE. Every existing holder's percentage falls and their
+ * money does not move, and the two columns sit next to each other so the
+ * reader can see that rather than be told it.
+ *
+ * Units issued is a FLOOR. Ceiling them would issue more units than were paid
+ * for, which lowers NAV for everyone else — and previewEntry refuses to build
+ * a receipt that lowers NAV on a deposit, so this cannot render at all if the
+ * engine's rounding is ever reversed.
+ */
+import type { Preview } from "@/lib/compound/present/derive";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import {
+  formatDate, formatMoney, formatNav, formatPpm, formatUnitsDp,
+} from "@/lib/compound/present/format";
+import { fingerprintToFields } from "@/lib/compound/present/fingerprint";
+import { Money } from "./primitives";
+import { Receipt, ReceiptLine, ReceiptTotal } from "./receipt";
+import { Field, FieldError, Sheet, SheetActions } from "./sheet";
+
+export function CapitalSheet({
+  accountId, holders, currency, preview, form, error, backHref, commitAction, blocked,
+}: {
+  accountId: number;
+  holders: HolderRow[];
+  currency: string;
+  preview: Preview | null;
+  form: { holderId?: string; amount?: string; occurredOn?: string; note?: string };
+  error?: string;
+  backHref: string;
+  commitAction: (formData: FormData) => Promise<void>;
+  /** Set when a pending capital event blocks any dated entry. */
+  blocked?: { candidateDate: string; reviewHref: string };
+}) {
+  if (blocked) {
+    return (
+      <Sheet title="Add capital" backHref={backHref}>
+        <div className="banner-halt" role="status">
+          <strong>Not while a capital event is unclassified.</strong>
+          <p style={{ margin: "6px 0 0" }}>
+            There is an unexplained balance move on {formatDate(blocked.candidateDate)}. Until
+            it is classified, the account&apos;s value on that date is not known — so neither is
+            the NAV a deposit would issue units at, and units issued at the wrong NAV cannot
+            be corrected without reversing everything after them.
+          </p>
+          <p style={{ margin: "6px 0 0" }}><a href={blocked.reviewHref}>Review it</a></p>
+        </div>
+      </Sheet>
+    );
+  }
+
+  if (preview === null) {
+    return (
+      <Sheet
+        title="Add capital"
+        lede="Units are issued at the NAV on the day the money lands. That is what stops a new investor diluting an existing one."
+        backHref={backHref}
+      >
+        {error ? <FieldError>{error}</FieldError> : null}
+        <form method="get">
+          <input type="hidden" name="step" value="confirm" />
+          <Field name="holderId" label="Holder">
+            <select id="holderId" name="holderId" required defaultValue={form.holderId}>
+              <option value="">Choose…</option>
+              {holders.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.name}{h.isManager ? " (you)" : ""}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field name="amount" label={`Amount, ${currency}`}>
+            <input id="amount" name="amount" inputMode="decimal" required defaultValue={form.amount} />
+          </Field>
+          <Field name="occurredOn" label="Date" hint="The broker-server date the money landed.">
+            <input id="occurredOn" name="occurredOn" type="date" required defaultValue={form.occurredOn} />
+          </Field>
+          <Field name="note" label="Note" hint="Optional. Appears on the ledger.">
+            <input id="note" name="note" defaultValue={form.note} />
+          </Field>
+          <SheetActions>
+            <button className="btn btn-primary" type="submit">Review</button>
+          </SheetActions>
+        </form>
+      </Sheet>
+    );
+  }
+
+  const fields = fingerprintToFields(preview.fingerprint);
+  const holderId = Number(form.holderId);
+  const holder = holders.find((h) => h.id === holderId);
+  const idx = preview.after.holders.findIndex((h) => h.holderId === holderId);
+  const unitsIssued = preview.after.holders[idx]!.units - preview.before.holders[idx]!.units;
+  const navMoved = preview.navResidualX1e4 !== 0n;
+
+  return (
+    <Sheet title={`Add capital — ${holder?.name ?? ""}`} backHref={backHref} backLabel="Back">
+      {error ? <FieldError>{error}</FieldError> : null}
+
+      <Receipt label="Deposit">
+        <ReceiptLine label="Amount">
+          <span className="num">{formatMoney(preview.equityDelta, { currency })}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Date">
+          <span className="num">{formatDate(form.occurredOn ?? "")}</span>
+        </ReceiptLine>
+        <ReceiptLine label="NAV units are issued at" hint="The NAV before this deposit.">
+          <span className="num">{formatNav(totalsOf(preview.before))}</span>
+        </ReceiptLine>
+        <ReceiptLine
+          label="Units issued"
+          hint="Amount divided by NAV, rounded DOWN — never more units than were paid for."
+        >
+          <span className="num">{formatUnitsDp(unitsIssued, 10)}</span>
+        </ReceiptLine>
+        <ReceiptLine label="Units in issue" hint="Before, then after.">
+          <span className="num">
+            {formatUnitsDp(preview.before.units)} → {formatUnitsDp(preview.after.units)}
+          </span>
+        </ReceiptLine>
+        <ReceiptLine
+          label="NAV per unit"
+          hint={navMoved
+            ? "A deposit cannot lower NAV. The sub-cent rounding residual stays in the pool, which nudges it up."
+            : "Unchanged, which is the point: a deposit issues units at the prevailing NAV."}
+        >
+          <span className="num">
+            {formatNav(totalsOf(preview.before))} → {formatNav(totalsOf(preview.after))}
+          </span>
+        </ReceiptLine>
+        <ReceiptTotal label="Account equity after">
+          <Money cents={preview.after.equityCents} currency={currency} />
+        </ReceiptTotal>
+      </Receipt>
+
+      <div className="scroller" style={{ marginTop: 18 }}>
+        <table>
+          <caption className="eyebrow">What this does to everyone</caption>
+          <thead>
+            <tr>
+              <th scope="col">Holder</th>
+              <th scope="col">Share before</th>
+              <th scope="col">Share after</th>
+              <th scope="col">Value before</th>
+              <th scope="col">Value after</th>
+            </tr>
+          </thead>
+          <tbody>
+            {preview.after.holders.map((h, i) => (
+              <tr key={h.holderId} className={h.holderId === holderId ? "own" : ""}>
+                <th scope="row" style={{ fontWeight: 400 }}>
+                  {holders.find((x) => x.id === h.holderId)?.name ?? `Holder #${h.holderId}`}
+                </th>
+                <td className="num">{formatPpm(preview.sharesBefore[i]!)}</td>
+                <td className="num">{formatPpm(preview.sharesAfter[i]!)}</td>
+                <td><Money cents={preview.valuesBefore[i]!} currency={currency} /></td>
+                <td><Money cents={preview.valuesAfter[i]!} currency={currency} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="split-note">
+        Every other holder&apos;s share falls and their value does not move. A deposit buys
+        units at the NAV that already existed, so it cannot take value from anyone who was
+        already in. Where a division does not terminate, the sub-cent residual stays in the
+        pool and can move a stated value by one cent — upward, never down.
+      </p>
+
+      <form action={commitAction}>
+        <input type="hidden" name="accountId" value={accountId} />
+        {(["holderId", "amount", "occurredOn", "note"] as const).map((k) => (
+          <input key={k} type="hidden" name={k} value={form[k] ?? ""} />
+        ))}
+        {Object.entries(fields).map(([k, v]) => (
+          <input key={k} type="hidden" name={k} value={v} />
+        ))}
+        <SheetActions>
+          <button className="btn btn-primary" type="submit">Record this deposit</button>
+        </SheetActions>
+      </form>
+    </Sheet>
+  );
+}
+```
+
+- [ ] **Step 5: The two pages and the two actions**
+
+```tsx
+// app/a/[id]/actions/investor/page.tsx
+import { requireAccount } from "@/lib/compound/load/account";
+import { InvestorSheet } from "@/lib/compound/ui/investor-sheet";
+import { deskHref } from "@/lib/compound/ui/routes";
+import { addInvestor } from "../actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function InvestorPage({
+  params, searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<Record<string, string | undefined>>;
+}) {
+  const account = await requireAccount((await params).id);
+  const q = await searchParams;
+  return (
+    <InvestorSheet
+      accountId={account.id}
+      defaultSplitBps={account.defaultSplitBps}
+      currency={account.currency}
+      form={q}
+      error={q.error}
+      backHref={deskHref(account.id)}
+      commitAction={addInvestor}
+    />
+  );
+}
+```
+
+```tsx
+// app/a/[id]/actions/capital/page.tsx
+import { withDb } from "@/lib/compound/db/client";
+import { listHolders } from "@/lib/compound/db/holders";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadInterlock } from "@/lib/compound/load/interlock";
+import { loadLedger, loadSeeds } from "@/lib/compound/load/ledger";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { CapitalSheet } from "@/lib/compound/ui/capital-sheet";
+import { deskHref, reviewHref } from "@/lib/compound/ui/routes";
+import { addCapital } from "../actions";
+
+export const dynamic = "force-dynamic";
+
+export default async function CapitalPage({
+  params, searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<Record<string, string | undefined>>;
+}) {
+  const account = await requireAccount((await params).id);
+  const q = await searchParams;
+  const [holders, entries, seeds, interlock] = await Promise.all([
+    withDb((c) => listHolders(c, account.id)),
+    loadLedger(account.id),
+    loadSeeds(account.id),
+    loadInterlock(account.id),
+  ]);
+
+  let preview = null;
+  if (q.step === "confirm" && q.holderId && q.amount && q.occurredOn) {
+    try {
+      preview = previewEntry({
+        accountId: account.id, entries, seeds,
+        proposed: {
+          holderId: Number(q.holderId),
+          occurredOn: q.occurredOn,
+          type: "deposit",
+          amountCents: centsFromDecimal(q.amount),
+          feeSettlement: null,
+          splitBpsApplied: null,
+        },
+      });
+    } catch {
+      preview = null;
+    }
+  }
+
+  return (
+    <CapitalSheet
+      accountId={account.id}
+      holders={holders}
+      currency={account.currency}
+      preview={preview}
+      form={q}
+      error={q.error}
+      backHref={deskHref(account.id)}
+      commitAction={addCapital}
+      blocked={interlock.pendingCandidateDate === null ? undefined : {
+        candidateDate: interlock.pendingCandidateDate,
+        reviewHref: reviewHref(account.id),
+      }}
+    />
+  );
+}
+```
+
+Append to `app/a/[id]/actions/actions.ts`:
+
+```typescript
+export async function addInvestor(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const back = investorHref(account.id);
+  try {
+    const holderId = await withDb((c) =>
+      addHolder(c, {
+        accountId: account.id,
+        name: String(formData.get("name") ?? ""),
+        email: String(formData.get("email") ?? "") || null,
+        splitBps: Math.round(Number(formData.get("split")) * 100),
+        joinedAt: String(formData.get("joinedAt")),
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(`${capitalHref(account.id)}?holderId=${holderId}`);
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?step=confirm&error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+
+export async function addCapital(formData: FormData) {
+  const account = await requireAccount(String(formData.get("accountId")));
+  const user = await requireManager();
+  const back = capitalHref(account.id);
+
+  const stale = await staleness(account.id, formData);
+  if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
+
+  let amountCents: bigint;
+  try {
+    amountCents = centsFromDecimal(String(formData.get("amount")));
+  } catch {
+    redirect(`${back}?error=${encodeURIComponent("That is not an amount. Use digits and at most two decimal places.")}`);
+    return;
+  }
+
+  try {
+    await withDbTransaction((c) =>
+      commitDeposit(c, {
+        accountId: account.id,
+        holderId: Number(formData.get("holderId")),
+        occurredOn: String(formData.get("occurredOn")),
+        amountCents,
+        note: String(formData.get("note") ?? "") || null,
+        actorUserId: user.id,
+      }),
+    );
+    revalidatePath(deskHref(account.id), "layout");
+    redirect(deskHref(account.id));
+  } catch (e) {
+    if (isNextControlFlow(e)) throw e;
+    redirect(`${back}?error=${encodeURIComponent(explainCommitError(e))}`);
+  }
+}
+```
+
+Add `Add an investor` and `Add capital` to the desk's action bar in `app/a/[id]/page.tsx`.
+
+- [ ] **Step 6: Write `lib/compound/ui/capital-sheet.test.tsx`**
+
+The receipt is the deliverable, so the figures are what is asserted.
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import type { HolderRow } from "@/lib/compound/db/holders";
+import { centsFromDecimal } from "@/lib/compound/engine/money";
+import { previewEntry } from "@/lib/compound/present/derive";
+import { ADA_ID, GRACE_ID, LEDGER, MANAGER_ID, SEEDS } from "@/lib/compound/present/fixture";
+import { CapitalSheet } from "./capital-sheet";
+
+const HOLDERS: HolderRow[] = [
+  { id: MANAGER_ID, accountId: 7, name: "J. Marsh", email: null, userId: null,
+    isManager: true, splitBps: 0, joinedAt: "2026-03-02", status: "active" },
+  { id: ADA_ID, accountId: 7, name: "Ada Lovelace", email: null, userId: null,
+    isManager: false, splitBps: 4000, joinedAt: "2026-05-04", status: "active" },
+  { id: GRACE_ID, accountId: 7, name: "Grace Hopper", email: null, userId: null,
+    isManager: false, splitBps: 3700, joinedAt: "2026-07-06", status: "active" },
+];
+
+const PREVIEW = previewEntry({
+  accountId: 7, entries: LEDGER, seeds: SEEDS,
+  proposed: {
+    holderId: ADA_ID, occurredOn: "2026-08-18", type: "deposit",
+    amountCents: centsFromDecimal("4250.00"), feeSettlement: null, splitBpsApplied: null,
+  },
+});
+
+const noop = async () => {};
+
+function renderSheet(over: Partial<Parameters<typeof CapitalSheet>[0]> = {}) {
+  return render(
+    <CapitalSheet
+      accountId={7}
+      holders={HOLDERS}
+      currency="USD"
+      preview={over.preview === undefined ? PREVIEW : over.preview}
+      form={over.form ?? { holderId: String(ADA_ID), amount: "4250.00", occurredOn: "2026-08-18" }}
+      error={over.error}
+      backHref="/a/7"
+      commitAction={noop}
+      blocked={over.blocked}
+    />,
+  );
+}
+
+describe("CapitalSheet — the receipt", () => {
+  beforeEach(() => renderSheet());
+
+  it("shows the amount and the NAV it buys at", () => {
+    expect(screen.getByLabelText("Amount").textContent).toBe("$4,250.00");
+    expect(screen.getByLabelText("NAV units are issued at").textContent).toBe("1.3858");
+  });
+
+  it("shows units issued to ten places, floored", () => {
+    // 4250.00 at NAV 1.3858... is 3066.6207821498... Ceiling it would end
+    // 1499 and would lower NAV for everyone else.
+    expect(screen.getByLabelText("Units issued").textContent).toBe("3,066.6207821498");
+  });
+
+  it("shows units in issue before and after, differing by exactly what was issued", () => {
+    expect(screen.getByLabelText("Units in issue").textContent)
+      .toBe("40,222.4547 → 43,289.0755");
+  });
+
+  it("shows NAV unchanged, and says why that is the point", () => {
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.3858");
+    expect(screen.getByText(/issues units at the prevailing NAV/)).toBeInTheDocument();
+  });
+
+  it("shows the resulting equity", () => {
+    expect(screen.getByLabelText("Account equity after").textContent).toBe("$59,993.91");
+  });
+});
+
+describe("CapitalSheet — what it does to everyone", () => {
+  beforeEach(() => renderSheet());
+
+  function row(name: string): string[] {
+    const r = screen.getByRole("row", { name: new RegExp(name) });
+    return [...within(r).getAllByRole("rowheader"), ...within(r).getAllByRole("cell")]
+      .map((c) => c.textContent ?? "");
+  }
+
+  it("dilutes every existing holder's share", () => {
+    expect(row("J. Marsh").slice(1, 3)).toEqual(["62.15%", "57.75%"]);
+    expect(row("Grace Hopper").slice(1, 3)).toEqual(["15.19%", "14.11%"]);
+  });
+
+  it("leaves every existing holder's value exactly where it was", () => {
+    expect(row("J. Marsh").slice(3, 5)).toEqual(["$34,647.26", "$34,647.26"]);
+    expect(row("Grace Hopper").slice(3, 5)).toEqual(["$8,466.04", "$8,466.04"]);
+  });
+
+  it("raises the depositor's share and their value by the amount deposited", () => {
+    expect(row("Ada Lovelace").slice(1, 3)).toEqual(["22.66%", "28.14%"]);
+    expect(row("Ada Lovelace").slice(3, 5)).toEqual(["$12,630.61", "$16,880.61"]);
+  });
+
+  it("keeps both share columns summing to a full pool", () => {
+    for (const col of [1, 2]) {
+      const total = ["J. Marsh", "Ada Lovelace", "Grace Hopper"]
+        .map((n) => Number(row(n)[col]!.replace("%", "")))
+        .reduce((a, b) => a + b, 0);
+      expect(total).toBeCloseTo(100, 1);
+    }
+  });
+
+  it("says in words what the two columns show", () => {
+    expect(screen.getByText(/share falls and their value does not move/)).toBeInTheDocument();
+    expect(screen.getByText(/upward, never down/)).toBeInTheDocument();
+  });
+});
+
+describe("CapitalSheet — the interlock", () => {
+  it("refuses while a capital event is unclassified, and explains the NAV problem", () => {
+    renderSheet({ preview: null, blocked: { candidateDate: "2026-08-12", reviewHref: "/a/7/review" } });
+    expect(screen.getByText(/unexplained balance move on 12 Aug 2026/)).toBeInTheDocument();
+    expect(screen.getByText(/units issued at the wrong NAV cannot be corrected/))
+      .toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Record this deposit/ })).toBeNull();
+  });
+});
+
+describe("CapitalSheet — a first deposit for a brand-new investor", () => {
+  it("issues them units and leaves everyone else's value alone", () => {
+    const seeds = [...SEEDS, { holderId: 4, isManager: false, splitBps: 4000 }];
+    const preview = previewEntry({
+      accountId: 7, entries: LEDGER, seeds,
+      proposed: {
+        holderId: 4, occurredOn: "2026-08-18", type: "deposit",
+        amountCents: centsFromDecimal("6000.00"), feeSettlement: null, splitBpsApplied: null,
+      },
+    });
+    render(
+      <CapitalSheet
+        accountId={7}
+        holders={[...HOLDERS, { ...HOLDERS[1]!, id: 4, name: "Katherine Johnson" }]}
+        currency="USD" preview={preview}
+        form={{ holderId: "4", amount: "6000.00", occurredOn: "2026-08-18" }}
+        backHref="/a/7" commitAction={noop}
+      />,
+    );
+    expect(screen.getByLabelText("Units issued").textContent).toBe("4,329.3469865645");
+    expect(screen.getByLabelText("NAV per unit").textContent).toBe("1.3858 → 1.3858");
+    const r = screen.getByRole("row", { name: /Katherine Johnson/ });
+    const cells = [...within(r).getAllByRole("cell")].map((c) => c.textContent);
+    expect(cells[0]).toBe("0.00%");
+    expect(cells[1]).toBe("9.72%");
+    expect(cells[2]).toBe("$0.00");
+    expect(cells[3]).toBe("$6,000.00");
+  });
+});
+```
+
+- [ ] **Step 7: Write `lib/compound/ui/investor-sheet.test.tsx`**
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import { InvestorSheet } from "./investor-sheet";
+
+const noop = async () => {};
+const base = {
+  accountId: 7, defaultSplitBps: 4000, currency: "USD",
+  backHref: "/a/7", commitAction: noop,
+};
+
+describe("InvestorSheet — step one", () => {
+  it("offers the account default without hard-coding it", () => {
+    render(<InvestorSheet {...base} defaultSplitBps={3700} form={{}} />);
+    expect(screen.getByLabelText(/Your share of their profit/)).toHaveValue("37");
+    expect(screen.getByText(/The account default is 37%/)).toBeInTheDocument();
+  });
+
+  it("says nothing moves until capital is added", () => {
+    render(<InvestorSheet {...base} form={{}} />);
+    expect(screen.getByText(/Nothing moves until you add capital/)).toBeInTheDocument();
+  });
+});
+
+describe("InvestorSheet — the terms", () => {
+  beforeEach(() =>
+    render(
+      <InvestorSheet
+        {...base}
+        form={{ step: "confirm", name: "Grace Hopper", email: "grace@example.com",
+                split: "37", joinedAt: "2026-07-06" }}
+      />,
+    ));
+
+  it("states the split as a ratio and as a sentence", () => {
+    expect(screen.getByLabelText("Split").textContent).toBe("63 / 37");
+    expect(screen.getByText(/Grace Hopper keeps 63% of profit and you keep 37%/))
+      .toBeInTheDocument();
+  });
+
+  it("says when the fee applies, in the words the payout receipt uses", () => {
+    expect(screen.getByText(/only when Grace Hopper withdraws/)).toBeInTheDocument();
+    expect(screen.getByText(/only on withdrawal, and only on profit/)).toBeInTheDocument();
+  });
+
+  it("explains why staggered entry is safe", () => {
+    expect(screen.getByText(/at the NAV on the day it lands/)).toBeInTheDocument();
+    expect(screen.getByText(/stops a later investor diluting an earlier one/))
+      .toBeInTheDocument();
+  });
+
+  it("names the person on the button, so a mis-typed name is caught here", () => {
+    expect(screen.getByRole("button", { name: "Add Grace Hopper" })).toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 8: Write `lib/compound/db/write-deposit.db.test.ts`**
+
+```typescript
+import { withDbTransaction } from "@/lib/compound/db/client";
+import { getLedgerEntries } from "@/lib/compound/db/compound";
+import { commitDeposit } from "@/lib/compound/db/write-deposit";
+import { addHolder } from "@/lib/compound/db/write-holder";
+import { MANAGER_USER_ID, seedTwoAccounts } from "@/lib/compound/db/test-harness";
+
+const rollback = (e: Error) => { if (e.message !== "rollback") throw e; };
+
+describe("commitDeposit", () => {
+  it("assigns seq server-side, starting at 1 and rising", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const a = await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 2_500_000n, note: null,
+        actorUserId: MANAGER_USER_ID,
+      });
+      const b = await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-03", amountCents: 100n, note: null,
+        actorUserId: MANAGER_USER_ID,
+      });
+      expect(b.seq).toBe(a.seq + 1);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("keeps seq independent per account", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      const a = await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const b = await commitDeposit(c, {
+        accountId: theirs.accountId, holderId: theirs.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      expect(a.seq).toBe(b.seq);   // both are 1: seq is per account, not global
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("stores an amount past Number.MAX_SAFE_INTEGER exactly", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const big = 9_007_199_254_740_993n;
+      await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: big, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      const [entry] = await getLedgerEntries(c, mine.accountId);
+      expect(entry!.amountCents).toBe(big);
+      expect(entry!.amountCents).not.toBe(9_007_199_254_740_992n);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("stores no units_delta and no nav_at_entry, because there are no such columns", async () => {
+    await withDbTransaction(async (c) => {
+      const { rows } = await c.query<{ column_name: string }>(
+        `select column_name from information_schema.columns
+          where table_schema = 'public' and table_name = 'compound_ledger_entry'`,
+      );
+      const names = rows.map((r) => r.column_name);
+      expect(names).not.toContain("units_delta");
+      expect(names).not.toContain("nav_at_entry");
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a holder who belongs to another account, with CX205", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine, theirs } = await seedTwoAccounts(c);
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: theirs.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/is not on account/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a deposit dated on or after an unclassified capital event, with CX002", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await c.query(
+        `insert into public.compound_capital_event_candidate
+           (account_id, trade_date, balance_delta_cents, explained_cents, unexplained_cents)
+         values ($1, '2026-08-12', 500000, 0, 500000)`,
+        [mine.accountId],
+      );
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-08-12", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/on or after the unclassified capital event/);
+
+      // And permits one dated before it, or the guard is just "refuse everything".
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-08-11", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      })).resolves.toBeDefined();
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses a non-positive amount before it reaches SQL", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await expect(commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 0n, note: null, actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/a deposit must be positive/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("cannot be updated or deleted afterwards", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      const { ledgerEntryId } = await commitDeposit(c, {
+        accountId: mine.accountId, holderId: mine.managerHolderId,
+        occurredOn: "2026-03-02", amountCents: 100n, note: null, actorUserId: MANAGER_USER_ID,
+      });
+      await expect(
+        c.query(`update public.compound_ledger_entry set amount_cents = 1 where id = $1`,
+          [ledgerEntryId]),
+      ).rejects.toThrow(/append-only|not permitted|permission denied/i);
+      await expect(
+        c.query(`delete from public.compound_ledger_entry where id = $1`, [ledgerEntryId]),
+      ).rejects.toThrow(/append-only|not permitted|permission denied/i);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+
+describe("addHolder", () => {
+  it("refuses to create a second manager", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      // addHolder cannot ask for is_manager, so the only route to two managers
+      // is direct SQL — which the partial unique index refuses.
+      await expect(
+        c.query(
+          `insert into public.compound_holder
+             (account_id, name, is_manager, split_bps, status)
+           values ($1, 'Impostor', true, 0, 'active')`,
+          [mine.accountId],
+        ),
+      ).rejects.toThrow(/unique|already exists/i);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("refuses an empty name", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);
+      await expect(addHolder(c, {
+        accountId: mine.accountId, name: "   ", email: null, splitBps: 4000,
+        joinedAt: "2026-07-06", actorUserId: MANAGER_USER_ID,
+      })).rejects.toThrow(/a holder needs a name/);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+
+  it("stores the holder's own split, not the account default", async () => {
+    await withDbTransaction(async (c) => {
+      const { mine } = await seedTwoAccounts(c);   // account default is 4000
+      const id = await addHolder(c, {
+        accountId: mine.accountId, name: "Grace Hopper", email: null, splitBps: 3700,
+        joinedAt: "2026-07-06", actorUserId: MANAGER_USER_ID,
+      });
+      const { rows } = await c.query<{ split_bps: number }>(
+        `select split_bps from public.compound_holder where id = $1`, [id],
+      );
+      expect(rows[0]!.split_bps).toBe(3700);
+      throw new Error("rollback");
+    }).catch(rollback);
+  });
+});
+```
+
+- [ ] **Step 9: Run the gates and prove three probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm test:db && pnpm build
+```
+
+Then, reverting each:
+
+1. In `compound_commit_deposit`, delete the pending-candidate check. Expect the CX002 integration test to fail on its first assertion — and note that the second half of that test, the one that permits a deposit dated *before* the event, is what stops the guard being "refuse everything".
+2. In `nav.ts`, switch `unitsForDeposit` from `mulDivFloor` to `mulDivCeil`. Expect `previewEntry` to throw `assertNavDidNotFall` and the entire capital-sheet suite to fail to render. That is the cross-module alarm: a rounding reversal in the engine takes the receipt down rather than quietly printing a smaller NAV.
+3. In `CapitalSheet`, render `sharesAfter` in both share columns. Expect the dilution assertions to fail while the value assertions still pass — which is the pair that shows the receipt is making a claim about the difference rather than about either column alone.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): adding an investor, and adding capital
+
+The deposit receipt shows every holder's share falling and every holder's value
+standing still, side by side. That contrast is the explanation for why units
+solve staggered entry, and it is the thing an existing investor asks about the
+moment a new one joins.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
