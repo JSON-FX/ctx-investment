@@ -3,7 +3,7 @@ import { allocateValues, valueOfUnits } from "@/lib/compound/engine/nav";
 import { fold, totalsOf } from "@/lib/compound/engine/replay";
 import { ADA_ID, LEDGER, SEEDS } from "./fixture";
 import {
-  formatDate, formatMoney, formatNav, formatPpm, formatSinceInception,
+  formatDate, formatLots, formatMoney, formatNav, formatPpm, formatSinceInception,
   formatSplit, formatSplitWords, formatUnitsDp, formatUtcStamp, signOf, splitMoney,
 } from "./format";
 
@@ -270,5 +270,34 @@ describe("decision D-A: allocated and floored value are both formatted, and stay
 
   it("the two figures are not equal", () => {
     expect(formatMoney(allocated[adaIndex]!)).not.toBe(formatMoney(valueOfUnits(TOTALS, ada.units)));
+  });
+});
+
+describe("formatLots", () => {
+  it("renders 0.05 lots from 50 milli-lots", () => {
+    expect(formatLots(50)).toBe("0.050");
+  });
+
+  it("renders a whole lot", () => {
+    expect(formatLots(1000)).toBe("1.000");
+  });
+
+  it("pads a fraction with leading zeros", () => {
+    expect(formatLots(1)).toBe("0.001");
+  });
+
+  it("renders zero volume, rather than throwing on the falsy value", () => {
+    // 0 is a non-negative integer and a legitimate (if odd) input; the guard
+    // is `< 0`, not truthiness, and this is the case that would catch a
+    // `!milliLots` typo in the refusal check.
+    expect(formatLots(0)).toBe("0.000");
+  });
+
+  it("refuses a fractional milli-lot", () => {
+    expect(() => formatLots(0.5)).toThrow(/must be a non-negative integer/);
+  });
+
+  it("refuses a negative milli-lot", () => {
+    expect(() => formatLots(-50)).toThrow(/must be a non-negative integer/);
   });
 });

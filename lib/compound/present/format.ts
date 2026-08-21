@@ -202,3 +202,15 @@ export function formatUtcStamp(iso: string): string {
 export function signOf(c: Cents): "pos" | "neg" | "zero" {
   return c > 0n ? "pos" : c < 0n ? "neg" : "zero";
 }
+
+/**
+ * Milli-lots to lots. `volumeMilliLots` is lots x 1000 as an integer, so 50
+ * is 0.05 lots. Integer arithmetic throughout: a float divide reintroduces
+ * the comparison problem the milli-lot representation exists to avoid.
+ */
+export function formatLots(milliLots: number): string {
+  if (!Number.isInteger(milliLots) || milliLots < 0) {
+    throw new RangeError(`milliLots must be a non-negative integer, got ${milliLots}`);
+  }
+  return `${Math.trunc(milliLots / 1000)}.${(milliLots % 1000).toString().padStart(3, "0")}`;
+}
