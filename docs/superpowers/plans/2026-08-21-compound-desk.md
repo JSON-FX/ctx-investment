@@ -5074,3 +5074,368 @@ MSG
 )"
 ```
 
+---
+
+### Task 8: `/a/[id]` — the desk
+
+Spec §7's headline surface: statement head, unit rail, KPI strip, holder table.
+
+> **The convention every route from here follows, and the reason the tests in this plan can exist.**
+>
+> **A route is a loader plus a sync component.** The page resolves the account, awaits the loaders, and renders one synchronous component that takes engine types as props. That component lives in `lib/compound/ui/` and is where every test points.
+>
+> `@testing-library/react` cannot render an async Server Component, so a page with branches in it is a page with untestable branches. Keeping the page to *resolve, load, render* means the only thing not covered by a component test is a four-line function with no conditionals — and Task 15's smoke pass covers that.
+>
+> This applies to Tasks 8 through 14 without further comment.
+
+**Files:**
+- Create: `lib/compound/ui/desk.tsx`
+- Create: `app/a/[id]/page.tsx`
+- Test: `lib/compound/ui/desk.test.tsx`
+
+**Interfaces:**
+- Consumes: `deskFigures` from `@/lib/compound/present/derive`; `railSegments` from `@/lib/compound/present/rail`; `loadPoolState`, `loadHolderNames`, `loadLive`, `loadLedger` from `@/lib/compound/load/ledger`; every component from `@/lib/compound/ui/*`
+- Produces: `Desk` component; the `/a/[id]` route
+
+- [ ] **Step 1: Create `lib/compound/ui/desk.tsx`**
+
+```tsx
+/**
+ * The desk. Everything on it is derived from one PoolState.
+ *
+ * Two figures on this page are the same quantity measured two ways and they
+ * are meant to stay apart:
+ *
+ *   Account equity   the COMMITTED figure, from the last posted reading.
+ *   Live equity      account_snapshots_current, intraday, not posted.
+ *
+ * Spec section 5.2 keeps them apart because a payout may never settle against
+ * a drifting intraday figure. The headline is always the committed one.
+ *
+ * The KPI strip carries exactly one amber tile — "Fee if everyone paid out
+ * today" — and it is the only amber on the page apart from the manager's row.
+ * Spec section 8.2: amber means the fee and nothing else.
+ */
+import type { PoolState } from "@/lib/compound/engine/replay";
+import { totalsOf } from "@/lib/compound/engine/replay";
+import type { DeskFigures } from "@/lib/compound/present/derive";
+import type { RailSegment } from "@/lib/compound/present/rail";
+import { HolderTable } from "./holder-table";
+import { OwnershipRail } from "./rail";
+import { DeltaMoney, EmptyState, Eyebrow, FeeMoney, Money, Panel } from "./primitives";
+import { KpiStrip, StatementHead, type LiveFigures } from "./statement";
+
+export function Desk({
+  accountId, state, figures, segments, currency, entryCount, live, actions,
+}: {
+  accountId: number;
+  state: PoolState;
+  figures: DeskFigures;
+  segments: RailSegment[];
+  currency: string;
+  entryCount: number;
+  live: LiveFigures | null;
+  /** Phase B fills this. Absent in Phase A, and the desk is complete without it. */
+  actions?: React.ReactNode;
+}) {
+  if (entryCount === 0) {
+    return (
+      <Panel>
+        <EmptyState title="Nothing posted yet">
+          This account has no ledger entries. Post an equity reading or add capital
+          to start, and every figure on this page will be derived from what you post.
+        </EmptyState>
+        {actions ? <div className="actions" style={{ justifyContent: "center" }}>{actions}</div> : null}
+      </Panel>
+    );
+  }
+
+  return (
+    <>
+      <Panel>
+        <StatementHead
+          totals={totalsOf(state)}
+          currency={currency}
+          asOf={state.lastReadingOn}
+          entryCount={entryCount}
+          holderCount={figures.holderCount}
+          live={live}
+        />
+        <OwnershipRail segments={segments} />
+        {actions ? <div className="actions">{actions}</div> : null}
+      </Panel>
+
+      <KpiStrip
+        items={[
+          {
+            key: "capital",
+            label: "Investor capital in",
+            value: <Money cents={figures.investorBasisCents} currency={currency} />,
+          },
+          {
+            key: "value",
+            label: "Investor value now",
+            value: <Money cents={figures.investorValueCents} currency={currency} />,
+          },
+          {
+            key: "pl",
+            label: "Investor P/L",
+            value: <DeltaMoney cents={figures.investorProfitCents} currency={currency} />,
+          },
+          {
+            key: "yours",
+            label: "Your holding",
+            value: <Money cents={figures.managerValueCents} currency={currency} />,
+          },
+          {
+            key: "fee",
+            label: "Fee if everyone paid out today",
+            tone: "fee",
+            value: <FeeMoney cents={figures.feeIfAllExitCents} currency={currency} />,
+          },
+        ]}
+      />
+
+      <Panel flush>
+        <HolderTable
+          accountId={accountId}
+          figures={figures}
+          currency={currency}
+          showActions={actions !== undefined}
+        />
+      </Panel>
+
+      <p className="foot">
+        Every figure on this page is derived by replaying {entryCount} ledger{" "}
+        {entryCount === 1 ? "entry" : "entries"}. Nothing is stored. Money is integer
+        cents, units are integers scaled 1e-10, and no floating point is used anywhere
+        in the accounting.
+      </p>
+    </>
+  );
+}
+```
+
+- [ ] **Step 2: Create `app/a/[id]/page.tsx`**
+
+```tsx
+import { requireAccount } from "@/lib/compound/load/account";
+import { loadHolderNames, loadLedger, loadLive, loadPoolState } from "@/lib/compound/load/ledger";
+import { deskFigures } from "@/lib/compound/present/derive";
+import { railSegments } from "@/lib/compound/present/rail";
+import { Desk } from "@/lib/compound/ui/desk";
+
+export const dynamic = "force-dynamic";
+
+export default async function DeskPage({ params }: { params: Promise<{ id: string }> }) {
+  const account = await requireAccount((await params).id);
+  const [state, names, live, entries] = await Promise.all([
+    loadPoolState(account.id),
+    loadHolderNames(account.id),
+    loadLive(account.mt5Account),
+    loadLedger(account.id),
+  ]);
+
+  return (
+    <Desk
+      accountId={account.id}
+      state={state}
+      figures={deskFigures(state, names)}
+      segments={railSegments(state, names)}
+      currency={account.currency}
+      entryCount={entries.length}
+      live={live}
+    />
+  );
+}
+```
+
+- [ ] **Step 3: Write `lib/compound/ui/desk.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import { fold } from "@/lib/compound/engine/replay";
+import { deskFigures } from "@/lib/compound/present/derive";
+import { railSegments } from "@/lib/compound/present/rail";
+import { HOLDER_NAMES, LEDGER, LIVE, SEEDS } from "@/lib/compound/present/fixture";
+import { Desk } from "./desk";
+
+const STATE = fold(LEDGER, SEEDS);
+const NAMES = HOLDER_NAMES;
+
+function renderDesk(over: Partial<Parameters<typeof Desk>[0]> = {}) {
+  const state = over.state ?? STATE;
+  return render(
+    <Desk
+      accountId={7}
+      state={state}
+      figures={over.figures ?? deskFigures(state, NAMES)}
+      segments={over.segments ?? railSegments(state, NAMES)}
+      currency={over.currency ?? "USD"}
+      entryCount={over.entryCount ?? LEDGER.length}
+      live={over.live === undefined ? LIVE : over.live}
+      actions={over.actions}
+    />,
+  );
+}
+
+describe("Desk — the statement head", () => {
+  beforeEach(() => renderDesk());
+
+  it("headlines the committed equity, not the live figure", () => {
+    expect(screen.getByLabelText("Account equity").textContent).toBe("$55,743.91");
+    expect(screen.getByLabelText("Live equity").textContent).toBe("$55,930.00");
+  });
+
+  it("shows NAV, growth, units and the holder count", () => {
+    expect(screen.getByLabelText("NAV / unit").textContent).toBe("1.3858");
+    expect(screen.getByLabelText("Since inception").textContent).toBe("+38.58%");
+    expect(screen.getByLabelText("Units issued").textContent).toBe("40,222.4547");
+    expect(screen.getByLabelText("Holders").textContent).toBe("3");
+  });
+});
+
+describe("Desk — the KPI strip", () => {
+  beforeEach(() => renderDesk());
+
+  it("reads back every headline figure", () => {
+    expect(screen.getByLabelText("Investor capital in").textContent).toBe("$17,500.00");
+    expect(screen.getByLabelText("Investor value now").textContent).toBe("$21,096.65");
+    expect(screen.getByLabelText("Investor P/L").textContent).toBe("+$3,596.65");
+    expect(screen.getByLabelText("Your holding").textContent).toBe("$34,647.26");
+    expect(screen.getByLabelText("Fee if everyone paid out today").textContent).toBe("$1,409.67");
+  });
+
+  it("separates the manager's holding from the investors' totals", () => {
+    // 34,647.26 + 21,096.65 = 55,743.91. If the manager leaked into the
+    // investor totals, "Investor value now" would read the equity figure.
+    const investors = BigInt(screen.getByLabelText("Investor value now").textContent!.replace(/\D/g, ""));
+    const yours = BigInt(screen.getByLabelText("Your holding").textContent!.replace(/\D/g, ""));
+    expect(investors + yours).toBe(5_574_391n);
+  });
+
+  it("carries exactly one amber tile, and it is the fee", () => {
+    const amber = document.querySelectorAll(".kpi-item.is-fee");
+    expect(amber).toHaveLength(1);
+    expect(amber[0]!.textContent).toContain("Fee if everyone paid out today");
+  });
+});
+
+describe("Desk — the ownership rail", () => {
+  beforeEach(() => renderDesk());
+
+  it("shows the manager darkest and first", () => {
+    const segs = document.querySelectorAll<HTMLElement>(".seg");
+    expect(segs[0]!.style.background).toBe("rgb(20, 83, 45)");
+  });
+
+  it("labels every segment with a name and a share", () => {
+    const legend = screen.getByRole("list", { name: "Ownership legend" });
+    expect(legend.textContent).toContain("J. Marsh (manager)");
+    expect(legend.textContent).toContain("62.15%");
+  });
+});
+
+describe("Desk — the holder table", () => {
+  it("agrees with the KPI strip on Ada's value", () => {
+    renderDesk();
+    const row = screen.getByRole("row", { name: /Ada Lovelace/ });
+    expect(within(row).getAllByRole("cell")[3]!.textContent).toBe("$12,630.61");
+  });
+
+  it("offers no payout link in Phase A, where nothing can be committed", () => {
+    renderDesk();
+    expect(screen.queryByRole("link", { name: "Pay out" })).toBeNull();
+  });
+
+  it("offers one once actions are wired", () => {
+    renderDesk({ actions: <a className="btn" href="/a/7/actions/reading">Post a reading</a> });
+    expect(screen.getAllByRole("link", { name: "Pay out" }).length).toBeGreaterThan(0);
+  });
+});
+
+describe("Desk — an account under water", () => {
+  const underwater = fold([...LEDGER, {
+    id: 7, seq: 7, holderId: null, occurredOn: "2026-08-18",
+    type: "equity_reading" as const, amountCents: 3_811_044n,
+    feeSettlement: null, splitBpsApplied: null, reversesId: null,
+  }], SEEDS);
+
+  beforeEach(() => renderDesk({ state: underwater, entryCount: 7, live: null }));
+
+  it("shows the accrued fee as zero, because no one is above their mark", () => {
+    expect(screen.getByLabelText("Fee if everyone paid out today").textContent).toBe("$0.00");
+  });
+
+  it("shows investor P/L negative, with a minus sign and not only a colour", () => {
+    // Spec 8.4: colour is never the sole carrier. The sign is the carrier.
+    expect(screen.getByLabelText("Investor P/L").textContent).toBe("-$3,076.86");
+  });
+
+  it("shows growth since inception as negative", () => {
+    expect(screen.getByLabelText("Since inception").textContent).toBe("-5.26%");
+  });
+
+  it("omits the live block entirely when nothing has been pushed", () => {
+    expect(screen.queryByLabelText("Live equity")).toBeNull();
+    expect(screen.queryByText(/Live · not yet posted/)).toBeNull();
+  });
+});
+
+describe("Desk — a new account", () => {
+  it("says what to do instead of rendering a statement of zeroes", () => {
+    renderDesk({ state: fold([], SEEDS), entryCount: 0, live: null });
+    expect(screen.getByText("Nothing posted yet")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Account equity")).toBeNull();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+});
+
+describe("Desk — currency", () => {
+  it("renders every figure in the account's currency", () => {
+    renderDesk({ currency: "EUR" });
+    expect(screen.getByLabelText("Account equity").textContent).toBe("€55,743.91");
+    expect(screen.getByLabelText("Fee if everyone paid out today").textContent).toBe("€1,409.67");
+  });
+});
+```
+
+**How these bite.**
+
+| Change | What goes red |
+|---|---|
+| headline `live.equityCents` instead of committed equity | "headlines the committed equity" — `$55,930.00` where `$55,743.91` belongs, which is spec §5.2's exact failure |
+| include the manager in `investorValueCents` | the KPI readback and the sum-to-equity assertion |
+| add a second `tone: "fee"` tile | "carries exactly one amber tile" |
+| render the empty account as a statement of zeroes | "says what to do instead", and `Account equity` reading `$0.00` |
+| drop the `sign: "always"` on investor P/L | the underwater minus-sign assertion — the one that keeps colour from being the sole carrier |
+| show the payout link before Phase B exists | "offers no payout link in Phase A" |
+
+Note what is deliberately **not** tested here: that the desk fetched the right rows. That is `loadPoolState`'s job and plan 3's integration suite covers the readers underneath it. Mocking the loaders and asserting they were called would test the mock.
+
+- [ ] **Step 4: Run the gates and prove two probes**
+
+```bash
+supabase db reset && pnpm typecheck && pnpm test && pnpm build
+```
+
+Then, reverting each:
+
+1. In `Desk`, pass `live.equityCents` to `StatementHead`'s `totals`. Expect exactly the committed-equity assertion to fail.
+2. In `deskFigures`, drop the `!r.isManager` filter from `investors`. Expect four assertions across `desk.test.tsx` and `derive.test.ts` to fail — the strip, the sum, and the two totals.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A && git commit -m "$(cat <<'MSG'
+feat(desk): the desk — statement head, ownership rail, KPI strip, holder table
+
+Every figure derived from one PoolState. The committed equity is the headline
+and the live figure is labelled beside it, per spec 5.2: a payout may never
+settle against a drifting intraday number, so the two never share a slot.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+MSG
+)"
+```
+
