@@ -48,7 +48,7 @@ describe("db purity", () => {
   // and passes having checked nothing. The floor is raised as db/ grows —
   // Task 8 takes it to 6.
   it("scans every source file in db/", () => {
-    expect(files.length).toBeGreaterThanOrEqual(3);
+    expect(files.length).toBeGreaterThanOrEqual(6);
   });
 
   it("never scales money in JavaScript, and never imports the UI stack", () => {
