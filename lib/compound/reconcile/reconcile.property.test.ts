@@ -16,6 +16,7 @@ interface Day {
   tradedCents: bigint;
   capitalCents: bigint;
   skipped: boolean;
+  splitDeal: boolean;
 }
 
 const dayArb: fc.Arbitrary<Day> = fc.record({
@@ -26,15 +27,19 @@ const dayArb: fc.Arbitrary<Day> = fc.record({
     { arbitrary: fc.bigInt({ min: -100_000n, max: 100_000n }), weight: 1 },
   ),
   skipped: fc.boolean(),
+  splitDeal: fc.boolean(),
 });
 
 const FIXTURE_EPOCH = Date.parse("2026-01-01T00:00:00Z");
 
 /**
  * A per-date stand-in for floating P/L. Equity is never equal to balance and
- * never differs from it by a constant — a constant cancels in the subtractions
- * reconcileDays performs, which is exactly how an earlier fixed offset left a
- * balance/equity swap undetectable.
+ * never differs from it by a constant. A constant wouldn't hide a field swap
+ * (balance + C still != balance) — what it hides is a caller that derives
+ * equity by walking balance deltas forward from a correct baseline instead of
+ * reading equityCloseCents off each snapshot. That delta-propagation bug is
+ * numerically identical to the correct value under a constant offset, and
+ * only per-date variation exposes it.
  */
 function floatingFor(tradeDate: string): bigint {
   const days = Math.floor((Date.parse(`${tradeDate}T00:00:00Z`) - FIXTURE_EPOCH) / 86_400_000);
@@ -58,12 +63,22 @@ function build(days: readonly Day[]): { snapshots: DailySnapshot[]; deals: Close
     const date = dateAt(i + 1);
     balance += d.tradedCents + d.capitalCents;
     if (d.tradedCents !== 0n) {
-      ticket += 1;
-      deals.push({
-        ticket, symbol: "GBPUSD", side: "buy", volumeMilliLots: 10,
-        openTime: `${date}T07:00:00.000Z`,
-        closeTime: `${date}T12:00:00.000Z`,
-        profitCents: d.tradedCents, swapCents: 0n, commissionCents: 0n,
+      // One trade or two closing the same UTC day. Two is the ordinary
+      // production case and nothing else in this suite produced it, which
+      // left detect.ts's per-day accumulation unguarded — changing it to
+      // overwrite passed every test in reconcile/.
+      const half = d.tradedCents / 2n;
+      const parts = d.splitDeal ? [half, d.tradedCents - half] : [d.tradedCents];
+      parts.forEach((profitCents, k) => {
+        ticket += 1;
+        deals.push({
+          ticket, symbol: "GBPUSD", side: "buy", volumeMilliLots: 10,
+          openTime: `${date}T07:00:00.000Z`,
+          // 12:00 and 14:00 — two hours apart, never the three-hour broker
+          // offset dedupe looks for, so a split pair cannot be read as a twin.
+          closeTime: `${date}T${k === 0 ? "12" : "14"}:00:00.000Z`,
+          profitCents, swapCents: 0n, commissionCents: 0n,
+        });
       });
     }
     // A skipped day models a weekend: the trade still closes, but no snapshot
@@ -245,6 +260,54 @@ describe("reconciler properties", () => {
                 `${s.equityCloseCents} and its balance is ${s.balanceCloseCents}`,
             );
           }
+        }
+        return true;
+      }),
+      { numRuns: 400 },
+    );
+  });
+
+  it("halts at the first snapshot carrying an unexplained capital move", () => {
+    fc.assert(
+      fc.property(fc.array(dayArb, { minLength: 1, maxLength: 30 }), (days) => {
+        const { snapshots, deals } = build(days);
+        const plan = planReadings({
+          snapshots, deals,
+          cursor: { lastReadingDate: null },
+          brokerOffsetHours: OFFSET_HOURS,
+          toleranceCents: 0n,
+        });
+
+        // Fold capital forward across skipped days: a move on a day with no
+        // snapshot lands in the NEXT snapshot's balance delta, so the halt
+        // belongs to that snapshot rather than to the day the move happened.
+        // Moves that cancel inside one gap produce no halt, correctly — the
+        // net balance move is then fully explained.
+        let pending = 0n;
+        let expected: string | null = null;
+        for (let i = 0; i < days.length; i += 1) {
+          const d = days[i]!;
+          pending += d.capitalCents;
+          if (!d.skipped) {
+            if (pending !== 0n && expected === null) expected = dateAt(i + 1);
+            pending = 0n;
+          }
+        }
+
+        if (expected === null) {
+          if (plan.kind === "halt") {
+            throw new Error(
+              `halted at ${plan.candidate.tradeDate}, but no snapshot carries an ` +
+                `unexplained capital move`,
+            );
+          }
+          return true;
+        }
+        if (plan.kind !== "halt") {
+          throw new Error(`expected a halt at ${expected}, got ${plan.kind}`);
+        }
+        if (plan.candidate.tradeDate !== expected) {
+          throw new Error(`halted at ${plan.candidate.tradeDate}, expected ${expected}`);
         }
         return true;
       }),
