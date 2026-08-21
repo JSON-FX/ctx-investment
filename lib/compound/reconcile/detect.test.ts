@@ -1,12 +1,28 @@
 import { reconcileDays } from "./detect";
 import type { ClosedDeal, DailySnapshot } from "./types";
 
-// R2 (controller ruling): equity defaults to balance + 137n, not balance.
-// A fixed non-zero divergence between balance and equity means a probe that
-// swaps balanceCloseCents for equityCloseCents can be told apart from the
-// correct implementation — the two fields are no longer identical in every
-// fixture.
-function snap(tradeDate: string, balance: bigint, equity = balance + 137n): DailySnapshot {
+const FIXTURE_EPOCH = Date.parse("2026-01-01T00:00:00Z");
+
+/**
+ * A per-date stand-in for floating P/L, so equity is never equal to balance
+ * and never differs from it by a CONSTANT.
+ *
+ * reconcileDays only ever reads these as `cur.X - prev.X`, and a constant
+ * offset cancels on both sides — which is exactly why an earlier fixed
+ * `balance + 137n` divergence left the reconcile-on-equity probe passing.
+ * Monotone in the date, so distinct dates never share a value and no
+ * consecutive pair cancels.
+ */
+function floatingFor(tradeDate: string): bigint {
+  const days = Math.floor((Date.parse(`${tradeDate}T00:00:00Z`) - FIXTURE_EPOCH) / 86_400_000);
+  return BigInt(days) * 13n + 7n;
+}
+
+function snap(
+  tradeDate: string,
+  balance: bigint,
+  equity = balance + floatingFor(tradeDate),
+): DailySnapshot {
   return { tradeDate, balanceCloseCents: balance, equityCloseCents: equity };
 }
 
