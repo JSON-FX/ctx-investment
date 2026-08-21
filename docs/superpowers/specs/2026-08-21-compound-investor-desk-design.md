@@ -555,6 +555,26 @@ holder linked to the requesting user" without any new role existing.
 This corrects an earlier draft of D4, which said Compound would add an
 `investor` role. That was written without checking the constraint.
 
+**The admin claim is an AND gate, not an OR bypass.** §9 previously read both
+ways — "admin sees everything, all accounts" against "keyed on
+`compound_account.manager_user_id`". They are not the same policy. Every
+`compound_*` policy requires the admin claim **and** a `manager_user_id` match:
+
+```sql
+using (
+  (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin'
+  and account_id in (select id from compound_account where manager_user_id = auth.uid())
+)
+```
+
+Under D1 the two readings coincide, because there is one admin and they manage
+every account. They diverge the moment a second admin exists — and an OR bypass
+would then hand each admin every other manager's ledger. Worse for correctness
+today: an OR arm makes RLS a no-op for the only role that actually uses the
+product, which makes every isolation test pass whether the policy is right or
+not. A test that cannot fail is the defect class this project has now hit eleven
+times.
+
 RLS on every `compound_*` table from day one, using the project's established
 idiom rather than a new one:
 
