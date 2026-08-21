@@ -69,10 +69,10 @@ const MESSAGES: Record<string, string> = {
   CX204:
     "The account moved while this was open, so the figures you read are no longer " +
     "the figures that would be written. Nothing was committed. Close this and reopen it.",
-  CX205: "That holder is not on this account.",
+  CX205: "That holder is not on this account. Check you picked the right holder.",
   CX206: "A deposit must be a positive amount.",
-  CX207: "Settlement equity must be a positive amount.",
-  CX208: "That is not a valid choice for this form. Nothing was committed.",
+  CX207: "Settlement equity must be a positive amount. Check the figure you entered — ",
+  CX208: "That withdrawal type or fee-settlement choice was not recognised. Nothing was ",
   CX209:
     "Marking this \"not a capital event\" needs a note — it's the only record of " +
     "why the balance moved and nobody is going to remember by the time it matters.",
