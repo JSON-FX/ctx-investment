@@ -402,3 +402,154 @@ verification was complete — see the reply to the coordinator for
 confirmation. Bring it back with `supabase start` from this worktree; the
 DB volume persists across `stop`/`start` (not `stop --no-backup`), so data
 survives a stop/start cycle without needing `db reset`.
+
+## Update: added `public.users` (fifth fixture table)
+
+The plan-authoring agent relayed a finding from the controller: the real
+`licenses.user_id` references `public.users(id)`, not `auth.users(id)`
+directly — there's an application-level projection table in between, owned
+by copytraderx-license, with two triggers that mirror role between it and
+`auth.users`. That's a real gap in my original four-table migration (my
+`licenses.user_id -> auth.users(id)` FK and my `raw_app_meta_data.role`
+guess were both my own local-testing choices, explicitly flagged as
+unconfirmed in my first pass).
+
+Rather than trust the relay, I read the real migrations directly at
+`~/Documents/development/EA/JSONFX-IMPULSE/supabase/migrations/`
+(`20260506000001_create_users_table.sql`,
+`20260506000003_alter_licenses_add_user_subscription.sql`,
+`20260425000001_create_licenses_table.sql`, and the RLS policy file) rather
+than build on a second-hand paraphrase of something I could just go check
+myself. That confirmed the relayed DDL exactly, and also surfaced two
+things nobody had mentioned yet:
+
+- **`licenses.product` and `licenses.status` are both CHECK-constrained** in
+  production (`product in ('impulse','ctx-core','ctx-live',
+  'ctx-prop-passer','ctx-prop-funded')`, `status in
+  ('active','revoked','expired')` default `'active'`). My seed's
+  `product = 'copytraderx-impulse'` was not a real value at all — fixed to
+  `'impulse'` (the actual code for the CopyTraderX-Impulse EA, confirmed
+  from the same file). Added matching CHECKs to the fixture table so a
+  wrong product/status string now fails loudly instead of silently seeding
+  data that could never exist in production.
+- **Role on signup comes from `raw_user_meta_data`, not
+  `raw_app_meta_data`.** A trigger (`on_auth_user_created`) reads
+  `raw_user_meta_data ->> 'role'` on `auth.users` insert, creates the
+  `public.users` row, and only then stamps `raw_app_meta_data.role` itself
+  (that's the field `auth.jwt() -> 'app_metadata' ->> 'role'` reads at
+  request time — confirmed against the actual RLS policy file). My first
+  seed set `raw_app_meta_data.role` directly, skipping that whole
+  mechanism. Fixed by moving `role` into `raw_user_meta_data` and letting
+  the (now-implemented) trigger do the rest, exactly like production.
+
+### What changed
+
+`supabase/migrations/20260821004302_copytraderx_fixture_tables.sql`
+(same file, not a new migration — see rationale below):
+
+- Added `public.users` (`id uuid primary key references auth.users(id) on
+  delete cascade`, `email text not null unique`, `role text not null
+  default 'user' check (role in ('admin','user'))`, `full_name text`,
+  `must_change_password boolean not null default true`, `created_at
+  timestamptz not null default now()`, `created_by uuid references
+  public.users(id)`), reproduced close to verbatim from the real migration.
+- Added both trigger functions (`handle_auth_user_insert`,
+  `handle_users_role_sync`) and their triggers, also reproduced close to
+  verbatim, `security definer` + `set search_path = public` exactly as the
+  real ones are.
+- `licenses.user_id` now references `public.users(id)`. Added the
+  `product`/`status` CHECKs described above, and `status default 'active'`.
+- Added `public.users` to the RLS-enable and `grant select ... to
+  service_role` blocks, same pattern as the other four tables.
+- Updated the top banner comment to cover five tables and to record the
+  local path to the real migrations, for whoever needs to re-verify later.
+
+`supabase/seed.sql`:
+
+- `encrypted_password` changed from a `crypt()`/`gen_salt()` bcrypt hash to
+  the sentinel string `'!!disabled-no-login!!'` — copytraderx-license's own
+  convention for a synthetic user that must never authenticate with a
+  password (confirmed in the backfill migration), and it removes this
+  seed's only `pgcrypto` dependency.
+- `role` moved from `raw_app_meta_data` into `raw_user_meta_data` on both
+  seeded users (`admin` for the manager, `user` — not `investor` — for the
+  investor, since the real CHECK only allows `admin`/`user`). No manual
+  `insert into public.users` — the trigger creates both rows automatically
+  from the `auth.users` insert, which is itself a live proof the trigger
+  works, not just that a hand-written row looks right.
+- `licenses.product` fixed from the invented `'copytraderx-impulse'` to the
+  real `'impulse'`.
+
+**Why edited in place rather than a second migration file:** nothing has
+built persistent state on top of this migration — every verification cycle
+is a full `supabase db reset` (drop, recreate, replay everything), and no
+one outside this local loop has applied it to a database that has to keep
+working across the edit. `supabase/migrations/` still represents exactly
+one thing — "local stand-ins for tables this repo doesn't own" — and
+splitting that into two files for what is one concept seemed worse than
+one accurate file. A real second migration remains the right move for any
+*future* change to these fixtures, once other work has been built on top of
+this one.
+
+### Verification — actual output, after `supabase db reset`
+
+```
+=== tables in public schema ===
+        table_name         
+---------------------------
+ account_snapshots_current
+ account_snapshots_daily
+ deals
+ licenses
+ users
+(5 rows)
+
+=== public.users (created by the trigger, not a manual insert) ===
+                  id                  |        email         | role  |    full_name     | must_change_password 
+--------------------------------------+----------------------+-------+------------------+----------------------
+ 00000000-0000-0000-0000-000000000002 | investor@example.com | user  | Fixture Investor | t
+ 00000000-0000-0000-0000-000000000001 | manager@example.com  | admin | Fixture Manager  | t
+(2 rows)
+
+=== auth.users raw_app_meta_data (trigger should have stamped role) ===
+        email         |                       raw_app_meta_data                        |                raw_user_meta_data                 
+----------------------+----------------------------------------------------------------+---------------------------------------------------
+ investor@example.com | {"role": "user", "provider": "email", "providers": ["email"]}  | {"role": "user", "full_name": "Fixture Investor"}
+ manager@example.com  | {"role": "admin", "provider": "email", "providers": ["email"]} | {"role": "admin", "full_name": "Fixture Manager"}
+(2 rows)
+
+=== licenses (FK now to public.users, product/status now checked) ===
+ id | mt5_account | product | status |               user_id                
+----+-------------+---------+--------+--------------------------------------
+  1 |    90000001 | impulse | active | 00000000-0000-0000-0000-000000000001
+(1 row)
+
+=== licenses joined through public.users to confirm the FK really works ===
+ mt5_account | product |        email        | role  
+-------------+---------+---------------------+-------
+    90000001 | impulse | manager@example.com | admin
+(1 row)
+```
+
+Grants + REST API, confirming `public.users` follows the exact same
+service-role-only pattern as the other four tables:
+
+```
+=== grants on public.users ===
+   grantee    | privilege_type 
+--------------+----------------
+ postgres     | SELECT
+ service_role | SELECT
+(2 rows)
+
+--- anon key against /users ---
+{"code":"42501","details":null,"hint":"Grant the required privileges to the current role with: GRANT SELECT ON public.users TO anon;","message":"permission denied for table users"}
+
+--- service role key against /users ---
+[{"email":"investor@example.com","role":"user"},
+ {"email":"manager@example.com","role":"admin"}]
+```
+
+Stack stopped again after this verification, same as before — zero
+`supabase_*_ctx-investment` containers left running. Restart with
+`supabase start` from this worktree.

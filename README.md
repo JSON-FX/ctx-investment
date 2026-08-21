@@ -101,14 +101,16 @@ local Supabase projects on this machine already occupy the `54320s` and
 `54520s` ranges. See `supabase/config.toml` for the full port list.
 
 `supabase/migrations/` currently holds one migration: local fixture
-stand-ins for the four CopyTraderX-owned tables Compound reads
-(`account_snapshots_daily`, `account_snapshots_current`, `deals`,
-`licenses`). These are **not** Compound's tables and this migration must
-never be applied to the live project — see the warning comment at the top
-of the file. `supabase/seed.sql` fills them with one fictional MT5 account
-and a scripted scenario — a clean run of days, one unexplained balance
-jump, one duplicate-deal pair, one weekend gap — shaped for testing
-`lib/compound/reconcile/`.
+stand-ins for the five CopyTraderX/copytraderx-license-owned tables
+Compound reads (`users`, `account_snapshots_daily`,
+`account_snapshots_current`, `deals`, `licenses`), including the two
+triggers that mirror `users`/`auth.users` role in production. These are
+**not** Compound's tables and this migration must never be applied to the
+live project — see the warning comment at the top of the file.
+`supabase/seed.sql` fills them with one fictional MT5 account, two
+fictional users (a manager and an investor), and a scripted scenario — a
+clean run of days, one unexplained balance jump, one duplicate-deal pair,
+one weekend gap — shaped for testing `lib/compound/reconcile/`.
 
 ## What the page shows today
 

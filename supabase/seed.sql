@@ -9,17 +9,29 @@
 -- ----------------------------------------------------------------------------
 -- auth.users / auth.identities — two fictional users so compound_* RLS
 -- policies (added by a later migration) have real auth.uid() values to test
--- against, and so licenses.user_id has something to point at.
+-- against, and so licenses.user_id (via public.users) has something to
+-- point at.
 --
 -- instance_id 00000000-0000-0000-0000-000000000000 is GoTrue's standard
 -- fixed local/self-hosted instance id, not a project secret. The user ids
 -- below are deliberately all-zeroes-plus-a-digit so they read as fixtures
 -- at a glance.
 --
--- NOTE: the `role` hint in raw_app_meta_data below is this fixture's own
--- best guess at where Compound will look for admin/investor role — it is
--- NOT a confirmed fact about the live CopyTraderX auth schema (that lives
--- in a sibling repo this migration cannot see). Verify before relying on it.
+-- encrypted_password is the sentinel string '!!disabled-no-login!!', not a
+-- real bcrypt hash — this is copytraderx-license's own convention for a
+-- synthetic user that must never be able to sign in with a password
+-- (verified against 20260506000007_backfill_legacy_licenses.sql), and it
+-- avoids a pgcrypto dependency this seed does not otherwise need.
+--
+-- Role is set via raw_user_meta_data, NOT raw_app_meta_data directly: the
+-- on_auth_user_created trigger (this file's migration) reads
+-- raw_user_meta_data ->> 'role' on insert, creates the matching
+-- public.users row, and stamps raw_app_meta_data.role itself. That mirror
+-- is exactly what the query at the bottom of this file checks. Confirmed
+-- against 20260506000001_create_users_table.sql — see the migration's
+-- banner comment for the path. 'user', not 'investor': the real
+-- public.users.role CHECK only allows ('admin', 'user') — the spec's future
+-- `investor` role is unused until v2 and has nowhere to live yet.
 -- ----------------------------------------------------------------------------
 insert into auth.users (
   instance_id, id, aud, role, email, encrypted_password,
@@ -33,10 +45,10 @@ insert into auth.users (
     '00000000-0000-0000-0000-000000000001',
     'authenticated', 'authenticated',
     'manager@example.com',
-    crypt('fixture-only-not-a-real-password', gen_salt('bf')),
+    '!!disabled-no-login!!',
     now(), '', '', '', '',
-    '{"provider":"email","providers":["email"],"role":"admin"}',
-    '{"full_name":"Fixture Manager"}',
+    '{"provider":"email","providers":["email"]}',
+    '{"role":"admin","full_name":"Fixture Manager"}',
     false, now(), now()
   ),
   (
@@ -44,12 +56,18 @@ insert into auth.users (
     '00000000-0000-0000-0000-000000000002',
     'authenticated', 'authenticated',
     'investor@example.com',
-    crypt('fixture-only-not-a-real-password', gen_salt('bf')),
+    '!!disabled-no-login!!',
     now(), '', '', '', '',
-    '{"provider":"email","providers":["email"],"role":"investor"}',
-    '{"full_name":"Fixture Investor"}',
+    '{"provider":"email","providers":["email"]}',
+    '{"role":"user","full_name":"Fixture Investor"}',
     false, now(), now()
   );
+
+-- The on_auth_user_created trigger fired for both rows above and already
+-- created matching public.users rows (role admin / user) and stamped
+-- raw_app_meta_data.role to match — nothing further to insert here.
+-- Confirmed by querying public.users after `supabase db reset`; see
+-- supabase-setup-report.md at the repo root for the actual output.
 
 insert into auth.identities (
   id, provider_id, user_id, identity_data, provider,
@@ -73,9 +91,12 @@ insert into auth.identities (
 -- ----------------------------------------------------------------------------
 -- licenses — resolves the fixture MT5 account to its owner (the manager;
 -- investors hold units in the pool, they do not own the MT5 account).
+-- product 'impulse' is the real product code for the CopyTraderX-Impulse
+-- EA (license-key prefix IMPX) — confirmed against
+-- 20260506000003_alter_licenses_add_user_subscription.sql, not guessed.
 -- ----------------------------------------------------------------------------
 insert into public.licenses (mt5_account, product, status, user_id) values
-  (90000001, 'copytraderx-impulse', 'active', '00000000-0000-0000-0000-000000000001');
+  (90000001, 'impulse', 'active', '00000000-0000-0000-0000-000000000001');
 
 -- ----------------------------------------------------------------------------
 -- account_snapshots_daily — ten weekday rows, 2026-08-03 through 2026-08-14.
