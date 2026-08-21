@@ -5,6 +5,10 @@ import {
   fixtureHistory,
   fixtureHistoryUnguarded,
 } from "./__fixtures__/deals";
+import {
+  lossDuplicateHistory,
+  lossDuplicateHistoryUnguarded,
+} from "./__fixtures__/loss-duplicate-deals";
 import { computeTradeStats } from "./trade-stats";
 
 describe("computeTradeStats", () => {
@@ -154,6 +158,46 @@ describe("computeTradeStats", () => {
     expect(bad.avgLossCents).toBe(s.avgLossCents);
     expect(bad.bestTradeCents).toBe(s.bestTradeCents);
     expect(bad.worstTradeCents).toBe(s.worstTradeCents);
+  });
+
+  // bestTradeCents/worstTradeCents COVERAGE, using the loss-side fixture.
+  // THE PROBE THIS TASK RAN, recorded rather than hidden. Ticket 6099 is a
+  // planted duplicate of 6003 — the loss-duplicate fixture's OWN worst
+  // trade, the most favourable placement possible for creating dedupe
+  // sensitivity, exactly what the comment above speculates would work.
+  // It does not: worstTradeCents is identical deduplicated or not, and
+  // bestTradeCents (untouched by the duplicate either way) obviously is
+  // too. A planted duplicate is by construction a value-copy of a trade
+  // already in the set — dedupeDeals groups candidates on
+  // symbol+side+volume+profit+swap+commission before it ever compares
+  // timestamps — so the original alone already supplies that value to the
+  // max/min reduction; dropping the copy removes a repetition, never a
+  // value. No fixture, on either side, at any position, can give these two
+  // fields the kind of dedupe protection the other fields above have. This
+  // was verified against the real computeTradeStats, not assumed, and the
+  // two blocks below are that verification, kept as a permanent regression
+  // check rather than a one-off scratch test.
+  it("pins bestTradeCents and worstTradeCents on the loss-side-duplicate fixture", () => {
+    const l = computeTradeStats(lossDuplicateHistory().deals);
+    expect(l.totalTrades).toBe(4); // 5 raw, one dropped as a duplicate
+    expect(l.bestTradeCents).toBe(620n);
+    expect(l.worstTradeCents).toBe(-1330n);
+  });
+
+  it("proves a duplicate planted on the fixture's own worst trade still cannot move bestTradeCents or worstTradeCents", () => {
+    const l = computeTradeStats(lossDuplicateHistory().deals);
+    const bad = computeTradeStats(lossDuplicateHistoryUnguarded().deals);
+
+    // The duplicate surviving is real and visible elsewhere — total count
+    // moves — which rules out "the duplicate was never in the input" as an
+    // innocent explanation for best/worst staying put.
+    expect(bad.totalTrades).toBe(5);
+    expect(bad.totalTrades).not.toBe(l.totalTrades);
+
+    expect(bad.bestTradeCents).toBe(620n);
+    expect(bad.worstTradeCents).toBe(-1330n);
+    expect(bad.bestTradeCents).toBe(l.bestTradeCents);
+    expect(bad.worstTradeCents).toBe(l.worstTradeCents);
   });
 
   it("returns zeros for an empty list without dividing by zero", () => {
