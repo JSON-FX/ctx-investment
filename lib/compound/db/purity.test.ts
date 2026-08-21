@@ -13,6 +13,15 @@ const DB_DIR = join(__dirname);
  */
 const FORBIDDEN: ReadonlyArray<readonly [string, RegExp]> = [
   ["parseFloat", /\bparseFloat\s*\(/],
+  // A global pg type parser is the one way to undo every other rule here at
+  // once: setTypeParser(20, Number) turns EVERY int8 in the app into a JS
+  // number, silently, including money. Task 5 probed this at runtime and found
+  // the blast radius contained to a single Jest file by module-registry
+  // isolation — which means the runtime probe is a test-runner artifact, not a
+  // production guarantee. A source scan is, because it does not depend on which
+  // module registry happened to load first. Tests may still call it; only
+  // non-test sources in db/ are scanned.
+  ["pg setTypeParser", /\bsetTypeParser\s*\(/],
   ["Math.round", /\bMath\.round\s*\(/],
   ["Math.trunc", /\bMath\.trunc\s*\(/],
   ["Math.floor", /\bMath\.floor\s*\(/],
