@@ -49,9 +49,10 @@ describe("db purity", () => {
   // and passes having checked nothing. The floor is raised as db/ grows —
   // Task 8 took it to 6; Task 5 adds holders.ts and users.ts, taking it to 8;
   // Task 6 adds write-account.ts, taking it to 9; plan 4 Task 9 adds
-  // ledger-meta.ts, taking it to 10.
+  // ledger-meta.ts, taking it to 10; plan 4 Task 12 adds write-holder.ts and
+  // write-deposit.ts, taking it to 12.
   it("scans every source file in db/", () => {
-    expect(files.length).toBeGreaterThanOrEqual(10);
+    expect(files.length).toBeGreaterThanOrEqual(12);
   });
 
   // Comments are stripped before matching (see strip-comments.ts): a doc
