@@ -14,6 +14,14 @@ import base from "./jest.config.mjs";
 // COMPOUND_DATABASE_URL pointing at a real database in their shell would
 // otherwise have run them against it. This overrides that, every time.
 //
+// KNOWN COLLISION, and why it is not fixed here. These suites truncate
+// compound_* and the harness runs `supabase db reset`, which — verified
+// empirically, not assumed — recreates the ENTIRE local Postgres instance,
+// not just the postgres database. A second database on the same instance
+// does not survive it, so there is no in-instance way to keep a demo
+// alongside the tests. Real isolation needs a second Supabase project on
+// different ports. Until then `pnpm reseed` restores the demo after a run.
+//
 // Precedence mirrors lib/compound/db/testing/env.ts: an explicit
 // COMPOUND_TEST_DATABASE_URL wins, otherwise the local Supabase stack from
 // supabase/config.toml. 127.0.0.1 rather than localhost because Docker here

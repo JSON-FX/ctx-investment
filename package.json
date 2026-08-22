@@ -12,7 +12,8 @@
     "test:watch": "jest --watch",
     "test:db": "jest --config jest.db.config.mjs",
     "test:all": "jest && jest --config jest.db.config.mjs",
-    "check:secrets": "bash scripts/check-secrets.sh"
+    "check:secrets": "bash scripts/check-secrets.sh",
+    "reseed": "node .reseed.mjs"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",
