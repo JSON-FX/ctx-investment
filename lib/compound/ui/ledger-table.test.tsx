@@ -52,6 +52,22 @@ function renderLedger(entries: readonly LedgerEntry[] = LEDGER, meta = META) {
   );
 }
 
+describe("LedgerTable — page identity", () => {
+  it("announces itself as a level-1 heading named 'Ledger'", () => {
+    renderLedger();
+    expect(screen.getByRole("heading", { level: 1, name: "Ledger" })).toBeInTheDocument();
+  });
+
+  it("still announces itself with no entries posted yet", () => {
+    // The empty-state branch is a separate return (steps.length === 0), not
+    // a fallthrough of the populated one above.
+    render(
+      <LedgerTable accountId={7} steps={[]} meta={new Map()} names={{}} currency="USD" />,
+    );
+    expect(screen.getByRole("heading", { level: 1, name: "Ledger" })).toBeInTheDocument();
+  });
+});
+
 describe("LedgerTable — the running state", () => {
   beforeEach(() => renderLedger());
 

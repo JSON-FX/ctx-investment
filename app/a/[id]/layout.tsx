@@ -13,6 +13,14 @@
  * the reconciler has stopped, EVERY figure on the account is as of the frozen
  * date. A banner that appeared on the desk and not on /performance would be
  * telling the truth in one place and implying its opposite in another.
+ *
+ * `<main>` also lives here, for the same reason: every route under this
+ * layout shares one masthead and one six-link sub-nav, so the single
+ * landmark that skips both belongs where they do, wrapping `{children}`
+ * once, not repeated on each page. SkipToContent and AccountMain are
+ * lib/compound/ui/shell.tsx, not inline here, so the "ui" Jest project can
+ * actually render and test them — this file itself sits outside every Jest
+ * project's roots.
  */
 import type { ReactNode } from "react";
 import { redirect } from "next/navigation";
@@ -23,6 +31,7 @@ import { authClient } from "@/lib/compound/load/supabase";
 import { InterlockBanner } from "@/lib/compound/ui/banner";
 import { Masthead } from "@/lib/compound/ui/masthead";
 import { reviewHref } from "@/lib/compound/ui/routes";
+import { AccountMain, SkipToContent } from "@/lib/compound/ui/shell";
 import { SubNav } from "./subnav";
 
 export const dynamic = "force-dynamic";
@@ -57,6 +66,7 @@ export default async function AccountLayout({
 
   return (
     <div className="wrap">
+      <SkipToContent />
       <Masthead current={account} accounts={accounts} signOutAction={signOut} />
       <SubNav accountId={account.id} pendingCount={interlock.pendingCount} />
       {interlock.pendingCandidateDate === null ? null : (
@@ -66,7 +76,7 @@ export default async function AccountLayout({
           reviewHref={reviewHref(account.id)}
         />
       )}
-      {children}
+      <AccountMain>{children}</AccountMain>
     </div>
   );
 }

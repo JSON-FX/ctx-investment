@@ -1,5 +1,5 @@
 import {
-  SUBNAV, activeNavKey, deskHref, holderHref, payoutHref, withdrawHref,
+  SUBNAV, activeNavKey, deskHref, holderHref, payoutHref, routeTitle, withdrawHref,
 } from "./routes";
 
 describe("SUBNAV", () => {
@@ -59,5 +59,32 @@ describe("href builders", () => {
     expect(holderHref(7, 2)).toBe("/a/7/holders/2");
     expect(payoutHref(7, 2)).toBe("/a/7/actions/payout/2");
     expect(withdrawHref(7, 2)).toBe("/a/7/actions/withdraw/2");
+  });
+});
+
+describe("routeTitle", () => {
+  it("names the surface and the account, with the brand last", () => {
+    expect(routeTitle("Ledger", "Pooled — live")).toBe("Ledger · Pooled — live — Compound");
+  });
+
+  it("gives two different surfaces on the same account two different titles", () => {
+    // The defect this exists to fix: every route under /a/[id] sharing one
+    // <title>. Two calls for the same account must not collide.
+    expect(routeTitle("Desk", "Pooled — live")).not.toBe(routeTitle("Ledger", "Pooled — live"));
+  });
+
+  it("gives the same surface on two different accounts two different titles", () => {
+    // The other half of the same defect: a manager with two accounts open
+    // in two tabs, both on the same route, needs the tab titles to tell
+    // the accounts apart.
+    expect(routeTitle("Desk", "Pooled — live")).not.toBe(routeTitle("Desk", "Pooled — second"));
+  });
+
+  it("takes no parameter a cents value could be handed to", () => {
+    // A signature-level guard, not a runtime one: routeTitle(surface: string,
+    // accountLabel: string) has nowhere to pass a Cents/bigint through even
+    // by mistake. See route-titles.test.ts for the check that the seven real
+    // pages actually call this rather than building their own title string.
+    expect(routeTitle.length).toBe(2);
   });
 });

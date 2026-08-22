@@ -26,6 +26,22 @@ function renderDesk(over: Partial<Parameters<typeof Desk>[0]> = {}) {
   );
 }
 
+describe("Desk — page identity", () => {
+  it("announces itself as a level-1 heading named 'Desk'", () => {
+    renderDesk();
+    expect(screen.getByRole("heading", { level: 1, name: "Desk" })).toBeInTheDocument();
+  });
+
+  it("still announces itself on a brand-new account with nothing posted", () => {
+    // The empty-state branch is a separate return, not a fallthrough of the
+    // one above — desk.tsx's own early return for entryCount === 0. A screen
+    // reader landing here needs page identity exactly as much as it does on
+    // a funded account; nothing about "empty" makes it not the Desk.
+    renderDesk({ state: fold([], SEEDS), entryCount: 0, live: null });
+    expect(screen.getByRole("heading", { level: 1, name: "Desk" })).toBeInTheDocument();
+  });
+});
+
 describe("Desk — the statement head", () => {
   beforeEach(() => renderDesk());
 

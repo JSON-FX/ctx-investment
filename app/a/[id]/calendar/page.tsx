@@ -11,6 +11,7 @@
  * clock — a `new Date()` read here would make the render non-deterministic
  * and open a quiet account on an empty grid.
  */
+import type { Metadata } from "next";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadTradeHistory } from "@/lib/compound/load/trades";
 import {
@@ -22,12 +23,20 @@ import {
 } from "@/lib/compound/journal/calendar-aggregate";
 import { flattenParams } from "@/lib/compound/journal/table-state";
 import { utcDateKey } from "@/lib/compound/reconcile/date-key";
+import { PageHeading } from "@/lib/compound/ui/primitives";
 import { GuardNotice } from "@/lib/compound/ui/journal/guard-notice";
 import { DayPanel } from "@/lib/compound/ui/calendar/day-panel";
 import { MonthGrid } from "@/lib/compound/ui/calendar/month-grid";
-import { calendarHref } from "@/lib/compound/ui/routes";
+import { calendarHref, routeTitle } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Calendar", account.label) };
+}
 
 const MONTH_RE = /^\d{4}-\d{2}$/;
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -72,6 +81,7 @@ export default async function CalendarPage({
 
   return (
     <>
+      <PageHeading>Calendar</PageHeading>
       <GuardNotice history={history} />
       <MonthGrid
         month={month}

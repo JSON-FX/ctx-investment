@@ -29,7 +29,7 @@ import type { ReadingPlan } from "@/lib/compound/reconcile/interlock";
 import type { DroppedDeal } from "@/lib/compound/reconcile/dedupe";
 import { dealNetCents } from "@/lib/compound/reconcile/types";
 import { formatDate, formatLots, formatUtcStamp } from "@/lib/compound/present/format";
-import { DeltaMoney, EmptyState, Eyebrow, Panel } from "./primitives";
+import { DeltaMoney, EmptyState, Eyebrow, PageHeading, Panel } from "./primitives";
 import { Receipt, ReceiptLine, ReceiptTotal } from "./receipt";
 import { classifyHref } from "./routes";
 
@@ -129,6 +129,8 @@ export function ReviewQueue({
 }) {
   return (
     <>
+      <PageHeading>Review</PageHeading>
+
       {notConfigured ? (
         <Panel>
           <div className="banner-halt" role="status">

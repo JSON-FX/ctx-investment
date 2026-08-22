@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadHolderNames, loadLedger, loadLive, loadPoolState } from "@/lib/compound/load/ledger";
 import { decodeDroppedDeals } from "@/lib/compound/load/reconcile";
@@ -5,10 +6,17 @@ import { deskFigures } from "@/lib/compound/present/derive";
 import { railSegments } from "@/lib/compound/present/rail";
 import { Notice } from "@/lib/compound/ui/banner";
 import { Desk } from "@/lib/compound/ui/desk";
-import { capitalHref, readingHref } from "@/lib/compound/ui/routes";
+import { capitalHref, readingHref, routeTitle } from "@/lib/compound/ui/routes";
 import { refreshReadings } from "./actions/actions";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Desk", account.label) };
+}
 
 interface DeskSearchParams {
   posted?: string;

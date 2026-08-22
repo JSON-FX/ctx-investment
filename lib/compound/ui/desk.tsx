@@ -21,7 +21,7 @@ import type { DeskFigures } from "@/lib/compound/present/derive";
 import type { RailSegment } from "@/lib/compound/present/rail";
 import { HolderTable } from "./holder-table";
 import { OwnershipRail } from "./rail";
-import { DeltaMoney, EmptyState, FeeMoney, Money, Panel } from "./primitives";
+import { DeltaMoney, EmptyState, FeeMoney, Money, Panel, PageHeading } from "./primitives";
 import { KpiStrip, StatementHead, type LiveFigures } from "./statement";
 
 export function Desk({
@@ -42,18 +42,22 @@ export function Desk({
 }) {
   if (entryCount === 0) {
     return (
-      <Panel>
-        <EmptyState title="Nothing posted yet">
-          This account has no ledger entries. Post an equity reading or add capital
-          to start, and every figure on this page will be derived from what you post.
-        </EmptyState>
-        {actions ? <div className="actions" style={{ justifyContent: "center" }}>{actions}</div> : null}
-      </Panel>
+      <>
+        <PageHeading>Desk</PageHeading>
+        <Panel>
+          <EmptyState title="Nothing posted yet">
+            This account has no ledger entries. Post an equity reading or add capital
+            to start, and every figure on this page will be derived from what you post.
+          </EmptyState>
+          {actions ? <div className="actions" style={{ justifyContent: "center" }}>{actions}</div> : null}
+        </Panel>
+      </>
     );
   }
 
   return (
     <>
+      <PageHeading>Desk</PageHeading>
       <Panel>
         <StatementHead
           totals={totalsOf(state)}
