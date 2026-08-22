@@ -12,7 +12,7 @@
  * hiding — stays put.
  */
 import type { Metadata } from "next";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listCandidates } from "@/lib/compound/db/compound";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadInterlock } from "@/lib/compound/load/interlock";
@@ -34,8 +34,8 @@ export default async function ReviewPage({ params }: { params: Promise<{ id: str
   const account = await requireAccount((await params).id);
   const [outcome, pending, interlock] = await Promise.all([
     planFor(account),
-    withDb((c) => listCandidates(c, account.id, "pending")),
-    loadInterlock(account.id),
+    withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")),
+    loadInterlock(account.managerUserId, account.id),
   ]);
 
   return (

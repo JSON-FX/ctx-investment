@@ -16,32 +16,32 @@
  *      below rather than assumed to be a fixed array index.
  *
  *   2. seedUser (called by seedTwoAccounts) inserts into auth.users, which
- *      only postgres/supabase_auth_admin can write — service_role gets
- *      "permission denied for table users". Fixture seeding therefore runs
- *      on the harness's postgres-connected pool (withTestClient) and the
- *      writers under test run on client.ts's service_role pool (withDb),
- *      exactly as write-account.db.test.ts and holders.db.test.ts settled —
- *      not the plan's single rolled-back withDbTransaction spanning both,
- *      which cannot work once seeding needs a different role than the write.
- *      Isolation is resetCompoundTables in beforeEach, to match.
+ *      only postgres/supabase_auth_admin can write — no role client.ts ever
+ *      switches to can. Fixture seeding therefore runs on the harness's
+ *      postgres-connected pool (withTestClient) and the writers under test
+ *      run on client.ts's withAuthenticatedDb, connected as the account's own
+ *      manager — exactly as write-account.db.test.ts and holders.db.test.ts
+ *      settled — not the plan's single rolled-back withDbTransaction spanning
+ *      both, which cannot work once seeding needs a different role than the
+ *      write. Isolation is resetCompoundTables in beforeEach, to match.
  *
  *   3. "cannot be updated or deleted afterwards" asserts the EXACT refusal
  *      rather than the plan's loose /append-only|not permitted|permission
- *      denied/i: commitDeposit runs as service_role (withDb), and
- *      service_role holds no UPDATE/DELETE grant at all on
+ *      denied/i: commitDeposit runs through withAuthenticatedDb, and neither
+ *      authenticated nor service_role holds an UPDATE/DELETE grant at all on
  *      compound_ledger_entry (compound_ledger_append_only grants it only
- *      select+insert) — so the statement never reaches the append-only
- *      TRIGGER (which only binds the table owner, postgres) and is refused
- *      by the GRANT system instead, with 42501 "permission denied for table
- *      compound_ledger_entry". Confirmed against commit-plan.db.test.ts's
- *      own precedent for the identical scenario ("the writer respects the
- *      append-only ledger").
+ *      select+insert, to both) — so the statement never reaches the
+ *      append-only TRIGGER (which only binds the table owner, postgres) and
+ *      is refused by the GRANT system instead, with 42501 "permission denied
+ *      for table compound_ledger_entry". Confirmed against
+ *      commit-plan.db.test.ts's own precedent for the identical scenario
+ *      ("the writer respects the append-only ledger").
  *
  *   4. "refuses to create a second manager" asserts the real duplicate-key
  *      text from compound_holder_one_manager_per_account (23505), not a
  *      loose /unique|already exists/i.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { getLedgerEntries } from "@/lib/compound/db/compound";
 import { commitDeposit } from "@/lib/compound/db/write-deposit";
 import { addHolder } from "@/lib/compound/db/write-holder";
@@ -89,14 +89,14 @@ describe("commitDeposit", () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
     const holderId = await managerHolderId(seed.accountA);
 
-    const a = await withDb((c) =>
+    const a = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId,
         occurredOn: "2026-03-02", amountCents: 2_500_000n, note: null,
         actorUserId: seed.accountA.managerUserId,
       }),
     );
-    const b = await withDb((c) =>
+    const b = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId,
         occurredOn: "2026-03-03", amountCents: 100n, note: null,
@@ -112,14 +112,14 @@ describe("commitDeposit", () => {
     const holderA = await managerHolderId(seed.accountA);
     const holderB = await managerHolderId(seed.accountB);
 
-    const a = await withDb((c) =>
+    const a = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId: holderA,
         occurredOn: "2026-03-02", amountCents: 100n, note: null,
         actorUserId: seed.accountA.managerUserId,
       }),
     );
-    const b = await withDb((c) =>
+    const b = await withAuthenticatedDb(seed.accountB.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountB.accountId, holderId: holderB,
         occurredOn: "2026-03-02", amountCents: 100n, note: null,
@@ -134,14 +134,14 @@ describe("commitDeposit", () => {
     const holderId = await managerHolderId(seed.accountA);
     const big = 9_007_199_254_740_993n;
 
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId,
         occurredOn: "2026-03-02", amountCents: big, note: null,
         actorUserId: seed.accountA.managerUserId,
       }),
     );
-    const [entry] = await withDb((c) => getLedgerEntries(c, seed.accountA.accountId));
+    const [entry] = await withAuthenticatedDb(seed.accountA.managerUserId, (c) => getLedgerEntries(c, seed.accountA.accountId));
     expect(entry!.amountCents).toBe(big);
     expect(entry!.amountCents).not.toBe(9_007_199_254_740_992n);
   });
@@ -162,7 +162,7 @@ describe("commitDeposit", () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
     const theirHolder = await managerHolderId(seed.accountB);
 
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         commitDeposit(c, {
           accountId: seed.accountA.accountId, holderId: theirHolder,
@@ -188,7 +188,7 @@ describe("commitDeposit", () => {
       ),
     );
 
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         commitDeposit(c, {
           accountId: seed.accountA.accountId, holderId,
@@ -202,7 +202,7 @@ describe("commitDeposit", () => {
 
     // And permits one dated before it, or the guard is just "refuse everything".
     await expect(
-      withDb((c) =>
+      withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
         commitDeposit(c, {
           accountId: seed.accountA.accountId, holderId,
           occurredOn: "2026-08-11", amountCents: 100n, note: null,
@@ -217,7 +217,7 @@ describe("commitDeposit", () => {
     const holderId = await managerHolderId(seed.accountA);
 
     await expect(
-      withDb((c) =>
+      withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
         commitDeposit(c, {
           accountId: seed.accountA.accountId, holderId,
           occurredOn: "2026-03-02", amountCents: 0n, note: null,
@@ -227,7 +227,7 @@ describe("commitDeposit", () => {
     ).rejects.toThrow(/a deposit must be positive/);
 
     // Nothing reached SQL: no ledger row exists for the account at all.
-    const entries = await withDb((c) => getLedgerEntries(c, seed.accountA.accountId));
+    const entries = await withAuthenticatedDb(seed.accountA.managerUserId, (c) => getLedgerEntries(c, seed.accountA.accountId));
     expect(entries).toHaveLength(0);
   });
 
@@ -237,7 +237,7 @@ describe("commitDeposit", () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
     const holderId = await managerHolderId(seed.accountA);
 
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         c.query(
           `select public.compound_commit_deposit($1,$2,$3::date,$4::bigint,$5,$6::uuid) as result`,
@@ -253,7 +253,7 @@ describe("commitDeposit", () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
     const holderId = await managerHolderId(seed.accountA);
 
-    const { ledgerEntryId } = await withDb((c) =>
+    const { ledgerEntryId } = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId,
         occurredOn: "2026-03-02", amountCents: 100n, note: null,
@@ -261,7 +261,7 @@ describe("commitDeposit", () => {
       }),
     );
 
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         c.query(`update public.compound_ledger_entry set amount_cents = 1 where id = $1`,
           [ledgerEntryId]),
@@ -269,7 +269,7 @@ describe("commitDeposit", () => {
         /permission denied for table compound_ledger_entry/,
       ),
     );
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         c.query(`delete from public.compound_ledger_entry where id = $1`, [ledgerEntryId]),
         "42501",
@@ -299,10 +299,14 @@ describe("commitDeposit", () => {
         sequenceConsumed(c, "public.compound_ledger_entry", "id"),
       );
 
-      await withTestClient((c) => c.query(`revoke insert on public.compound_audit from service_role`));
+      // Revoked from `authenticated`, not `service_role`: commitDeposit now
+      // runs through withAuthenticatedDb, so authenticated is the grant the
+      // write actually depends on. See write-classify.db.test.ts's identical
+      // fix for the full reasoning.
+      await withTestClient((c) => c.query(`revoke insert on public.compound_audit from authenticated`));
       try {
         await expect(
-          withDb((c) =>
+          withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
             commitDeposit(c, {
               accountId: seed.accountA.accountId, holderId,
               occurredOn: "2026-03-02", amountCents: 4200n, note: null,
@@ -311,7 +315,7 @@ describe("commitDeposit", () => {
           ),
         ).rejects.toThrow(/permission denied for table compound_audit/);
       } finally {
-        await withTestClient((c) => c.query(`grant insert on public.compound_audit to service_role`));
+        await withTestClient((c) => c.query(`grant insert on public.compound_audit to authenticated`));
       }
 
       // The sequence advanced — the ledger INSERT genuinely executed and
@@ -325,7 +329,7 @@ describe("commitDeposit", () => {
       expect(after).toBeGreaterThan(before);
 
       // Neither row survives, not "an error surfaced": no ledger entry —
-      const entries = await withDb((c) => getLedgerEntries(c, seed.accountA.accountId));
+      const entries = await withAuthenticatedDb(seed.accountA.managerUserId, (c) => getLedgerEntries(c, seed.accountA.accountId));
       expect(entries).toHaveLength(0);
       // — and no audit row for this account's deposit attempt either.
       const audit = await withTestClient((c) =>
@@ -339,7 +343,7 @@ describe("commitDeposit", () => {
 
       // And the next call is unaffected — seq starts fresh at 1, matching
       // "no partial state was left for it to trip over".
-      const next = await withDb((c) =>
+      const next = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
         commitDeposit(c, {
           accountId: seed.accountA.accountId, holderId,
           occurredOn: "2026-03-02", amountCents: 100n, note: null,
@@ -373,7 +377,7 @@ describe("addHolder", () => {
   it("refuses an empty name", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
     await expect(
-      withDb((c) =>
+      withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
         addHolder(c, {
           accountId: seed.accountA.accountId, name: "   ", email: null, splitBps: 4000,
           joinedAt: "2026-07-06", actorUserId: seed.accountA.managerUserId,
@@ -384,7 +388,7 @@ describe("addHolder", () => {
 
   it("refuses an account that does not exist, with CX001", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       expectPgError(
         addHolder(c, {
           accountId: seed.accountA.accountId + 999_000, name: "Nobody", email: null,
@@ -398,7 +402,7 @@ describe("addHolder", () => {
 
   it("stores the holder's own split, not the account default", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c)); // account default is 4000
-    const id = await withDb((c) =>
+    const id = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       addHolder(c, {
         accountId: seed.accountA.accountId, name: "Grace Hopper", email: null, splitBps: 3700,
         joinedAt: "2026-07-06", actorUserId: seed.accountA.managerUserId,
@@ -414,19 +418,19 @@ describe("addHolder", () => {
 
   it("adds no ledger entry — a holder with no deposit holds no units, not a units column set to zero", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
-    const id = await withDb((c) =>
+    const id = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       addHolder(c, {
         accountId: seed.accountA.accountId, name: "Katherine Johnson", email: null,
         splitBps: 4000, joinedAt: "2026-08-18", actorUserId: seed.accountA.managerUserId,
       }),
     );
-    const entries = await withDb((c) => getLedgerEntries(c, seed.accountA.accountId));
+    const entries = await withAuthenticatedDb(seed.accountA.managerUserId, (c) => getLedgerEntries(c, seed.accountA.accountId));
     expect(entries.some((e) => e.holderId === id)).toBe(false);
   });
 
   it("writes an audit row naming the actor", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
-    const id = await withDb((c) =>
+    const id = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       addHolder(c, {
         accountId: seed.accountA.accountId, name: "Grace Hopper", email: null, splitBps: 3700,
         joinedAt: "2026-07-06", actorUserId: seed.accountA.managerUserId,

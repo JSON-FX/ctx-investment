@@ -29,11 +29,12 @@
  *   3. Isolation is resetCompoundTables in beforeEach (withTestClient), not
  *      per-test transaction rollback. seedTwoAccounts writes auth.users,
  *      which only postgres can do; classifyCandidate's real caller
- *      (app/a/[id]/actions/actions.ts's `classify`, per the plan's Task 14
- *      draft) runs it through withDbTransaction, i.e. service_role — so the
- *      writer under test runs through withDb/withDbTransaction here too,
- *      exercising the same role and connection the app actually uses, the
- *      same reasoning write-account.db.test.ts gives for the identical split.
+ *      (app/a/[id]/actions/actions.ts's `classify`) runs it through
+ *      withAuthenticatedDb, connected as the account's own manager — so the
+ *      writer under test runs through withAuthenticatedDb here too,
+ *      exercising the same helper, role and RLS policy the app actually
+ *      uses, the same reasoning write-account.db.test.ts gives for the
+ *      identical split.
  *
  *   4. CX208 IS used for the bad-outcome check, same as the plan's draft —
  *      but only after checking, not by trusting the draft. Task 13's
@@ -49,7 +50,7 @@
  *      12-14 for exactly this class of refusal — confirmed directly by the
  *      seam owner. Back to CX208, matching the migration.
  */
-import { closePool, withDb, withDbTransaction } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
 import { getLedgerEntries, listCandidates } from "@/lib/compound/db/compound";
 import { classifyCandidate, type ClassifyInput } from "@/lib/compound/db/write-classify";
@@ -126,8 +127,10 @@ async function seedManualDeposit(
   return Number(rows[0]!.id);
 }
 
-async function currentSeq(accountId: number): Promise<number> {
-  const entries = await withDb((c) => getLedgerEntries(c, accountId));
+// Unused in this file today (kept for parity with reconcile.db.test.ts's
+// own helper of the same name) — cheap to keep correct rather than delete.
+async function currentSeq(managerUserId: string, accountId: number): Promise<number> {
+  const entries = await withAuthenticatedDb(managerUserId, (c) => getLedgerEntries(c, accountId));
   return entries.reduce((m, e) => (e.seq > m ? e.seq : m), 0);
 }
 
@@ -149,7 +152,7 @@ describe("classifyCandidate — as a deposit", () => {
     const managerId = accountA.holderIds[0]!;
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
-    const { ledgerEntryId } = await withDb((c) =>
+    const { ledgerEntryId } = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "deposit",
         holderId: managerId, amountCents: 500_000n, note: null,
@@ -157,7 +160,7 @@ describe("classifyCandidate — as a deposit", () => {
       })),
     );
 
-    const entry = (await withDb((c) => getLedgerEntries(c, accountA.accountId)))
+    const entry = (await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId)))
       .find((e) => e.id === ledgerEntryId)!;
     expect(entry.type).toBe("deposit");
     expect(entry.occurredOn).toBe("2026-08-12");
@@ -170,7 +173,7 @@ describe("classifyCandidate — as a deposit", () => {
     const managerId = accountA.holderIds[0]!;
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
-    const { ledgerEntryId } = await withDb((c) =>
+    const { ledgerEntryId } = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "deposit",
         holderId: managerId, amountCents: 500_000n, note: null,
@@ -178,7 +181,7 @@ describe("classifyCandidate — as a deposit", () => {
       })),
     );
 
-    expect(await withDb((c) => listCandidates(c, accountA.accountId, "pending"))).toEqual([]);
+    expect(await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending"))).toEqual([]);
     const { rows } = await withTestClient((c) =>
       c.query<{ status: string; resolved_ledger_entry_id: string | null }>(
         `select status, resolved_ledger_entry_id
@@ -194,7 +197,7 @@ describe("classifyCandidate — as a deposit", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const managerId = accountA.holderIds[0]!;
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
-    await expect(withDb((c) =>
+    await expect(withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "deposit",
         holderId: managerId, amountCents: 0n, note: null, expectedSeq: 0,
@@ -207,7 +210,7 @@ describe("classifyCandidate — as a deposit", () => {
     const otherManagerId = accountB.holderIds[0]!;
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId, outcome: "deposit",
           holderId: otherManagerId, amountCents: 500_000n, note: null, expectedSeq: 0,
@@ -225,7 +228,7 @@ describe("classifyCandidate — refuses to double-classify, CX203", () => {
     const managerId = accountA.holderIds[0]!;
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "deposit",
         holderId: managerId, amountCents: 500_000n, note: null, expectedSeq: 0,
@@ -233,7 +236,7 @@ describe("classifyCandidate — refuses to double-classify, CX203", () => {
     );
 
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId, outcome: "deposit",
           holderId: managerId, amountCents: 500_000n, note: null, expectedSeq: 1,
@@ -243,7 +246,7 @@ describe("classifyCandidate — refuses to double-classify, CX203", () => {
       /is already classified/,
     );
 
-    const deposits = (await withDb((c) => getLedgerEntries(c, accountA.accountId)))
+    const deposits = (await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId)))
       .filter((e) => e.type === "deposit" && e.occurredOn === "2026-08-12");
     expect(deposits).toHaveLength(1);
   });
@@ -251,7 +254,7 @@ describe("classifyCandidate — refuses to double-classify, CX203", () => {
   it("refuses a candidate id that does not exist, also CX203", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId: 999_999, expectedSeq: 0,
         })),
@@ -266,7 +269,7 @@ describe("classifyCandidate — as ignore", () => {
   it("requires a note locally, with no round trip", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
-    await expect(withDb((c) =>
+    await expect(withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "ignore", note: "   ", expectedSeq: 0,
       })),
@@ -277,13 +280,13 @@ describe("classifyCandidate — as ignore", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
-    const { ledgerEntryId } = await withDb((c) =>
+    const { ledgerEntryId } = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "ignore", expectedSeq: 0,
       })),
     );
     expect(ledgerEntryId).toBeNull();
-    expect(await withDb((c) => getLedgerEntries(c, accountA.accountId))).toEqual([]);
+    expect(await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId))).toEqual([]);
 
     const { rows } = await withTestClient((c) =>
       c.query<{ status: string }>(
@@ -303,9 +306,9 @@ describe("classifyCandidate — matching an existing entry, without double-count
       accountA.accountId, managerId, "2026-03-02", 2_500_000n, accountA.managerUserId,
     );
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
-    const before = (await withDb((c) => getLedgerEntries(c, accountA.accountId))).length;
+    const before = (await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId))).length;
 
-    const r = await withDb((c) =>
+    const r = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId, outcome: "match",
         matchEntryId: existingId, expectedSeq: 1,
@@ -315,7 +318,7 @@ describe("classifyCandidate — matching an existing entry, without double-count
     expect(r.ledgerEntryId).toBe(existingId);
     // The count that actually proves no double-count: same number of rows
     // after matching as before it, not merely "a row exists".
-    expect((await withDb((c) => getLedgerEntries(c, accountA.accountId))).length).toBe(before);
+    expect((await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId))).length).toBe(before);
   });
 
   it("refuses an entry belonging to another account, with CX210", async () => {
@@ -327,7 +330,7 @@ describe("classifyCandidate — matching an existing entry, without double-count
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId, outcome: "match",
           matchEntryId: theirEntry, expectedSeq: 0,
@@ -349,7 +352,7 @@ describe("classifyCandidate — input validation reaching the database", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         // Cast through unknown: ClassifyOutcome correctly disallows this at
         // the type level. Only a test that wants to hit the database's own
         // check directly needs to bypass it.
@@ -371,7 +374,7 @@ describe("classifyCandidate — input validation reaching the database", () => {
     const candidateId = await seedCandidate(accountA.accountId, "2026-08-12");
 
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId, outcome: "ignore", expectedSeq: 0,
         })),
@@ -380,7 +383,7 @@ describe("classifyCandidate — input validation reaching the database", () => {
       /account is at entry 1 and the receipt was worked out at entry 0/,
     );
     // Nothing was written for the refused attempt: still pending, no second entry.
-    expect(await withDb((c) => listCandidates(c, accountA.accountId, "pending"))).toHaveLength(1);
+    expect(await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending"))).toHaveLength(1);
   });
 });
 
@@ -398,19 +401,27 @@ describe("classifyCandidate — a forced failure mid-write rolls back everything
     // run inside the same function call. Revoking a grant mid-test is
     // restored in the finally block below, unconditionally — this touches a
     // database-level object that outlives this test file if left revoked.
-    await withTestClient((c) => c.query(`revoke insert on ${AUDIT} from service_role`));
+    //
+    // Revoked from `authenticated`, not `service_role`: classifyCandidate now
+    // runs through withAuthenticatedDb, so authenticated is the grant that
+    // actually has to bind for this revoke to reach the write at all. Revoking
+    // service_role's grant (the pre-task target) would revoke a privilege
+    // nothing in this call path uses any more, and the insert would succeed
+    // right through it — the exact "test that could not fail" shape this
+    // project's own lessons table warns about.
+    await withTestClient((c) => c.query(`revoke insert on ${AUDIT} from authenticated`));
 
     const before = await withTestClient((c) => sequenceConsumed(c, LEDGER, "id"));
 
     try {
-      await expect(withDbTransaction((c) =>
+      await expect(withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId, outcome: "deposit",
           holderId: managerId, amountCents: 500_000n, note: null, expectedSeq: 0,
         })),
       )).rejects.toThrow(/permission denied/);
     } finally {
-      await withTestClient((c) => c.query(`grant insert on ${AUDIT} to service_role`));
+      await withTestClient((c) => c.query(`grant insert on ${AUDIT} to authenticated`));
     }
 
     // The proof that the earlier statements actually executed before the
@@ -422,7 +433,7 @@ describe("classifyCandidate — a forced failure mid-write rolls back everything
     expect(after - before).toBe(1);
 
     // And yet, post-rollback, nothing is actually there.
-    expect(await withDb((c) => getLedgerEntries(c, accountA.accountId))).toEqual([]);
+    expect(await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId))).toEqual([]);
     const { rows } = await withTestClient((c) =>
       c.query<{ status: string; resolved_ledger_entry_id: string | null }>(
         `select status, resolved_ledger_entry_id
@@ -440,7 +451,7 @@ describe("classifyCandidate — several pending candidates, one whose classifica
     const earlyId = await seedCandidate(accountA.accountId, "2026-08-10", 250_000n);
     const lateId = await seedCandidate(accountA.accountId, "2026-08-11", -157_836n);
 
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId: lateId, outcome: "ignore",
         note: "Broker correction, confirmed 2026-08-13", expectedSeq: 0,
@@ -460,7 +471,7 @@ describe("classifyCandidate — several pending candidates, one whose classifica
       { id: String(lateId), status: "ignored", resolved_ledger_entry_id: null },
     ]);
 
-    const pending = await withDb((c) => listCandidates(c, accountA.accountId, "pending"));
+    const pending = await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending"));
     expect(pending.map((k) => k.id)).toEqual([earlyId]);
   });
 
@@ -477,7 +488,7 @@ describe("classifyCandidate — several pending candidates, one whose classifica
     // account's seq never moves off 0 between these two calls. A deposit
     // outcome would need expectedSeq: 1 for the second call instead.
     for (const id of [a, b]) {
-      await withDb((c) =>
+      await withAuthenticatedDb(accountA.managerUserId, (c) =>
         classifyCandidate(c, classifyInput({
           accountId: accountA.accountId, candidateId: id, outcome: "ignore",
           note: "Reviewed", expectedSeq: 0,
@@ -537,7 +548,7 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
 
     // Two genuine halts, recorded through the real writer, exactly as the
     // reconciler would leave them behind — not a raw row insert.
-    await withDb((c) => withDbTransaction((tc) => commitReadingPlan(tc, {
+    await withAuthenticatedDb(accountA.managerUserId, (c) => commitReadingPlan(c, {
       accountId: accountA.accountId, actorUserId: accountA.managerUserId,
       plan: {
         kind: "halt", readings: [], newCursorDate: null,
@@ -547,12 +558,12 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
         },
         droppedDeals: [],
       } satisfies ReadingPlan,
-    })));
-    const early = (await withDb((c) => listCandidates(c, accountA.accountId, "pending")))[0]!;
+    }));
+    const early = (await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending")))[0]!;
     expect(early.tradeDate).toBe("2026-08-10");
 
     // Classify the EARLIER candidate only.
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       classifyCandidate(c, classifyInput({
         accountId: accountA.accountId, candidateId: early.id, outcome: "ignore",
         note: "Reviewed 2026-08-13", expectedSeq: 0,
@@ -560,7 +571,7 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
     );
 
     // A second, later, still-pending candidate the manager has NOT touched.
-    await withDb((c) => withDbTransaction((tc) => commitReadingPlan(tc, {
+    await withAuthenticatedDb(accountA.managerUserId, (c) => commitReadingPlan(c, {
       accountId: accountA.accountId, actorUserId: accountA.managerUserId,
       plan: {
         kind: "halt", readings: [], newCursorDate: null,
@@ -570,8 +581,8 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
         },
         droppedDeals: [],
       } satisfies ReadingPlan,
-    })));
-    const pendingAfter = await withDb((c) => listCandidates(c, accountA.accountId, "pending"));
+    }));
+    const pendingAfter = await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending"));
     expect(pendingAfter.map((k) => k.tradeDate)).toEqual(["2026-08-12"]);
 
     // THE GAP: a hand-built advance plan (what postReading's draft sends —
@@ -580,7 +591,7 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
     // refuse this with CX002 via their own independent query.
     // compound_commit_reading_plan does not, because nothing here passed it
     // a p_candidate for THIS call.
-    const result = await withDb((c) => withDbTransaction((tc) => commitReadingPlan(tc, {
+    const result = await withAuthenticatedDb(accountA.managerUserId, (c) => commitReadingPlan(c, {
       accountId: accountA.accountId, actorUserId: accountA.managerUserId,
       plan: {
         kind: "advance",
@@ -588,7 +599,7 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
         newCursorDate: "2026-08-15",
         droppedDeals: [],
       } satisfies ReadingPlan,
-    })));
+    }));
 
     // This SUCCEEDING is the finding, not the desired behaviour: a reading
     // landed on 2026-08-15, on or after the 2026-08-12 candidate's date,
@@ -599,7 +610,7 @@ describe("the persistence-boundary gap this task found: compound_commit_reading_
     // to modify.
     expect(result.readingsInserted).toBe(1);
     expect(result.cursorDate).toBe("2026-08-15");
-    const stillPending = await withDb((c) => listCandidates(c, accountA.accountId, "pending"));
+    const stillPending = await withAuthenticatedDb(accountA.managerUserId, (c) => listCandidates(c, accountA.accountId, "pending"));
     expect(stillPending.map((k) => k.tradeDate)).toEqual(["2026-08-12"]);
   });
 

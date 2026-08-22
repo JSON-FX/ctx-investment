@@ -26,7 +26,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitPayout } from "@/lib/compound/db/write-payout";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -45,13 +45,17 @@ import { deskHref, holderHref, payoutHref } from "@/lib/compound/ui/routes";
  * import from actions.ts. Keep this in step with that helper's behaviour if
  * either changes.
  */
-async function staleness(accountId: number, formData: FormData): Promise<string | null> {
+async function staleness(
+  managerUserId: string,
+  accountId: number,
+  formData: FormData,
+): Promise<string | null> {
   const shown = fingerprintFromFields((k) => {
     const v = formData.get(k);
     return typeof v === "string" ? v : null;
   });
   if (shown === null) return "That form was incomplete. Nothing was committed.";
-  const current = fingerprintOf(accountId, await loadPoolState(accountId));
+  const current = fingerprintOf(accountId, await loadPoolState(managerUserId, accountId));
   return fingerprintMismatch(shown, current);
 }
 
@@ -61,7 +65,7 @@ export async function payOut(formData: FormData) {
   const holderId = Number(formData.get("holderId"));
   const back = payoutHref(account.id, holderId);
 
-  const stale = await staleness(account.id, formData);
+  const stale = await staleness(user.id, account.id, formData);
   if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
 
   const shown = fingerprintFromFields((k) => {
@@ -78,7 +82,7 @@ export async function payOut(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitPayout(c, {
         accountId: account.id,
         holderId,

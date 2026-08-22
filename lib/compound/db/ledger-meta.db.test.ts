@@ -6,8 +6,9 @@
  * write only postgres (or supabase_auth_admin) can make, and service_role
  * cannot. Seeding therefore runs on the harness's postgres-connected pool
  * (withTestClient); listLedgerMeta itself still runs through client.ts's
- * withDb, the same service_role pool requireAccount and every other loader
- * borrow in production.
+ * withAuthenticatedDb, connected as the account's own manager — the same
+ * helper requireAccount and every other loader borrow in production, under
+ * compound_ledger_entry's real RLS policy rather than bypassing it.
  *
  * Two disagreements between this task's plan draft and the real harness,
  * checked against a real run rather than assumed — the same two
@@ -33,7 +34,7 @@
  *      return. A fixture that was already in seq order could not fail this
  *      test if `order by seq asc` were changed to `order by id asc`.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listLedgerMeta } from "@/lib/compound/db/ledger-meta";
 import {
   closeTestPool,
@@ -84,7 +85,9 @@ describe("listLedgerMeta", () => {
     const seq1Id = ids[1]!;
     const seq2Id = ids[2]!;
 
-    const meta = await withDb((c) => listLedgerMeta(c, accountA.accountId));
+    const meta = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listLedgerMeta(c, accountA.accountId),
+    );
 
     expect(meta.map((m) => m.id)).toEqual([seq1Id, seq2Id, seq3Id]);
     // Insertion (== id-ascending) order is the wrong-answer shape this
@@ -116,7 +119,9 @@ describe("listLedgerMeta", () => {
     const thenId = ids[1]!; // seq 3
     const firstId = ids[2]!; // seq 1
 
-    const meta = await withDb((c) => listLedgerMeta(c, accountA.accountId));
+    const meta = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listLedgerMeta(c, accountA.accountId),
+    );
 
     expect(meta.map((m) => m.id)).toEqual([firstId, posId, thenId]);
   });
@@ -130,7 +135,9 @@ describe("listLedgerMeta", () => {
       ]),
     );
 
-    const meta = await withDb((c) => listLedgerMeta(c, accountA.accountId));
+    const meta = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listLedgerMeta(c, accountA.accountId),
+    );
     const first = meta[0]!;
 
     expect(typeof first.recordedAt).toBe("string");
@@ -152,7 +159,9 @@ describe("listLedgerMeta", () => {
       ]),
     );
 
-    const meta = await withDb((c) => listLedgerMeta(c, accountA.accountId));
+    const meta = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listLedgerMeta(c, accountA.accountId),
+    );
     expect(meta[0]).toMatchObject({ note: "wired same day", createdBy: managerUserId });
     expect(meta[1]).toMatchObject({ note: null, createdBy: null });
   });
@@ -173,8 +182,12 @@ describe("listLedgerMeta", () => {
       ]),
     );
 
-    const metaA = await withDb((c) => listLedgerMeta(c, accountA.accountId));
-    const metaB = await withDb((c) => listLedgerMeta(c, accountB.accountId));
+    const metaA = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listLedgerMeta(c, accountA.accountId),
+    );
+    const metaB = await withAuthenticatedDb(accountB.managerUserId, (c) =>
+      listLedgerMeta(c, accountB.accountId),
+    );
 
     expect(metaA.length).toBeGreaterThan(0);
     const overlap = metaA.filter((m) => metaB.some((b) => b.id === m.id));
@@ -183,6 +196,8 @@ describe("listLedgerMeta", () => {
 
   it("returns an empty array for an account with no ledger entries, not null", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
-    expect(await withDb((c) => listLedgerMeta(c, accountA.accountId))).toEqual([]);
+    expect(
+      await withAuthenticatedDb(accountA.managerUserId, (c) => listLedgerMeta(c, accountA.accountId)),
+    ).toEqual([]);
   });
 });

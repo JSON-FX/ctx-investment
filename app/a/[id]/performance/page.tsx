@@ -59,9 +59,9 @@ export default async function PerformancePage({ params }: { params: Promise<{ id
   const [history, snapshots, ledger, seeds, interlock] = await Promise.all([
     loadTradeHistory(account.mt5Account, account.brokerOffsetHours),
     loadDailySnapshots(account.mt5Account),
-    loadLedger(account.id),
-    loadSeeds(account.id),
-    loadInterlock(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
+    loadInterlock(account.managerUserId, account.id),
   ]);
 
   const series = buildAccountEquitySeries({

@@ -1,10 +1,14 @@
 /**
  * Spec section 9's AND gate: signed in, app_metadata.role = 'admin', AND
- * account.managerUserId === user.id. Plan 3's decision P4 runs every pooled
- * connection as service_role, which carries BYPASSRLS, so the 16 RLS policies
- * rls.db.test.ts covers do not run for these pages at all — this gate, in
- * application code, is what actually protects one manager's account from
- * another's eyes. See session.ts's and account.ts's module docs.
+ * account.managerUserId === user.id. db/client.ts's withAuthenticatedDb (D-F,
+ * updated) now runs every compound_* query as `authenticated`, with the
+ * caller's own claims, so the 16 RLS policies rls.db.test.ts covers are the
+ * real boundary — this application-level gate is defence-in-depth on top of
+ * that, not the only thing standing between one manager's account and
+ * another's. See session.ts's and account.ts's module docs, and
+ * load/cross-manager-isolation.db.test.ts for the same claim proved one
+ * layer up, through requireAccount's own readers, including with this
+ * file's ownership check removed entirely.
  *
  * TWO managers, TWO accounts, throughout. A one-manager fixture passes with
  * either arm of the gate deleted: the only account in the database is yours,
@@ -27,14 +31,15 @@
  *
  * Seeding and reading run on two different connections, for the same reason
  * holders.db.test.ts does this (see its module doc): seedTwoAccounts/seedUser
- * write auth.users, which only postgres can do — service_role (what
- * resolveOwnedAccount is tested through, via client.ts's real pool, to match
- * what requireAccount actually borrows in production) cannot. Fixture setup
- * runs on the harness's postgres-connected pool; the functions under test run
- * on client.ts's pool. Isolation is resetCompoundTables in beforeEach, not
+ * write auth.users, which only postgres can do — neither authenticated nor
+ * service_role can (what resolveOwnedAccount and getUserRole are each tested
+ * through below, via client.ts's real pool, to match what requireAccount and
+ * requireManager actually borrow in production). Fixture setup runs on the
+ * harness's postgres-connected pool; the functions under test run on
+ * client.ts's pool. Isolation is resetCompoundTables in beforeEach, not
  * transaction rollback, for the same reason.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb, withElevatedCopyTraderXRead } from "@/lib/compound/db/client";
 import { getAccountById } from "@/lib/compound/db/compound";
 import { getUserRole } from "@/lib/compound/db/users";
 import {
@@ -68,7 +73,7 @@ afterAll(async () => {
 describe("resolveOwnedAccount — the ownership half", () => {
   it("returns an account its manager owns", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
-    const acct = await withDb((c) =>
+    const acct = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId)),
     );
     expect(acct?.id).toBe(accountA.accountId);
@@ -76,32 +81,46 @@ describe("resolveOwnedAccount — the ownership half", () => {
 
   it("refuses another manager's account, even though it exists", async () => {
     const { accountA, accountB } = await withTestClient((c) => seedTwoAccounts(c));
-    // It really is there — otherwise this test proves nothing.
-    expect(await withDb((c) => getAccountById(c, accountB.accountId))).not.toBeNull();
+    // It really is there — read as its own manager, otherwise this test
+    // proves nothing about isolation, only that a made-up id is absent.
     expect(
-      await withDb((c) => resolveOwnedAccount(c, accountA.managerUserId, String(accountB.accountId))),
+      await withAuthenticatedDb(accountB.managerUserId, (c) => getAccountById(c, accountB.accountId)),
+    ).not.toBeNull();
+    expect(
+      await withAuthenticatedDb(accountA.managerUserId, (c) =>
+        resolveOwnedAccount(c, accountA.managerUserId, String(accountB.accountId)),
+      ),
     ).toBeNull();
   });
 
   it("refuses an id that is not a plain positive integer", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     for (const bad of [`${accountA.accountId}abc`, "0", "-1", "1.5", " 1", "01", ""]) {
-      expect(await withDb((c) => resolveOwnedAccount(c, accountA.managerUserId, bad))).toBeNull();
+      expect(
+        await withAuthenticatedDb(accountA.managerUserId, (c) =>
+          resolveOwnedAccount(c, accountA.managerUserId, bad),
+        ),
+      ).toBeNull();
     }
   });
 
   it("refuses an account that does not exist", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     expect(
-      await withDb((c) => resolveOwnedAccount(c, accountA.managerUserId, "2147483646")),
+      await withAuthenticatedDb(accountA.managerUserId, (c) =>
+        resolveOwnedAccount(c, accountA.managerUserId, "2147483646"),
+      ),
     ).toBeNull();
   });
 
   it("carries the broker offset through, null when it is not configured", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     expect(
-      (await withDb((c) => resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId))))!
-        .brokerOffsetHours,
+      (
+        await withAuthenticatedDb(accountA.managerUserId, (c) =>
+          resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId)),
+        )
+      )!.brokerOffsetHours,
     ).toBeNull();
 
     await withTestClient((c) =>
@@ -111,8 +130,11 @@ describe("resolveOwnedAccount — the ownership half", () => {
     );
 
     expect(
-      (await withDb((c) => resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId))))!
-        .brokerOffsetHours,
+      (
+        await withAuthenticatedDb(accountA.managerUserId, (c) =>
+          resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId)),
+        )
+      )!.brokerOffsetHours,
     ).toBe(3);
   });
 
@@ -143,7 +165,7 @@ describe("resolveOwnedAccount — the ownership half", () => {
     // common JS reflex — `value ?? 0`) would make an unconfigured account
     // indistinguishable from one deliberately, and illegally, set to zero.
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
-    const acct = await withDb((c) =>
+    const acct = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId)),
     );
     expect(acct!.brokerOffsetHours).toBeNull();
@@ -182,11 +204,12 @@ describe("resolveIsAdmin — the role half", () => {
   });
 
   // Round-tripped against a real public.users row via client.ts's pool — the
-  // same service_role connection requireManager actually reads through (it
-  // has an explicit `grant select … on public.users to service_role` from
-  // the CopyTraderX fixture migration) — so this is not only a unit test of
-  // the predicate but proof getUserRole's real output is what resolveIsAdmin
-  // expects to receive.
+  // same withElevatedCopyTraderXRead (service_role) connection requireManager
+  // actually reads through (it has an explicit `grant select … on
+  // public.users to service_role` from the CopyTraderX fixture migration,
+  // and no grant to authenticated at all — see db/client.ts's module doc) —
+  // so this is not only a unit test of the predicate but proof getUserRole's
+  // real output is what resolveIsAdmin expects to receive.
   //
   // Prefixed dddddddd, not cccccccc: resetCompoundTables truncates the six
   // compound_* tables only, never public.users/auth.users, so a seeded
@@ -201,7 +224,7 @@ describe("resolveIsAdmin — the role half", () => {
   it("reads a real non-admin row as not admin", async () => {
     const userId = "dddddddd-0000-4000-8000-0000000000d1";
     await withTestClient((c) => seedUser(c, userId, "gate-role-arm@example.test", "user"));
-    const stored = await withDb((c) => getUserRole(c, userId));
+    const stored = await withElevatedCopyTraderXRead((c) => getUserRole(c, userId));
     expect(stored).toBe("user");
     expect(resolveIsAdmin(null, stored)).toBe(false);
   });
@@ -209,7 +232,7 @@ describe("resolveIsAdmin — the role half", () => {
   it("reads a real admin row as admin", async () => {
     const userId = "dddddddd-0000-4000-8000-0000000000d2";
     await withTestClient((c) => seedUser(c, userId, "gate-role-arm-admin@example.test", "admin"));
-    const stored = await withDb((c) => getUserRole(c, userId));
+    const stored = await withElevatedCopyTraderXRead((c) => getUserRole(c, userId));
     expect(stored).toBe("admin");
     expect(resolveIsAdmin(null, stored)).toBe(true);
   });
@@ -228,11 +251,16 @@ describe("the AND gate refuses when either arm fails, independently", () => {
     await withTestClient((c) =>
       c.query(`update public.users set role = 'user' where id = $1`, [accountA.managerUserId]),
     );
-    const stored = await withDb((c) => getUserRole(c, accountA.managerUserId));
+    const stored = await withElevatedCopyTraderXRead((c) => getUserRole(c, accountA.managerUserId));
     expect(stored).toBe("user");
 
     // Ownership arm alone: this manager really does own this account.
-    const owned = await withDb((c) =>
+    // withAuthenticatedDb always claims "admin" (see its own doc comment in
+    // db/client.ts — it is only ever reached once requireManager has already
+    // verified that), so this line is not itself exercising RLS's admin
+    // gate; the point being made is the application-level one the comment
+    // below states, same as before this task.
+    const owned = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       resolveOwnedAccount(c, accountA.managerUserId, String(accountA.accountId)),
     );
     expect(owned?.id).toBe(accountA.accountId);
@@ -241,25 +269,33 @@ describe("the AND gate refuses when either arm fails, independently", () => {
     expect(resolveIsAdmin(null, stored)).toBe(false);
 
     // requireAccount runs the role arm first (requireManager, via
-    // resolveIsAdmin) and only reaches the ownership arm if that passes — so
-    // this identity never gets past step one, and resolveOwnedAccount
-    // succeeding here in isolation is exactly the point: ownership was never
-    // the thing standing between this user and the account.
+    // resolveIsAdmin) and only reaches the ownership arm — and therefore
+    // withAuthenticatedDb — if that passes. So this identity never gets past
+    // step one in production, and resolveOwnedAccount succeeding here in
+    // isolation is exactly the point: ownership was never the thing standing
+    // between this user and the account.
   });
 
   it("role alone is not enough: an admin managing nothing here still cannot reach another manager's account", async () => {
     const { accountB } = await withTestClient((c) => seedTwoAccounts(c));
     const outsider = "dddddddd-0000-4000-8000-0000000000d3";
     await withTestClient((c) => seedUser(c, outsider, "gate-outsider-admin@example.test", "admin"));
-    const stored = await withDb((c) => getUserRole(c, outsider));
+    const stored = await withElevatedCopyTraderXRead((c) => getUserRole(c, outsider));
 
     // Role arm alone: this identity is a genuine admin.
     expect(resolveIsAdmin(null, stored)).toBe(true);
 
     // Ownership arm, for the same identity against someone else's account:
-    // refused, even though accountB is real and even though this identity
-    // cleared the role arm.
-    expect(await withDb((c) => getAccountById(c, accountB.accountId))).not.toBeNull();
-    expect(await withDb((c) => resolveOwnedAccount(c, outsider, String(accountB.accountId)))).toBeNull();
+    // refused — now doubly so. compound_account_select's own RLS policy
+    // already refuses a row whose manager_user_id is not this connection's
+    // auth.uid() before resolveOwnedAccount's JS comparison ever runs.
+    expect(
+      await withAuthenticatedDb(accountB.managerUserId, (c) => getAccountById(c, accountB.accountId)),
+    ).not.toBeNull();
+    expect(
+      await withAuthenticatedDb(outsider, (c) =>
+        resolveOwnedAccount(c, outsider, String(accountB.accountId)),
+      ),
+    ).toBeNull();
   });
 });

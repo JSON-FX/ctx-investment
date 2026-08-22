@@ -61,7 +61,7 @@ export default async function AccountLayout({
   const account = await requireAccount(id);
   const [accounts, interlock] = await Promise.all([
     listManagerAccounts(),
-    loadInterlock(account.id),
+    loadInterlock(account.managerUserId, account.id),
   ]);
 
   return (

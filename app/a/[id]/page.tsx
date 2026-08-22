@@ -33,10 +33,10 @@ export default async function DeskPage({
 }) {
   const account = await requireAccount((await params).id);
   const [state, names, live, entries] = await Promise.all([
-    loadPoolState(account.id),
-    loadHolderNames(account.id),
+    loadPoolState(account.managerUserId, account.id),
+    loadHolderNames(account.managerUserId, account.id),
     loadLive(account.mt5Account),
-    loadLedger(account.id),
+    loadLedger(account.managerUserId, account.id),
   ]);
   const q = await searchParams;
   const dropped = decodeDroppedDeals(q.dropped);

@@ -6,19 +6,31 @@
  * module is the first half — the role. account.ts's resolveOwnedAccount is
  * the second.
  *
- * WHY THIS IS IN APPLICATION CODE. Plan 3's decision P4 runs every pooled
- * connection as service_role, which has BYPASSRLS. The policies plan 3 wrote
- * are real and protect any other client of the database, and they do NOT run
- * for these pages. A gate that relies on them would pass every test whether it
- * was right or not, which is the defect class this project has now hit eleven
- * times.
+ * WHY THIS IS STILL IN APPLICATION CODE, EVEN THOUGH RLS NOW REALLY RUNS.
+ * db/client.ts's withAuthenticatedDb (D-F, updated) runs every compound_*
+ * query as `authenticated`, with real claims, so the 16 policies
+ * compound_rls.sql defines are the actual boundary now, not a decorative one.
+ * This function is still the application layer's own copy of the same gate,
+ * for two reasons that have nothing to do with distrusting RLS: first, an
+ * application still has to know WHO is asking before it can open a
+ * connection as them — RLS cannot bootstrap the identity it is then asked to
+ * check, this function is what resolves it. Second, defence in depth is the
+ * deliberate posture (see the report this change shipped with): a gate that
+ * relies on exactly one layer is one migration away from being the only
+ * thing standing between two managers' money, the same defect class this
+ * project has hit eleven times before.
+ *
+ * getUserRole reads public.users, one of the CopyTraderX-owned tables — see
+ * db/client.ts's withElevatedCopyTraderXRead. That grant is service_role
+ * only, regardless of RLS or claims, so this read cannot run on
+ * withAuthenticatedDb no matter who is asking or what they claim.
  *
  * getUser, not getSession: getSession decodes the cookie and believes it;
  * getUser validates the token against the Auth server.
  */
 import { cache } from "react";
 import { redirect } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withElevatedCopyTraderXRead } from "@/lib/compound/db/client";
 import { getUserRole } from "@/lib/compound/db/users";
 import { authClient } from "./supabase";
 
@@ -80,7 +92,7 @@ export const requireManager = cache(async (): Promise<SessionUser> => {
 
   const claim = (data.user.app_metadata as { role?: unknown } | null)?.role;
   const claimed = typeof claim === "string" ? claim : null;
-  const stored = await withDb((c) => getUserRole(c, data.user!.id));
+  const stored = await withElevatedCopyTraderXRead((c) => getUserRole(c, data.user!.id));
 
   if (!resolveIsAdmin(claimed, stored)) redirect(`${SIGN_IN_PATH}?denied=1`);
 

@@ -14,7 +14,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
 import { classifyCandidate } from "@/lib/compound/db/write-classify";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
@@ -32,14 +32,25 @@ import { classifyHref, deskHref, readingHref, reviewHref } from "@/lib/compound/
  * proceed. Exported so a later sheet (Task 12's addCapital, Task 13's
  * payOut) can reuse the identical check against `fingerprintFromFields` /
  * `fingerprintOf` / `fingerprintMismatch` rather than re-implementing it.
+ *
+ * managerUserId is an explicit parameter, not resolved internally — see
+ * load/ledger.ts's module doc: loadPoolState needs a caller identity to open
+ * its own compound_* connection as, and resolving one via requireManager()
+ * inside this function would make it uncallable from anywhere without a live
+ * Next.js request, capital-staleness.db.test.ts included, which calls this
+ * function directly against a real writer with no request in sight.
  */
-export async function staleness(accountId: number, formData: FormData): Promise<string | null> {
+export async function staleness(
+  managerUserId: string,
+  accountId: number,
+  formData: FormData,
+): Promise<string | null> {
   const shown = fingerprintFromFields((k) => {
     const v = formData.get(k);
     return typeof v === "string" ? v : null;
   });
   if (shown === null) return "That form was incomplete. Nothing was committed.";
-  const current = fingerprintOf(accountId, await loadPoolState(accountId));
+  const current = fingerprintOf(accountId, await loadPoolState(managerUserId, accountId));
   return fingerprintMismatch(shown, current);
 }
 
@@ -66,7 +77,7 @@ export async function refreshReadings(formData: FormData) {
   const droppedParam = encodeDroppedDeals(outcome.plan.droppedDeals);
 
   try {
-    const result = await withDbTransaction((c) =>
+    const result = await withAuthenticatedDb(user.id, (c) =>
       commitReadingPlan(c, { accountId: account.id, plan: outcome.plan, actorUserId: user.id }),
     );
     revalidatePath(back, "layout");
@@ -85,7 +96,7 @@ export async function postReading(formData: FormData) {
   const user = await requireManager();
   const back = readingHref(account.id);
 
-  const stale = await staleness(account.id, formData);
+  const stale = await staleness(user.id, account.id, formData);
   if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
 
   // The fence, re-checked here rather than trusted from the page that
@@ -127,7 +138,7 @@ export async function postReading(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitReadingPlan(c, {
         accountId: account.id,
         plan: {
@@ -170,7 +181,7 @@ export async function classify(formData: FormData) {
   const candidateId = Number(formData.get("candidateId"));
   const back = classifyHref(account.id, candidateId);
 
-  const stale = await staleness(account.id, formData);
+  const stale = await staleness(user.id, account.id, formData);
   if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
   const shown = fingerprintFromFields((k) => {
     const v = formData.get(k);
@@ -192,7 +203,7 @@ export async function classify(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       classifyCandidate(c, {
         accountId: account.id,
         candidateId,
