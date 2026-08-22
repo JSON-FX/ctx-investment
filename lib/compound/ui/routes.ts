@@ -81,3 +81,26 @@ export function activeNavKey(pathname: string, accountId: number): string {
   if (first === "holders" || first === "actions") return "desk";
   return SUBNAV.some((n) => n.key === first) ? first : "";
 }
+
+/** The brand every route's <title> carries, so the seven of them (built
+ * through routeTitle below) and the root layout's own default agree on it
+ * without seven copies of the literal string. */
+const BRAND = "Compound";
+
+/**
+ * Every account-scoped route's <title>, built one way. Before this, all
+ * seven routes under /a/[id] shared app/layout.tsx's single static title —
+ * "Compound — Investor Desk" in a manager's every tab and history entry,
+ * whichever account or page they had open.
+ *
+ * `surface` is a plain route name ("Ledger", "Review"), never a figure —
+ * this function's signature has no parameter a cents value could be handed
+ * to, which is what keeps a balance out of browser history and off a
+ * shoulder-surfer's screen by construction rather than by a reviewer
+ * remembering to check each call site. route-titles.test.ts reads the seven
+ * real page.tsx sources and confirms every one of them calls this rather
+ * than hand-building its own title string.
+ */
+export function routeTitle(surface: string, accountLabel: string): string {
+  return `${surface} · ${accountLabel} — ${BRAND}`;
+}

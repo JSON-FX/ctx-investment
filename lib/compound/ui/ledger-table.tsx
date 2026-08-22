@@ -33,7 +33,7 @@ import type { LedgerStep } from "@/lib/compound/present/derive";
 import {
   formatDate, formatNav, formatUnitsDp, formatUtcStamp,
 } from "@/lib/compound/present/format";
-import { DeltaMoney, EmptyState, Money } from "./primitives";
+import { DeltaMoney, EmptyState, Money, PageHeading } from "./primitives";
 import { holderHref } from "./routes";
 
 export interface LedgerRowMeta {
@@ -63,10 +63,13 @@ export function LedgerTable({
 }) {
   if (steps.length === 0) {
     return (
-      <EmptyState title="No entries yet">
-        Every deposit, payout and equity reading appears here, in the order it was
-        applied. Nothing else moves a figure on this account.
-      </EmptyState>
+      <>
+        <PageHeading>Ledger</PageHeading>
+        <EmptyState title="No entries yet">
+          Every deposit, payout and equity reading appears here, in the order it was
+          applied. Nothing else moves a figure on this account.
+        </EmptyState>
+      </>
     );
   }
 
@@ -76,84 +79,87 @@ export function LedgerTable({
   }
 
   return (
-    <div className="scroller">
-      <table>
-        <caption className="eyebrow">
-          Ledger · {steps.length} {steps.length === 1 ? "entry" : "entries"} ·
-          append-only, ordered by seq
-        </caption>
-        <thead>
-          <tr>
-            <th scope="col">Seq</th>
-            <th scope="col">Occurred</th>
-            <th scope="col">Type</th>
-            <th scope="col">Holder</th>
-            <th scope="col">Cash</th>
-            <th scope="col">Units</th>
-            <th scope="col">Equity after</th>
-            <th scope="col">Units after</th>
-            <th scope="col">NAV after</th>
-            <th scope="col">Recorded</th>
-          </tr>
-        </thead>
-        <tbody>
-          {steps.map((s) => {
-            const m = meta.get(s.entry.id);
-            const holderId = s.entry.holderId;
-            const reversedBy = voidedBy.get(s.entry.id);
-            return (
-              <tr key={s.entry.id} className={s.voided ? "voided" : ""}>
-                <th scope="row" className="num" style={{ fontWeight: 400 }}>{s.entry.seq}</th>
-                <td className="num">{formatDate(s.entry.occurredOn)}</td>
-                <td>
-                  {TYPE_LABELS[s.entry.type] ?? s.entry.type}
-                  {s.entry.feeSettlement === null ? null : (
-                    <span className="muted"> · fee as {s.entry.feeSettlement}</span>
-                  )}
-                  {s.voided ? (
-                    <span className="muted">
-                      {" "}· voided{reversedBy === undefined ? "" : ` by #${reversedBy}`}
-                    </span>
-                  ) : null}
-                  {s.entry.reversesId === null ? null : (
-                    <span className="muted"> · reverses #{s.entry.reversesId}</span>
-                  )}
-                </td>
-                <td>
-                  {holderId === null ? "—" : (
-                    <a href={holderHref(accountId, holderId)}>
-                      {names[holderId] ?? `Holder #${holderId}`}
-                    </a>
-                  )}
-                </td>
-                <td>
-                  {s.entry.type === "equity_reading" || s.equityDelta === 0n
-                    ? <span className="num">—</span>
-                    : <DeltaMoney cents={s.equityDelta} currency={currency} />}
-                </td>
-                <td className="num">
-                  {s.unitsDelta === 0n
-                    ? "—"
-                    : `${s.unitsDelta > 0n ? "+" : "-"}${formatUnitsDp(
-                        s.unitsDelta < 0n ? -s.unitsDelta : s.unitsDelta,
-                      )}`}
-                </td>
-                <td><Money cents={s.after.equityCents} currency={currency} /></td>
-                <td className="num">{formatUnitsDp(s.after.units)}</td>
-                <td className="num">{formatNav(totalsOf(s.after))}</td>
-                <td className="num muted">
-                  {m === undefined ? "—" : formatUtcStamp(m.recordedAt)}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-      <p className="foot" style={{ padding: "14px 16px" }}>
-        The ledger is append-only. There is no edit and no delete on this screen or
-        anywhere else, and none is granted in the database. A correction is a
-        reversing entry, which voids both itself and the entry it reverses.
-      </p>
-    </div>
+    <>
+      <PageHeading>Ledger</PageHeading>
+      <div className="scroller">
+        <table>
+          <caption className="eyebrow">
+            Ledger · {steps.length} {steps.length === 1 ? "entry" : "entries"} ·
+            append-only, ordered by seq
+          </caption>
+          <thead>
+            <tr>
+              <th scope="col">Seq</th>
+              <th scope="col">Occurred</th>
+              <th scope="col">Type</th>
+              <th scope="col">Holder</th>
+              <th scope="col">Cash</th>
+              <th scope="col">Units</th>
+              <th scope="col">Equity after</th>
+              <th scope="col">Units after</th>
+              <th scope="col">NAV after</th>
+              <th scope="col">Recorded</th>
+            </tr>
+          </thead>
+          <tbody>
+            {steps.map((s) => {
+              const m = meta.get(s.entry.id);
+              const holderId = s.entry.holderId;
+              const reversedBy = voidedBy.get(s.entry.id);
+              return (
+                <tr key={s.entry.id} className={s.voided ? "voided" : ""}>
+                  <th scope="row" className="num" style={{ fontWeight: 400 }}>{s.entry.seq}</th>
+                  <td className="num">{formatDate(s.entry.occurredOn)}</td>
+                  <td>
+                    {TYPE_LABELS[s.entry.type] ?? s.entry.type}
+                    {s.entry.feeSettlement === null ? null : (
+                      <span className="muted"> · fee as {s.entry.feeSettlement}</span>
+                    )}
+                    {s.voided ? (
+                      <span className="muted">
+                        {" "}· voided{reversedBy === undefined ? "" : ` by #${reversedBy}`}
+                      </span>
+                    ) : null}
+                    {s.entry.reversesId === null ? null : (
+                      <span className="muted"> · reverses #{s.entry.reversesId}</span>
+                    )}
+                  </td>
+                  <td>
+                    {holderId === null ? "—" : (
+                      <a href={holderHref(accountId, holderId)}>
+                        {names[holderId] ?? `Holder #${holderId}`}
+                      </a>
+                    )}
+                  </td>
+                  <td>
+                    {s.entry.type === "equity_reading" || s.equityDelta === 0n
+                      ? <span className="num">—</span>
+                      : <DeltaMoney cents={s.equityDelta} currency={currency} />}
+                  </td>
+                  <td className="num">
+                    {s.unitsDelta === 0n
+                      ? "—"
+                      : `${s.unitsDelta > 0n ? "+" : "-"}${formatUnitsDp(
+                          s.unitsDelta < 0n ? -s.unitsDelta : s.unitsDelta,
+                        )}`}
+                  </td>
+                  <td><Money cents={s.after.equityCents} currency={currency} /></td>
+                  <td className="num">{formatUnitsDp(s.after.units)}</td>
+                  <td className="num">{formatNav(totalsOf(s.after))}</td>
+                  <td className="num muted">
+                    {m === undefined ? "—" : formatUtcStamp(m.recordedAt)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <p className="foot" style={{ padding: "14px 16px" }}>
+          The ledger is append-only. There is no edit and no delete on this screen or
+          anywhere else, and none is granted in the database. A correction is a
+          reversing entry, which voids both itself and the entry it reverses.
+        </p>
+      </div>
+    </>
   );
 }

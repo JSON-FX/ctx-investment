@@ -10,7 +10,8 @@
 import { render, screen } from "@testing-library/react";
 import { centsFromDecimal, unitsFromDecimal } from "@/lib/compound/engine/money";
 import {
-  Chip, DeltaMoney, EmptyState, FeeMoney, LabelledFigure, Money, Share, Tag, UnitCount,
+  Chip, DeltaMoney, EmptyState, FeeMoney, LabelledFigure, Money, PageHeading, Share, Tag,
+  UnitCount,
 } from "./primitives";
 
 describe("Money", () => {
@@ -110,6 +111,18 @@ describe("Tag and Chip", () => {
 
     rerender(<Chip tone="fee">Fee</Chip>);
     expect(container.querySelector(".chip.is-fee")).not.toBeNull();
+  });
+});
+
+describe("PageHeading", () => {
+  it("is a level-1 heading, named for the route", () => {
+    render(<PageHeading>Journal</PageHeading>);
+    expect(screen.getByRole("heading", { level: 1, name: "Journal" })).toBeInTheDocument();
+  });
+
+  it("is visually hidden rather than adding a visible title to the design", () => {
+    render(<PageHeading>Journal</PageHeading>);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveClass("sr-only");
   });
 });
 

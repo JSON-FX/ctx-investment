@@ -13,6 +13,7 @@
  * account resolution beyond requireAccount, no navigation. Plan 4's
  * app/a/[id]/layout.tsx supplies all of that once it lands.
  */
+import type { Metadata } from "next";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadOpenPositions, loadOrders, loadTradeHistory } from "@/lib/compound/load/trades";
 import {
@@ -23,13 +24,21 @@ import {
 } from "@/lib/compound/journal/order-filters";
 import { applyTradeFilters, symbolsOf, TRADE_SPEC } from "@/lib/compound/journal/trade-filters";
 import { flattenParams, parseTableState } from "@/lib/compound/journal/table-state";
+import { PageHeading } from "@/lib/compound/ui/primitives";
 import { GuardNotice } from "@/lib/compound/ui/journal/guard-notice";
 import { OrdersTable } from "@/lib/compound/ui/journal/orders-table";
 import { PositionsTable } from "@/lib/compound/ui/journal/positions-table";
 import { TradesTable } from "@/lib/compound/ui/journal/trades-table";
-import { journalHref } from "@/lib/compound/ui/routes";
+import { journalHref, routeTitle } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Journal", account.label) };
+}
 
 export default async function JournalPage({
   params,
@@ -55,6 +64,7 @@ export default async function JournalPage({
 
   return (
     <>
+      <PageHeading>Journal</PageHeading>
       <GuardNotice history={history} />
       <TradesTable
         result={applyTradeFilters(history.deals, tradeState)}

@@ -22,6 +22,7 @@
  * not typecheck against the real (merged) signature, caught by running
  * `tsc`, not by reading the plan.
  */
+import type { Metadata } from "next";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadDailySnapshots, loadTradeHistory } from "@/lib/compound/load/trades";
 import { loadLedger, loadSeeds } from "@/lib/compound/load/ledger";
@@ -33,13 +34,21 @@ import { computeStreaks } from "@/lib/compound/journal/streaks";
 import { computeTradeEquity } from "@/lib/compound/journal/trade-equity";
 import { computeTradeStats } from "@/lib/compound/journal/trade-stats";
 import { GuardNotice } from "@/lib/compound/ui/journal/guard-notice";
-import { Eyebrow, Panel } from "@/lib/compound/ui/primitives";
+import { Eyebrow, PageHeading, Panel } from "@/lib/compound/ui/primitives";
 import { EquityChart } from "@/lib/compound/ui/performance/equity-chart";
 import { HistogramChart } from "@/lib/compound/ui/performance/histogram-chart";
 import { PnlCurve } from "@/lib/compound/ui/performance/pnl-curve";
 import { StatsPanel } from "@/lib/compound/ui/performance/stats-panel";
+import { routeTitle } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Performance", account.label) };
+}
 
 const BIN_COUNT = 12;
 
@@ -67,6 +76,7 @@ export default async function PerformancePage({ params }: { params: Promise<{ id
 
   return (
     <>
+      <PageHeading>Performance</PageHeading>
       <GuardNotice history={history} />
 
       <Panel>

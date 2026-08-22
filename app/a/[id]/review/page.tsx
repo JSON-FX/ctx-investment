@@ -11,15 +11,24 @@
  * wrong place while the real one — which a duplicated trade date can be
  * hiding — stays put.
  */
+import type { Metadata } from "next";
 import { withDb } from "@/lib/compound/db/client";
 import { listCandidates } from "@/lib/compound/db/compound";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadInterlock } from "@/lib/compound/load/interlock";
 import { planFor } from "@/lib/compound/load/reconcile";
 import { ReviewQueue } from "@/lib/compound/ui/review-queue";
+import { routeTitle } from "@/lib/compound/ui/routes";
 import { refreshReadings } from "../actions/actions";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Review", account.label) };
+}
 
 export default async function ReviewPage({ params }: { params: Promise<{ id: string }> }) {
   const account = await requireAccount((await params).id);

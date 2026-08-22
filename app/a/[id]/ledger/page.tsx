@@ -9,6 +9,7 @@
  * alone, so it stays a direct withDb call here rather than adding a
  * single-caller export to that shared loader module.
  */
+import type { Metadata } from "next";
 import { withDb } from "@/lib/compound/db/client";
 import { listLedgerMeta } from "@/lib/compound/db/ledger-meta";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -16,8 +17,16 @@ import { loadHolderNames, loadLedger, loadSeeds } from "@/lib/compound/load/ledg
 import { ledgerSteps } from "@/lib/compound/present/derive";
 import { LedgerTable } from "@/lib/compound/ui/ledger-table";
 import { Panel } from "@/lib/compound/ui/primitives";
+import { routeTitle } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Metadata> {
+  const account = await requireAccount((await params).id);
+  return { title: routeTitle("Ledger", account.label) };
+}
 
 export default async function LedgerPage({ params }: { params: Promise<{ id: string }> }) {
   const account = await requireAccount((await params).id);

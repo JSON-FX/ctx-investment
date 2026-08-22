@@ -36,6 +36,33 @@ function renderQueue(over: Partial<Parameters<typeof ReviewQueue>[0]> = {}) {
   );
 }
 
+describe("ReviewQueue — page identity", () => {
+  it("announces itself as a level-1 heading named 'Review', distinct from a candidate's own heading", () => {
+    renderQueue();
+    expect(screen.getByRole("heading", { level: 1, name: "Review" })).toBeInTheDocument();
+    // Each pending candidate carries its own <h2> (its trade date) — see
+    // "dates the event" below. Asserting the level here is what keeps this
+    // from ever matching one of those by accident.
+    expect(screen.getByRole("heading", { level: 2, name: "12 Aug 2026" })).toBeInTheDocument();
+  });
+
+  it("still announces itself when the queue is clear, switched off, or the data is a defect", () => {
+    // Three more of the component's four states — every one of them a
+    // different early return, none of them a fallthrough of "a pending
+    // candidate" above.
+    const { unmount: u1 } = renderQueue({ pending: [] });
+    expect(screen.getByRole("heading", { level: 1, name: "Review" })).toBeInTheDocument();
+    u1();
+
+    const { unmount: u2 } = renderQueue({ pending: [], plan: null, notConfigured: true });
+    expect(screen.getByRole("heading", { level: 1, name: "Review" })).toBeInTheDocument();
+    u2();
+
+    renderQueue({ pending: [], plan: null, defect: "duplicate snapshot" });
+    expect(screen.getByRole("heading", { level: 1, name: "Review" })).toBeInTheDocument();
+  });
+});
+
 describe("ReviewQueue — a pending candidate", () => {
   beforeEach(() => renderQueue());
 

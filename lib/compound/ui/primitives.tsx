@@ -36,6 +36,29 @@ export function Eyebrow({ children }: { children: ReactNode }) {
   return <span className="eyebrow">{children}</span>;
 }
 
+/**
+ * A route's own <h1>. Visually hidden, never omitted.
+ *
+ * Every route under /a/[id] already shows its identity visibly — the sub-nav's
+ * active tab carries it in bold, sighted readers never lose track of which
+ * page they are on. What was missing was not a VISIBLE title but an ANNOUNCED
+ * one: a screen reader landing mid-page (a link followed from elsewhere, a
+ * bookmark, a fresh load) had no page identity read out, and heading-level
+ * navigation (screen readers' own "jump to next heading" command) had nothing
+ * at level 1 to land on. sr-only supplies both without moving a single pixel
+ * of a design this fix is not here to touch.
+ *
+ * Applies only to the six routes that had no owning component of their own
+ * (journal, calendar, performance compose several sibling panels; desk,
+ * ledger and review compose exactly one, and take their <h1> directly rather
+ * than through this primitive — see those files). The holder statement is
+ * different again: its own name IS the page's identity, so it already
+ * carries a real, visible <h1> and does not use this component either.
+ */
+export function PageHeading({ children }: { children: ReactNode }) {
+  return <h1 className="sr-only">{children}</h1>;
+}
+
 export function Money({ cents, currency = "USD" }: { cents: Cents; currency?: string }) {
   return <span className="num">{formatMoney(cents, { currency })}</span>;
 }

@@ -24,6 +24,18 @@ function renderFor(ledger = LEDGER, holder: HolderIdentity = ADA) {
   );
 }
 
+describe("HolderStatement — page identity", () => {
+  // This route already had a real <h1> before this task's a11y pass — the
+  // holder's own name (see the component's own module doc). Locked in here
+  // as a regression guard, not as one of that pass's fixes: unlike desk,
+  // ledger, journal, calendar, performance and review, this route never
+  // lacked a level-1 heading.
+  it("announces itself as a level-1 heading named for the holder, not a generic 'Holder statement'", () => {
+    renderFor();
+    expect(screen.getByRole("heading", { level: 1, name: "Ada Lovelace" })).toBeInTheDocument();
+  });
+});
+
 describe("HolderStatement — the position", () => {
   beforeEach(() => renderFor());
 

@@ -14,18 +14,46 @@
  * to the resolved account, so a holder id that belongs to a different
  * account simply is not in that list and falls through to notFound() below.
  */
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { withDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import { totalsOf } from "@/lib/compound/engine/replay";
 import { requireAccount } from "@/lib/compound/load/account";
-import { loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger";
+import { loadHolderNames, loadLedger, loadPoolState, loadSeeds } from "@/lib/compound/load/ledger";
 import { ledgerSteps } from "@/lib/compound/present/derive";
 import { holderPosition, holderStatement } from "@/lib/compound/present/holder";
 import { HolderStatement } from "@/lib/compound/ui/holder-statement";
-import { editHolderHref, payoutHref } from "@/lib/compound/ui/routes";
+import { editHolderHref, payoutHref, routeTitle } from "@/lib/compound/ui/routes";
 
 export const dynamic = "force-dynamic";
+
+// Same shape resolveOwnedAccount (load/account.ts) holds a path param to,
+// before it does any work: a plain positive integer, nothing parseInt would
+// coerce from garbage. Not itself the security boundary (holderId never
+// reaches SQL directly below) — just a fast, clear rejection ahead of the
+// loads that a malformed id would otherwise still fail safely on, one line
+// later. Shared by generateMetadata and the page below so the two cannot
+// silently drift onto different rules for the same param.
+const HID_RE = /^[1-9][0-9]{0,17}$/;
+
+export async function generateMetadata(
+  { params }: { params: Promise<{ id: string; hid: string }> },
+): Promise<Metadata> {
+  const { id, hid } = await params;
+  const account = await requireAccount(id);
+  if (!HID_RE.test(hid)) notFound();
+  // loadHolderNames, not listHolders: this route's own page component below
+  // needs the full HolderRow (split, status, joinedAt…) and reads it
+  // uncached — see that call's own reasoning. A <title> needs only the
+  // name, and loadHolderNames is the cache()d loader desk and ledger
+  // already share for exactly that, so this adds no second full-record
+  // query beside the page's.
+  const names = await loadHolderNames(account.id);
+  const name = names[Number(hid)];
+  if (name === undefined) notFound();
+  return { title: routeTitle(name, account.label) };
+}
 
 export default async function HolderPage({
   params,
@@ -35,13 +63,7 @@ export default async function HolderPage({
   const { id, hid } = await params;
   const account = await requireAccount(id);
 
-  // Same shape resolveOwnedAccount (load/account.ts) holds a path param to,
-  // before it does any work: a plain positive integer, nothing parseInt
-  // would coerce from garbage. Not itself the security boundary (holderId
-  // never reaches SQL directly below) — just a fast, clear rejection ahead
-  // of four parallel loads that a malformed id would otherwise still fail
-  // safely on, one line later.
-  if (!/^[1-9][0-9]{0,17}$/.test(hid)) notFound();
+  if (!HID_RE.test(hid)) notFound();
   const holderId = Number(hid);
 
   const [state, entries, seeds, holders] = await Promise.all([
