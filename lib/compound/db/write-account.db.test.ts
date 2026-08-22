@@ -13,15 +13,16 @@
  *      hits it independently for Task 6.
  *
  *   2. seedUser (and seedTwoAccounts, which calls it) inserts into
- *      auth.users, which only postgres/supabase_auth_admin can write —
- *      service_role gets "permission denied for table users" (confirmed
- *      exactly as holders.db.test.ts's header describes). createAccount
- *      itself has to run through client.ts's withDb (service_role), since
- *      that is the pool it actually runs under in production. So fixture
- *      seeding (withTestClient, the postgres-connected harness pool) and the
- *      writer under test (withDb, service_role) are necessarily two
- *      different connections/roles, not one rolled-back withDbTransaction
- *      spanning both, which is what the plan's draft assumed.
+ *      auth.users, which only postgres/supabase_auth_admin can write — no
+ *      role client.ts ever switches to can (confirmed exactly as
+ *      holders.db.test.ts's header describes). createAccount itself has to
+ *      run through client.ts's withAuthenticatedDb, connected as the
+ *      manager the row belongs to, since that is the helper — and the
+ *      identity — it actually runs under in production. So fixture seeding
+ *      (withTestClient, the postgres-connected harness pool) and the writer
+ *      under test (withAuthenticatedDb, authenticated) are necessarily two
+ *      different connections/roles, not one rolled-back transaction spanning
+ *      both, which is what the plan's draft assumed.
  *
  *   3. The plan's fourth case forces the manager-holder insert to fail with
  *      a 100,000-character managerName, reasoning that compound_holder.name
@@ -35,7 +36,7 @@
  * Isolation is resetCompoundTables in beforeEach, matching holders.db.test.ts
  * and commit-plan.db.test.ts, rather than transaction rollback — see point 2.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { getAccountById, getAccountByMt5, listAccountsForManager } from "@/lib/compound/db/compound";
 import { listHolders } from "@/lib/compound/db/holders";
 import { createAccount, type CreateAccountInput } from "@/lib/compound/db/write-account";
@@ -50,9 +51,10 @@ import {
 } from "@/lib/compound/db/testing/harness";
 import { LOCAL_SUPABASE_DB_URL } from "@/lib/compound/db/testing/env";
 
-// withDb (client.ts) reads COMPOUND_DATABASE_URL, not COMPOUND_TEST_DATABASE_URL,
-// and throws if it is unset. Nothing sets it globally; client.db.test.ts is the
-// precedent for doing this locally so this file does not depend on run order.
+// withAuthenticatedDb (client.ts) reads COMPOUND_DATABASE_URL, not
+// COMPOUND_TEST_DATABASE_URL, and throws if it is unset. Nothing sets it
+// globally; client.db.test.ts is the precedent for doing this locally so
+// this file does not depend on run order.
 const ORIGINAL_DATABASE_URL = process.env.COMPOUND_DATABASE_URL;
 
 const MANAGER = "aaaaaaaa-0000-4000-8000-0000000006a1";
@@ -97,13 +99,15 @@ describe("createAccount", () => {
   });
 
   it("creates the account and its manager holder together", async () => {
-    const { accountId, managerHolderId } = await withDb((c) => createAccount(c, input()));
+    const { accountId, managerHolderId } = await withAuthenticatedDb(MANAGER, (c) =>
+      createAccount(c, input()),
+    );
 
-    const account = await withDb((c) => getAccountById(c, accountId));
+    const account = await withAuthenticatedDb(MANAGER, (c) => getAccountById(c, accountId));
     expect(account!.mt5Account).toBe(90_000_777);
     expect(account!.brokerOffsetHours).toBe(3);
 
-    const holders = await withDb((c) => listHolders(c, accountId));
+    const holders = await withAuthenticatedDb(MANAGER, (c) => listHolders(c, accountId));
     expect(holders).toHaveLength(1);
     expect(holders[0]!.id).toBe(managerHolderId);
     expect(holders[0]!.isManager).toBe(true);
@@ -111,16 +115,44 @@ describe("createAccount", () => {
   });
 
   it("stores a null offset when none is given, rather than zero", async () => {
-    const { accountId } = await withDb((c) =>
+    const { accountId } = await withAuthenticatedDb(MANAGER, (c) =>
       createAccount(c, input({ mt5Account: 90_001_777, brokerOffsetHours: null })),
     );
-    expect((await withDb((c) => getAccountById(c, accountId)))!.brokerOffsetHours).toBeNull();
+    expect(
+      (await withAuthenticatedDb(MANAGER, (c) => getAccountById(c, accountId)))!.brokerOffsetHours,
+    ).toBeNull();
   });
 
-  it("refuses a second account on the same MT5 number, with CX101", async () => {
-    await withDb((c) => createAccount(c, input()));
+  it("refuses the SAME manager a second account on an MT5 number they already registered, with CX101", async () => {
+    await withAuthenticatedDb(MANAGER, (c) => createAccount(c, input()));
     await expectPgError(
-      withDb((c) => createAccount(c, input({ managerUserId: OTHER_MANAGER }))),
+      withAuthenticatedDb(MANAGER, (c) => createAccount(c, input({ label: "Second attempt" }))),
+      "CX101",
+      /already has a Compound account/,
+    );
+  });
+
+  // Not the same case as above, and not interchangeable with it —
+  // 20260822130000_compound_create_account_visible_duplicate_check.sql's own
+  // header explains why: compound_create_account is SECURITY INVOKER, and
+  // CX101's guard now runs as `authenticated`. Read by the SAME manager who
+  // owns the existing row, compound_account_select's policy lets the guard
+  // see it, and CX101 fires — that is the case immediately above. Read by a
+  // DIFFERENT manager, the same unqualified `select … from compound_account`
+  // would have found nothing before this migration's fix (RLS scoping the
+  // guard to the caller's own rows), and CX101 would never have fired at
+  // all — the INSERT would have reached compound_account_mt5_account_key's
+  // raw UNIQUE constraint instead, a 23505 with no friendly message. This
+  // case is what compound_mt5_account_taken exists to keep working: CX101
+  // regardless of which manager is asking, because an MT5 account number is
+  // one broker account and must resolve to at most one Compound account,
+  // full stop.
+  it("refuses a DIFFERENT manager the same MT5 number too, with the same CX101 — not the raw unique-constraint error", async () => {
+    await withAuthenticatedDb(MANAGER, (c) => createAccount(c, input()));
+    await expectPgError(
+      withAuthenticatedDb(OTHER_MANAGER, (c) =>
+        createAccount(c, input({ managerUserId: OTHER_MANAGER, managerName: "Other Marsh" })),
+      ),
       "CX101",
       /already has a Compound account/,
     );
@@ -131,10 +163,12 @@ describe("createAccount", () => {
     // `unknown` because CreateAccountInput's own type correctly disallows
     // it — no valid TypeScript caller can reach this path. Only a test that
     // wants to hit compound_holder.name's NOT NULL directly needs to.
-    const before = await withDb((c) => sequenceConsumed(c, "public.compound_account", "id"));
+    const before = await withAuthenticatedDb(MANAGER, (c) =>
+      sequenceConsumed(c, "public.compound_account", "id"),
+    );
 
     await expectPgError(
-      withDb((c) =>
+      withAuthenticatedDb(MANAGER, (c) =>
         createAccount(c, input({ mt5Account: 90_000_778, managerName: null as unknown as string })),
       ),
       "23502",
@@ -145,15 +179,17 @@ describe("createAccount", () => {
     // reached RETURNING id — even though the row it produced is gone. This
     // is what tells a real rollback apart from a guard that fired before
     // either insert ran; a promise rejection alone cannot.
-    const after = await withDb((c) => sequenceConsumed(c, "public.compound_account", "id"));
+    const after = await withAuthenticatedDb(MANAGER, (c) =>
+      sequenceConsumed(c, "public.compound_account", "id"),
+    );
     expect(after).toBeGreaterThan(before);
 
     // Neither row survives, not "an error surfaced": the account itself —
-    const account = await withDb((c) => getAccountByMt5(c, 90_000_778));
+    const account = await withAuthenticatedDb(MANAGER, (c) => getAccountByMt5(c, 90_000_778));
     expect(account).toBeNull();
     // — and, since compound_holder.account_id can only reference a row that
     // exists, no holder anywhere in the (freshly reset) table either.
-    const holderCount = await withDb(async (c) => {
+    const holderCount = await withAuthenticatedDb(MANAGER, async (c) => {
       const { rows } = await c.query<{ n: string }>(`select count(*)::text as n from public.compound_holder`);
       return Number(rows[0]!.n);
     });
@@ -162,13 +198,13 @@ describe("createAccount", () => {
 
   it("refuses a split outside 0..10000 before it reaches SQL", async () => {
     await expect(
-      withDb((c) => createAccount(c, input({ defaultSplitBps: 10_001 }))),
+      withAuthenticatedDb(MANAGER, (c) => createAccount(c, input({ defaultSplitBps: 10_001 }))),
     ).rejects.toThrow(/defaultSplitBps must be an integer/);
   });
 
   it("writes an audit row naming the actor", async () => {
-    const { accountId } = await withDb((c) => createAccount(c, input()));
-    const { rows } = await withDb((c) =>
+    const { accountId } = await withAuthenticatedDb(MANAGER, (c) => createAccount(c, input()));
+    const { rows } = await withAuthenticatedDb(MANAGER, (c) =>
       c.query<{ actor: string; action: string; entity_id: string }>(
         `select actor, action, entity_id from public.compound_audit
           where entity = 'compound_account' and entity_id = $1`,
@@ -193,7 +229,7 @@ describe("createAccount + listAccountsForManager — ownership scoping", () => {
   it("shows a manager only the accounts they own, including one just created — never another manager's", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
 
-    const { accountId: newId } = await withDb((c) =>
+    const { accountId: newId } = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       createAccount(c, input({
         mt5Account: 90_000_779,
         label: "New for A",
@@ -202,8 +238,12 @@ describe("createAccount + listAccountsForManager — ownership scoping", () => {
       })),
     );
 
-    const listA = await withDb((c) => listAccountsForManager(c, seed.accountA.managerUserId));
-    const listB = await withDb((c) => listAccountsForManager(c, seed.accountB.managerUserId));
+    const listA = await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
+      listAccountsForManager(c, seed.accountA.managerUserId),
+    );
+    const listB = await withAuthenticatedDb(seed.accountB.managerUserId, (c) =>
+      listAccountsForManager(c, seed.accountB.managerUserId),
+    );
 
     // "These": A's list has both of A's accounts.
     expect(listA.map((a) => a.id)).toEqual([seed.accountA.accountId, newId]);
@@ -260,7 +300,7 @@ describe("createAccount + listAccountsForManager — order", () => {
       ),
     );
 
-    const rows = await withDb((c) => listAccountsForManager(c, MANAGER));
+    const rows = await withAuthenticatedDb(MANAGER, (c) => listAccountsForManager(c, MANAGER));
     expect(rows.map((a) => a.id)).toEqual([low, high]);
     expect(rows.map((a) => a.label)).toEqual(["Alpha, physically second", "Zeta, physically first"]);
   });

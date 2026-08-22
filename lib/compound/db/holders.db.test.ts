@@ -11,13 +11,15 @@
  * public.users` from the CopyTraderX fixture migration, so getUserRole is
  * unaffected), the fix moves ONLY the fixture setup onto the harness's
  * postgres-connected pool. listHolders itself still runs through client.ts's
- * withDb — the same pool requireAccount and every other loader actually
- * borrow in production — so what is under test still runs as service_role,
- * matching a real request. Isolation between tests is resetCompoundTables in
- * beforeEach, matching rls.db.test.ts and commit-plan.db.test.ts, rather than
- * transaction rollback: the plan's draft used a single rolled-back
- * withDbTransaction spanning both seeding and reading, which cannot work once
- * seeding needs a different role than the read.
+ * withAuthenticatedDb, connected as the account's own manager — the same
+ * helper requireAccount and every other loader actually borrow in
+ * production — so what is under test still runs under compound_holder's real
+ * RLS policy, matching a real request, not bypassing it as service_role
+ * would. Isolation between tests is resetCompoundTables in beforeEach,
+ * matching rls.db.test.ts and commit-plan.db.test.ts, rather than transaction
+ * rollback: the plan's draft used a single rolled-back withDbTransaction
+ * spanning both seeding and reading, which cannot work once seeding needs a
+ * different role than the read.
  *
  * Two further disagreements between the plan's draft and the real harness,
  * both checked against a real run rather than assumed:
@@ -40,7 +42,7 @@
  *      "the holder's own column" apart from a neighbour's value or the
  *      account default.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import {
   closeTestPool,
@@ -50,9 +52,10 @@ import {
 } from "@/lib/compound/db/testing/harness";
 import { LOCAL_SUPABASE_DB_URL } from "@/lib/compound/db/testing/env";
 
-// withDb (client.ts) reads COMPOUND_DATABASE_URL, not COMPOUND_TEST_DATABASE_URL,
-// and throws if it is unset. Nothing sets it globally; client.db.test.ts is the
-// precedent for doing this locally so this file does not depend on run order.
+// withAuthenticatedDb (client.ts) reads COMPOUND_DATABASE_URL, not
+// COMPOUND_TEST_DATABASE_URL, and throws if it is unset. Nothing sets it
+// globally; client.db.test.ts is the precedent for doing this locally so
+// this file does not depend on run order.
 const ORIGINAL_DATABASE_URL = process.env.COMPOUND_DATABASE_URL;
 
 beforeAll(() => {
@@ -73,14 +76,18 @@ afterAll(async () => {
 describe("listHolders", () => {
   it("returns only the requested account's holders", async () => {
     const { accountA, accountB } = await withTestClient((c) => seedTwoAccounts(c));
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listHolders(c, accountA.accountId),
+    );
     expect(rows.map((r) => r.accountId)).toEqual([accountA.accountId, accountA.accountId]);
     expect(rows.some((r) => r.accountId === accountB.accountId)).toBe(false);
   });
 
   it("puts the manager first", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listHolders(c, accountA.accountId),
+    );
     expect(rows[0]!.isManager).toBe(true);
     expect(rows[0]!.name).toBe("Seed Manager A");
     // The harness's own fixture (see the module doc above): this account's
@@ -108,7 +115,9 @@ describe("listHolders", () => {
       return Number(rows[0]!.id);
     });
 
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) =>
+      listHolders(c, accountA.accountId),
+    );
     expect(rows.find((r) => r.id === newId)?.splitBps).toBe(3700);
     expect(rows.find((r) => r.name === "Seed Investor A1")?.splitBps).toBe(4000);
   });
@@ -130,6 +139,11 @@ describe("listHolders", () => {
   });
 
   it("returns an empty array for an account with no holders, not null", async () => {
-    expect(await withDb((c) => listHolders(c, 2_147_483_646))).toEqual([]);
+    // No compound_holder row exists for this account under ANY manager, so
+    // which identity connects does not change the outcome — a syntactically
+    // valid uuid stands in for a caller, same as rls.db.test.ts's CAROL
+    // ("signed in as an admin, manages nothing").
+    const nobody = "eeeeeeee-0000-4000-8000-0000000000e1";
+    expect(await withAuthenticatedDb(nobody, (c) => listHolders(c, 2_147_483_646))).toEqual([]);
   });
 });
