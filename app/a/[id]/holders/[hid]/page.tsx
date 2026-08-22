@@ -51,7 +51,7 @@ export async function generateMetadata(
   // name, and loadHolderNames is the cache()d loader desk and ledger
   // already share for exactly that, so this adds no second full-record
   // query beside the page's.
-  const names = await loadHolderNames(account.id);
+  const names = await loadHolderNames(account.managerUserId, account.id);
   const name = names[Number(hid)];
   if (name === undefined) notFound();
   return { title: routeTitle(name, account.label) };
@@ -69,9 +69,9 @@ export default async function HolderPage({
   const holderId = Number(hid);
 
   const [state, entries, seeds, holders] = await Promise.all([
-    loadPoolState(account.id),
-    loadLedger(account.id),
-    loadSeeds(account.id),
+    loadPoolState(account.managerUserId, account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
     withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
   ]);
 

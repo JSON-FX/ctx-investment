@@ -21,9 +21,9 @@ export default async function CapitalPage({
   const q = await searchParams;
   const [holders, entries, seeds, interlock] = await Promise.all([
     withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
-    loadLedger(account.id),
-    loadSeeds(account.id),
-    loadInterlock(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
+    loadInterlock(account.managerUserId, account.id),
   ]);
 
   let preview = null;

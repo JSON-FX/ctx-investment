@@ -33,9 +33,9 @@ export async function generateMetadata(
 export default async function LedgerPage({ params }: { params: Promise<{ id: string }> }) {
   const account = await requireAccount((await params).id);
   const [entries, seeds, names, meta] = await Promise.all([
-    loadLedger(account.id),
-    loadSeeds(account.id),
-    loadHolderNames(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
+    loadHolderNames(account.managerUserId, account.id),
     withAuthenticatedDb(account.managerUserId, (c) => listLedgerMeta(c, account.id)),
   ]);
 

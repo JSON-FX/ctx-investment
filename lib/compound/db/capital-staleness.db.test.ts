@@ -24,7 +24,7 @@
  * as read directly from the sibling worktree building it, and verified by
  * temporarily copying that file in for a run — never committed alongside it.
  */
-import { withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitDeposit } from "@/lib/compound/db/write-deposit";
 import {
   closeTestPool,
@@ -37,7 +37,6 @@ import { fingerprintOf } from "@/lib/compound/present/derive";
 import { fingerprintToFields } from "@/lib/compound/present/fingerprint";
 import { loadPoolState } from "@/lib/compound/load/ledger";
 import { staleness } from "@/app/a/[id]/actions/actions";
-import { closePool } from "@/lib/compound/db/client";
 
 const ORIGINAL_DATABASE_URL = process.env.COMPOUND_DATABASE_URL;
 
@@ -73,11 +72,11 @@ describe("the staleness guard addCapital calls before every commit", () => {
     );
     const managerId = Number(rows[0]!.id);
 
-    const state = await withDb(() => loadPoolState(seed.accountA.accountId));
+    const state = await loadPoolState(seed.accountA.managerUserId, seed.accountA.accountId);
     const shown = fingerprintOf(seed.accountA.accountId, state);
     const fd = formDataOf(fingerprintToFields(shown));
 
-    expect(await staleness(seed.accountA.accountId, fd)).toBeNull();
+    expect(await staleness(seed.accountA.managerUserId, seed.accountA.accountId, fd)).toBeNull();
 
     // managerId retrieved above is what a real capital-page render would
     // also have needed; asserted here only so an unused-variable lint
@@ -97,7 +96,7 @@ describe("the staleness guard addCapital calls before every commit", () => {
 
     // The receipt a manager would have been looking at: the pool BEFORE the
     // race.
-    const before = await withDb(() => loadPoolState(seed.accountA.accountId));
+    const before = await loadPoolState(seed.accountA.managerUserId, seed.accountA.accountId);
     const shown = fingerprintOf(seed.accountA.accountId, before);
     const fd = formDataOf(fingerprintToFields(shown));
 
@@ -105,7 +104,7 @@ describe("the staleness guard addCapital calls before every commit", () => {
     // between. Not a hand-edited PoolState: the actual writer under test
     // elsewhere in this task, so this probe cannot be satisfied by a fixture
     // that merely LOOKS stale.
-    await withDb((c) =>
+    await withAuthenticatedDb(seed.accountA.managerUserId, (c) =>
       commitDeposit(c, {
         accountId: seed.accountA.accountId, holderId: managerId,
         occurredOn: "2026-03-02", amountCents: 500_00n, note: null,
@@ -113,7 +112,7 @@ describe("the staleness guard addCapital calls before every commit", () => {
       }),
     );
 
-    const message = await staleness(seed.accountA.accountId, fd);
+    const message = await staleness(seed.accountA.managerUserId, seed.accountA.accountId, fd);
     expect(message).not.toBeNull();
     expect(message).toContain("account moved while this was open");
     expect(message).toContain("Nothing was committed");
@@ -121,7 +120,7 @@ describe("the staleness guard addCapital calls before every commit", () => {
 
   it("refuses a form with no fingerprint fields at all, rather than defaulting to 'fresh'", async () => {
     const seed = await withTestClient((c) => seedTwoAccounts(c));
-    const message = await staleness(seed.accountA.accountId, new FormData());
+    const message = await staleness(seed.accountA.managerUserId, seed.accountA.accountId, new FormData());
     expect(message).toBe("That form was incomplete. Nothing was committed.");
   });
 });

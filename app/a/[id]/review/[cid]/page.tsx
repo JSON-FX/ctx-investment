@@ -35,9 +35,9 @@ export default async function ClassifyPage({
   const [candidates, holders, entries, seeds, state] = await Promise.all([
     withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")),
     withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
-    loadLedger(account.id),
-    loadSeeds(account.id),
-    loadPoolState(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
+    loadPoolState(account.managerUserId, account.id),
   ]);
   const candidate = candidates.find((k) => k.id === Number(cid));
   if (candidate === undefined) notFound();

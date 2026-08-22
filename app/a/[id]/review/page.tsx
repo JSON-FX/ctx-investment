@@ -35,7 +35,7 @@ export default async function ReviewPage({ params }: { params: Promise<{ id: str
   const [outcome, pending, interlock] = await Promise.all([
     planFor(account),
     withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")),
-    loadInterlock(account.id),
+    loadInterlock(account.managerUserId, account.id),
   ]);
 
   return (

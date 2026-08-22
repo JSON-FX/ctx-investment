@@ -29,10 +29,10 @@ export default async function WithdrawPage({
 
   const [holders, entries, seeds, live, interlock] = await Promise.all([
     withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
-    loadLedger(account.id),
-    loadSeeds(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
     loadLive(account.mt5Account),
-    loadInterlock(account.id),
+    loadInterlock(account.managerUserId, account.id),
   ]);
   const holder = holders.find((h) => h.id === holderId);
   if (holder === undefined) notFound();

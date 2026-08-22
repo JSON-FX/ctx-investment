@@ -20,9 +20,9 @@ export default async function ReadingPage({
 
   const [outcome, entries, seeds, names] = await Promise.all([
     planFor(account),
-    loadLedger(account.id),
-    loadSeeds(account.id),
-    loadHolderNames(account.id),
+    loadLedger(account.managerUserId, account.id),
+    loadSeeds(account.managerUserId, account.id),
+    loadHolderNames(account.managerUserId, account.id),
   ]);
 
   let gate: ReadingGate;

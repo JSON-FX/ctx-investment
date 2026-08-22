@@ -60,7 +60,7 @@ export async function addCapital(formData: FormData) {
   const user = await requireManager();
   const back = capitalHref(account.id);
 
-  const stale = await staleness(account.id, formData);
+  const stale = await staleness(user.id, account.id, formData);
   if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
 
   let amountCents: bigint;

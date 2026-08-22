@@ -30,13 +30,17 @@ import { explainCommitError, isNextControlFlow } from "@/lib/compound/present/er
 import { fingerprintFromFields, fingerprintMismatch } from "@/lib/compound/present/fingerprint";
 import { deskHref, holderHref, withdrawHref } from "@/lib/compound/ui/routes";
 
-async function staleness(accountId: number, formData: FormData): Promise<string | null> {
+async function staleness(
+  managerUserId: string,
+  accountId: number,
+  formData: FormData,
+): Promise<string | null> {
   const shown = fingerprintFromFields((k) => {
     const v = formData.get(k);
     return typeof v === "string" ? v : null;
   });
   if (shown === null) return "That form was incomplete. Nothing was committed.";
-  const current = fingerprintOf(accountId, await loadPoolState(accountId));
+  const current = fingerprintOf(accountId, await loadPoolState(managerUserId, accountId));
   return fingerprintMismatch(shown, current);
 }
 
@@ -46,7 +50,7 @@ export async function withdraw(formData: FormData) {
   const holderId = Number(formData.get("holderId"));
   const back = withdrawHref(account.id, holderId);
 
-  const stale = await staleness(account.id, formData);
+  const stale = await staleness(user.id, account.id, formData);
   if (stale !== null) redirect(`${back}?error=${encodeURIComponent(stale)}`);
 
   const shown = fingerprintFromFields((k) => {

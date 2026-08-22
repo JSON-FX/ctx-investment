@@ -14,7 +14,7 @@
  * reachable state over this table, and it is what "swallow a RangeError into
  * the halt path" is probed against below.
  */
-import { closePool, withDb, withDbTransaction } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
 import { getLedgerEntries, getReconcileCursor, listCandidates } from "@/lib/compound/db/compound";
 import { classifyCandidate } from "@/lib/compound/db/write-classify";
@@ -105,8 +105,8 @@ async function seedAccountWithInvestor(
 
 /** The seq classifyCandidate's expectedSeq/CX204 check needs: the highest
  * seq already posted for the account, or 0 when nothing has been. */
-async function currentSeq(accountId: number): Promise<number> {
-  const entries = await withDb((c) => getLedgerEntries(c, accountId));
+async function currentSeq(managerUserId: string, accountId: number): Promise<number> {
+  const entries = await withAuthenticatedDb(managerUserId, (c) => getLedgerEntries(c, accountId));
   return entries.reduce((m, e) => (e.seq > m ? e.seq : m), 0);
 }
 
@@ -125,7 +125,7 @@ function safeJson(v: unknown): string {
 describe("planFor — not-configured", () => {
   it("refuses before touching CopyTraderX data at all, when the broker offset is null", async () => {
     const account = await seedAccount(null);
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
     expect(outcome).toEqual({ kind: "not-configured" });
   });
 });
@@ -133,7 +133,7 @@ describe("planFor — not-configured", () => {
 describe("planFor — plan", () => {
   it("reports idle when CopyTraderX has nothing for this account yet", async () => {
     const account = await seedAccount(2);
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
     expect(outcome.kind).toBe("plan");
     if (outcome.kind === "plan") {
       expect(outcome.plan).toEqual({ kind: "idle", droppedDeals: [] });
@@ -152,7 +152,7 @@ describe("planFor — plan", () => {
         [MT5],
       ),
     );
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
     expect(outcome.kind).toBe("plan");
     if (outcome.kind === "plan") {
       expect(outcome.plan.kind).toBe("advance");
@@ -178,7 +178,7 @@ describe("planFor — plan", () => {
       ),
     );
     // No deals at all: the 500.00 move on 08-11 is entirely unexplained.
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
     expect(outcome.kind).toBe("plan");
     if (outcome.kind === "plan" && outcome.plan.kind === "halt") {
       expect(outcome.plan.candidate.tradeDate).toBe("2026-08-11");
@@ -214,7 +214,7 @@ describe("planFor — plan", () => {
         [MT5],
       );
     });
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
     expect(outcome.kind).toBe("plan");
     if (outcome.kind === "plan") {
       expect(outcome.plan.droppedDeals).toHaveLength(1);
@@ -254,7 +254,7 @@ describe("planFor — error (the RangeError data defect, kept apart from a halt)
       ),
     );
 
-    const outcome = await withDb(() => planFor(account));
+    const outcome = await planFor(account);
 
     // The defining assertion: this is an ERROR outcome, never a halt. A halt
     // carries a `candidate` a manager would go to Review and look for; here
@@ -296,23 +296,23 @@ describe("the fence a hand-posted reading needs, that compound_commit_reading_pl
         [MT5],
       ),
     );
-    const halted = await withDb(() => planFor(account));
+    const halted = await planFor(account);
     if (halted.kind !== "plan" || halted.plan.kind !== "halt") {
       throw new Error(`fixture setup failed to produce a halt: ${JSON.stringify(halted)}`);
     }
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, { accountId: account.id, plan: halted.plan, actorUserId: null }),
     );
 
     // The candidate is now pending in the database — exactly the state
     // postReading's fence exists to catch before it ever reaches here.
-    const stillPending = await withDb(() => planFor(account));
+    const stillPending = await planFor(account);
     expect(stillPending.kind).toBe("plan");
     if (stillPending.kind === "plan") expect(stillPending.plan.kind).toBe("halt");
 
     // A manager hand-posts a reading dated after the frozen candidate — the
     // exact shape postReading builds, bypassing planReadings entirely.
-    const handBuilt = await withDbTransaction((c) =>
+    const handBuilt = await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id,
         plan: {
@@ -346,7 +346,7 @@ describe("the fence a hand-posted reading needs, that compound_commit_reading_pl
   // which caller built the plan.
   it("refuses — CX004 — when the cursor a caller asks for does not match the reading it just posted", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
-    await expect(withDbTransaction((c) =>
+    await expect(withAuthenticatedDb(accountA.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: accountA.accountId,
         plan: {
@@ -409,26 +409,26 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     );
 
     // 1. Refresh. Halts on 08-11, posts the 08-10 baseline.
-    const first = await withDb(() => planFor(account));
+    const first = await planFor(account);
     if (first.kind !== "plan" || first.plan.kind !== "halt") {
       throw new Error(`fixture setup failed to produce a halt: ${safeJson(first)}`);
     }
     expect(first.plan.candidate.tradeDate).toBe("2026-08-11");
     expect(first.plan.candidate.unexplainedCents).toBe(50_000n);
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: first.plan, actorUserId: account.managerUserId,
       }),
     );
 
-    const pending = await withDb((c) => listCandidates(c, account.id, "pending"));
+    const pending = await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending"));
     expect(pending).toHaveLength(1);
     const candidateId = pending[0]!.id;
 
     // 2. Classify as a deposit. Writes the deposit dated ON 08-11, at
     // whatever seq comes next after the baseline reading committed above.
-    const seqBeforeClassify = await currentSeq(account.id);
-    await withDb((c) =>
+    const seqBeforeClassify = await currentSeq(account.managerUserId, account.id);
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       classifyCandidate(c, {
         accountId: account.id,
         candidateId,
@@ -444,7 +444,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
 
     // 3. Refresh again. THE ASSERTION THIS TASK EXISTS TO MAKE PASS:
     // refreshing does NOT halt on 08-11 a second time.
-    const second = await withDb(() => planFor(account));
+    const second = await planFor(account);
     if (second.kind !== "plan") throw new Error(`expected a plan, got ${safeJson(second)}`);
     if (second.plan.kind !== "advance") {
       // Not safeJson(second.plan) — a halt plan carries bigint fields
@@ -458,7 +458,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     expect(second.plan.readings.map((r) => r.occurredOn)).toEqual(["2026-08-11", "2026-08-12"]);
     expect(second.plan.newCursorDate).toBe("2026-08-12");
 
-    const committed = await withDbTransaction((c) =>
+    const committed = await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: second.plan, actorUserId: account.managerUserId,
       }),
@@ -466,7 +466,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     expect(committed.readingsInserted).toBe(2);
     expect(committed.cursorDate).toBe("2026-08-12");
 
-    const cursor = await withDb((c) => getReconcileCursor(c, account.id));
+    const cursor = await withAuthenticatedDb(account.managerUserId, (c) => getReconcileCursor(c, account.id));
     expect(cursor.lastReadingDate).toBe("2026-08-12");
 
     // seq, end to end. fold() (engine/replay.ts) issues units at the NAV
@@ -474,7 +474,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     // it would move NAV before the deposit ever saw it, and the investor
     // would be priced in at the wrong NAV. This is the ordering guarantee
     // the report asked to have proved, not assumed.
-    const entries = await withDb((c) => getLedgerEntries(c, account.id));
+    const entries = await withAuthenticatedDb(account.managerUserId, (c) => getLedgerEntries(c, account.id));
     const deposit = entries.find((e) => e.type === "deposit" && e.occurredOn === "2026-08-11");
     const reading0811 = entries.find(
       (e) => e.type === "equity_reading" && e.occurredOn === "2026-08-11",
@@ -485,7 +485,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     expect(deposit.seq).toBeLessThan(reading0811.seq);
 
     // A third refresh has nothing left to do — the sequence is fully resolved.
-    const third = await withDb(() => planFor(account));
+    const third = await planFor(account);
     if (third.kind === "plan") expect(third.plan.kind).toBe("idle");
     else throw new Error(`expected a plan, got ${safeJson(third)}`);
   });
@@ -515,20 +515,20 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
       ),
     );
 
-    const first = await withDb(() => planFor(account));
+    const first = await planFor(account);
     if (first.kind !== "plan" || first.plan.kind !== "halt") {
       throw new Error(`fixture setup failed: ${safeJson(first)}`);
     }
     expect(first.plan.candidate.tradeDate).toBe("2026-08-11");
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: first.plan, actorUserId: account.managerUserId,
       }),
     );
 
-    const pendingA = (await withDb((c) => listCandidates(c, account.id, "pending")))[0]!;
-    const seqBeforeClassify = await currentSeq(account.id);
-    await withDb((c) =>
+    const pendingA = (await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")))[0]!;
+    const seqBeforeClassify = await currentSeq(account.managerUserId, account.id);
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       classifyCandidate(c, {
         accountId: account.id,
         candidateId: pendingA.id,
@@ -545,7 +545,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     // Refresh again. 08-11 is now explained (classified); 08-12 is
     // explained by the deal; 08-13's +500.00 has nothing behind it and has
     // never been classified — the run must halt there, not sail past it.
-    const second = await withDb(() => planFor(account));
+    const second = await planFor(account);
     if (second.kind !== "plan" || second.plan.kind !== "halt") {
       throw new Error(`expected a halt at 08-13, got ${safeJson(second)}`);
     }
@@ -556,15 +556,15 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
       expect(r.occurredOn < second.plan.candidate.tradeDate).toBe(true);
     }
 
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: second.plan, actorUserId: account.managerUserId,
       }),
     );
 
-    const stillPending = await withDb((c) => listCandidates(c, account.id, "pending"));
+    const stillPending = await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending"));
     expect(stillPending.map((k) => k.tradeDate)).toEqual(["2026-08-13"]);
-    const nowClassified = await withDb((c) => listCandidates(c, account.id, "classified"));
+    const nowClassified = await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "classified"));
     expect(nowClassified.map((k) => k.tradeDate)).toEqual(["2026-08-11"]);
   });
 
@@ -596,18 +596,18 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     // Build the "two candidates" state exactly as a manager would, one step
     // at a time: halt at A (08-11), classify A, refresh into a fresh halt
     // at B (08-13).
-    const first = await withDb(() => planFor(account));
+    const first = await planFor(account);
     if (first.kind !== "plan" || first.plan.kind !== "halt") {
       throw new Error(`fixture setup failed (A): ${safeJson(first)}`);
     }
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: first.plan, actorUserId: account.managerUserId,
       }),
     );
-    const candidateA = (await withDb((c) => listCandidates(c, account.id, "pending")))[0]!;
-    const seqBeforeClassify = await currentSeq(account.id);
-    await withDb((c) =>
+    const candidateA = (await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")))[0]!;
+    const seqBeforeClassify = await currentSeq(account.managerUserId, account.id);
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       classifyCandidate(c, {
         accountId: account.id,
         candidateId: candidateA.id,
@@ -620,11 +620,11 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
         actorUserId: account.managerUserId,
       }),
     );
-    const second = await withDb(() => planFor(account));
+    const second = await planFor(account);
     if (second.kind !== "plan" || second.plan.kind !== "halt") {
       throw new Error(`fixture setup failed (B): ${safeJson(second)}`);
     }
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: second.plan, actorUserId: account.managerUserId,
       }),
@@ -632,7 +632,7 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
 
     // Confirm the state this test is actually about: two rows, A classified,
     // B pending.
-    const beforeThirdRefresh = await withDb((c) => listCandidates(c, account.id));
+    const beforeThirdRefresh = await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id));
     expect(beforeThirdRefresh.map((k) => [k.tradeDate, k.status])).toEqual([
       ["2026-08-11", "classified"],
       ["2026-08-13", "pending"],
@@ -641,19 +641,19 @@ describe("planFor + classifyCandidate + commitReadingPlan — refresh, classify,
     // A repeated refresh — B still not classified — must still halt at B,
     // must not manufacture a second row for B (compound_commit_reading_
     // plan's own ON CONFLICT DO NOTHING), and must not reopen or touch A.
-    const third = await withDb(() => planFor(account));
+    const third = await planFor(account);
     if (third.kind !== "plan" || third.plan.kind !== "halt") {
       throw new Error(`expected a halt still at 08-13, got ${safeJson(third)}`);
     }
     expect(third.plan.candidate.tradeDate).toBe("2026-08-13");
     expect(third.plan.readings).toEqual([]);
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(account.managerUserId, (c) =>
       commitReadingPlan(c, {
         accountId: account.id, plan: third.plan, actorUserId: account.managerUserId,
       }),
     );
 
-    const after = await withDb((c) => listCandidates(c, account.id));
+    const after = await withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id));
     expect(after.map((k) => [k.tradeDate, k.status])).toEqual([
       ["2026-08-11", "classified"],
       ["2026-08-13", "pending"],
