@@ -6,10 +6,11 @@
  * write-classify.db.test.ts) — not transaction rollback, for the same reason
  * those files give: seedTwoAccounts writes auth.users, which only
  * postgres/supabase_auth_admin can do, so fixture seeding (withTestClient,
- * the harness's postgres-connected pool) and the writer under test (withDb,
- * client.ts's service_role pool — the pool requireAccount actually borrows
- * in production) are two different connections, not one rolled-back
- * withDbTransaction spanning both.
+ * the harness's postgres-connected pool) and the writer under test
+ * (withAuthenticatedDb, client.ts's authenticated helper — connected as the
+ * account's own manager, the same helper and identity requireAccount
+ * actually borrows in production) are two different connections, not one
+ * rolled-back transaction spanning both.
  *
  * The centrepiece of this file is "changing a split does not rewrite
  * history" — the property the task exists to prove. compound_ledger_entry
@@ -19,7 +20,7 @@
  * each other needs a ledger entry already on the books before the holder is
  * edited — seedLedger supplies that.
  */
-import { closePool, withDb } from "@/lib/compound/db/client";
+import { closePool, withAuthenticatedDb } from "@/lib/compound/db/client";
 import { getLedgerEntries } from "@/lib/compound/db/compound";
 import { listHolders } from "@/lib/compound/db/holders";
 import { updateHolder, type UpdateHolderInput } from "@/lib/compound/db/write-holder";
@@ -86,13 +87,13 @@ describe("updateHolder", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!; // "Seed Investor A1"
 
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       updateHolder(c, input(accountA, investorId, {
         name: "Renamed Investor", email: "renamed@example.test", splitBps: 2500,
       })),
     );
 
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     const holder = rows.find((r) => r.id === investorId);
     expect(holder).toMatchObject({
       name: "Renamed Investor", email: "renamed@example.test", splitBps: 2500,
@@ -105,16 +106,16 @@ describe("updateHolder", () => {
 
     // Before: a plain, independent read — not a variable carried over from
     // setup — sees the seeded name.
-    const before = await withDb((c) => listHolders(c, accountA.accountId));
+    const before = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     expect(before.find((r) => r.id === investorId)?.name).toBe("Seed Investor A1");
 
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       updateHolder(c, input(accountA, investorId, { name: "Grace Hopper", splitBps: 3700 })),
     );
 
     // "Reload" is a SECOND, independent read call — the same shape a fresh
     // page load issues — not a re-use of any state the write touched.
-    const after = await withDb((c) => listHolders(c, accountA.accountId));
+    const after = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     const names = after.map((r) => r.name);
     expect(names).toContain("Grace Hopper");
     expect(names).not.toContain("Seed Investor A1");
@@ -123,8 +124,8 @@ describe("updateHolder", () => {
   it("clears email back to null when given an empty string, matching addHolder's own nullif", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!;
-    await withDb((c) => updateHolder(c, input(accountA, investorId, { email: "" })));
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    await withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, investorId, { email: "" })));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     expect(rows.find((r) => r.id === investorId)?.email).toBeNull();
   });
 
@@ -134,19 +135,24 @@ describe("updateHolder", () => {
 
     // accountA is the account named, but the holder id belongs to accountB.
     await expectPgError(
-      withDb((c) => updateHolder(c, input(accountA, otherManagerHolderId))),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, otherManagerHolderId))),
       "CX301",
       /holder .* is not on account/,
     );
 
-    const rowsB = await withDb((c) => listHolders(c, accountB.accountId));
+    // Read as Bob himself — the point is that HIS OWN row is untouched, and
+    // an outsider's inability to see it at all would make this assertion
+    // vacuous rather than a genuine check.
+    const rowsB = await withAuthenticatedDb(accountB.managerUserId, (c) =>
+      listHolders(c, accountB.accountId),
+    );
     expect(rowsB.find((r) => r.id === otherManagerHolderId)?.name).toBe("Seed Manager B");
   });
 
   it("refuses a holder id that does not exist at all", async () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     await expectPgError(
-      withDb((c) => updateHolder(c, input(accountA, 999_999_999))),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, 999_999_999))),
       "CX301",
       /holder .* is not on account/,
     );
@@ -156,7 +162,7 @@ describe("updateHolder", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!;
     await expectPgError(
-      withDb((c) => updateHolder(c, { ...input(accountA, investorId), accountId: 2_147_483_646 })),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, { ...input(accountA, investorId), accountId: 2_147_483_646 })),
       "CX001",
       /no account/,
     );
@@ -166,7 +172,7 @@ describe("updateHolder", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!;
     await expect(
-      withDb((c) => updateHolder(c, input(accountA, investorId, { name: "   " }))),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, investorId, { name: "   " }))),
     ).rejects.toThrow(/a holder needs a name/);
   });
 
@@ -174,7 +180,7 @@ describe("updateHolder", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!;
     await expect(
-      withDb((c) => updateHolder(c, input(accountA, investorId, { splitBps: 10_001 }))),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, investorId, { splitBps: 10_001 }))),
     ).rejects.toThrow(/splitBps must be an integer/);
   });
 
@@ -189,13 +195,13 @@ describe("updateHolder", () => {
     // a NON-zero-to-non-zero change too, not only catch an obviously wrong
     // 0-to-nonzero one.
     await expectPgError(
-      withDb((c) => updateHolder(c, input(accountA, managerId, { splitBps: 100 }))),
+      withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, managerId, { splitBps: 100 }))),
       "CX304",
       /manager's split is fixed at 0/,
     );
     // Refused, not partially applied: the manager's row is untouched from
     // whatever it read before this call.
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     expect(rows.find((r) => r.id === managerId)?.splitBps).toBe(4000);
   });
 
@@ -204,10 +210,10 @@ describe("updateHolder", () => {
     const managerId = await managerHolderId(accountA);
     // Seeded at 4000 (see the test above). This is a genuine change, and
     // it's allowed because 0 is the one value CX304 never refuses.
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       updateHolder(c, input(accountA, managerId, { name: "J. Marsh", splitBps: 0 })),
     );
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     expect(rows.find((r) => r.id === managerId)).toMatchObject({ name: "J. Marsh", splitBps: 0 });
   });
 
@@ -215,13 +221,13 @@ describe("updateHolder", () => {
     const { accountA } = await withTestClient((c) => seedTwoAccounts(c));
     const investorId = accountA.holderIds[1]!;
 
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       updateHolder(c, input(accountA, investorId, {
         name: "Renamed Investor", email: "renamed@example.test", splitBps: 2500,
       })),
     );
 
-    const { rows } = await withDb((c) =>
+    const { rows } = await withAuthenticatedDb(accountA.managerUserId, (c) =>
       c.query<{ actor: string; action: string; entity: string; entity_id: string;
                 prior_state: { name: string; email: string | null; split_bps: number } }>(
         `select actor, action, entity, entity_id, prior_state from public.compound_audit
@@ -245,15 +251,17 @@ describe("updateHolder", () => {
     const investorId = accountA.holderIds[1]!;
     const AUDIT = "public.compound_audit";
 
-    await withTestClient((c) => c.query(`revoke insert on ${AUDIT} from service_role`));
+    // Revoked from `authenticated`, not `service_role` — see
+    // write-classify.db.test.ts's identical fix for the reasoning.
+    await withTestClient((c) => c.query(`revoke insert on ${AUDIT} from authenticated`));
     const before = await withTestClient((c) => sequenceConsumed(c, AUDIT, "id"));
 
     try {
       await expect(
-        withDb((c) => updateHolder(c, input(accountA, investorId, { name: "Should Not Land" }))),
+        withAuthenticatedDb(accountA.managerUserId, (c) => updateHolder(c, input(accountA, investorId, { name: "Should Not Land" }))),
       ).rejects.toThrow(/permission denied/);
     } finally {
-      await withTestClient((c) => c.query(`grant insert on ${AUDIT} to service_role`));
+      await withTestClient((c) => c.query(`grant insert on ${AUDIT} to authenticated`));
     }
 
     // The audit insert is the LAST statement in the function body — this is
@@ -263,7 +271,7 @@ describe("updateHolder", () => {
     const after = await withTestClient((c) => sequenceConsumed(c, AUDIT, "id"));
     expect(after - before).toBe(0); // the audit sequence itself never advanced (insert never ran)
 
-    const rows = await withDb((c) => listHolders(c, accountA.accountId));
+    const rows = await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId));
     expect(rows.find((r) => r.id === investorId)?.name).toBe("Seed Investor A1");
   });
 });
@@ -287,8 +295,8 @@ describe("updateHolder — a changed split does not rewrite an already-posted pa
     ]));
     const payoutEntryId = ids[2]!;
 
-    const beforeEntries = await withDb((c) => getLedgerEntries(c, accountA.accountId));
-    const beforeSeeds = (await withDb((c) => listHolders(c, accountA.accountId))).map((h) => ({
+    const beforeEntries = await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId));
+    const beforeSeeds = (await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId))).map((h) => ({
       holderId: h.id, isManager: h.isManager, splitBps: h.splitBps,
     }));
     const beforeState = fold(beforeEntries, beforeSeeds);
@@ -296,7 +304,7 @@ describe("updateHolder — a changed split does not rewrite an already-posted pa
 
     // Change the holder's CURRENT split — a decision made today, long after
     // that payout posted.
-    await withDb((c) =>
+    await withAuthenticatedDb(accountA.managerUserId, (c) =>
       updateHolder(c, {
         accountId: accountA.accountId, holderId: investorId,
         name: "Seed Investor A1", email: null, splitBps: 1500,
@@ -308,7 +316,7 @@ describe("updateHolder — a changed split does not rewrite an already-posted pa
     // was written with. compound_ledger_entry is INSERT/SELECT only, so this
     // is also mechanically guaranteed — asserted anyway, because the
     // guarantee is only worth something if something checks it.
-    const afterEntries = await withDb((c) => getLedgerEntries(c, accountA.accountId));
+    const afterEntries = await withAuthenticatedDb(accountA.managerUserId, (c) => getLedgerEntries(c, accountA.accountId));
     const payoutEntry = afterEntries.find((e) => e.id === payoutEntryId)!;
     expect(payoutEntry.splitBpsApplied).toBe(4000);
 
@@ -317,7 +325,7 @@ describe("updateHolder — a changed split does not rewrite an already-posted pa
     // quote — but replaying the ALREADY-POSTED payout must land on exactly
     // the same units/equity effect as before, because fold() reads
     // e.splitBpsApplied for that entry, never the seed's live value.
-    const afterSeeds = (await withDb((c) => listHolders(c, accountA.accountId))).map((h) => ({
+    const afterSeeds = (await withAuthenticatedDb(accountA.managerUserId, (c) => listHolders(c, accountA.accountId))).map((h) => ({
       holderId: h.id, isManager: h.isManager, splitBps: h.splitBps,
     }));
     expect(afterSeeds.find((s) => s.holderId === investorId)?.splitBps).toBe(1500);
