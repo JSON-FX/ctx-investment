@@ -22,6 +22,13 @@ import base from "./jest.config.mjs";
 // alongside the tests. Real isolation needs a second Supabase project on
 // different ports. Until then `pnpm reseed` restores the demo after a run.
 //
+// It cuts both ways, which is worth knowing before diagnosing a failure:
+// with the demo restored, round-trip.db.test.ts fails 12 assertions, because
+// it expects supabase/seed.sql's ten snapshots and finds production's 328.
+// Verified in both directions — 426 pass on the fixture seed, 12 fail with
+// the demo present, and `supabase db reset` flips it back. So "12
+// pre-existing failures" after a reseed is not a defect; it is this.
+//
 // Precedence mirrors lib/compound/db/testing/env.ts: an explicit
 // COMPOUND_TEST_DATABASE_URL wins, otherwise the local Supabase stack from
 // supabase/config.toml. 127.0.0.1 rather than localhost because Docker here
