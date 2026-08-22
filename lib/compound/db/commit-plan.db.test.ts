@@ -482,19 +482,19 @@ describe("CONCURRENCY — the row lock", () => {
 });
 
 describe("the writer respects the append-only ledger", () => {
-  it("runs as service_role through withDb and still cannot rewrite what it wrote", async () => {
-    const { withDb, closePool } = await import("./client");
+  it("runs as authenticated through withAuthenticatedDb and still cannot rewrite what it wrote", async () => {
+    const { withAuthenticatedDb, closePool } = await import("./client");
     const saved = process.env.COMPOUND_DATABASE_URL;
     process.env.COMPOUND_DATABASE_URL = testDatabaseUrl();
     try {
-      await withDb((c) =>
+      await withAuthenticatedDb(MANAGER, (c) =>
         commitReadingPlan(c, {
           accountId: accountA,
           plan: advance([reading("2026-08-03", 100n)]),
           actorUserId: MANAGER,
         }),
       );
-      await withDb((c) =>
+      await withAuthenticatedDb(MANAGER, (c) =>
         expectPgError(
           c.query(`update ${LEDGER} set amount_cents = 1 where account_id = $1`, [accountA]),
           "42501",
