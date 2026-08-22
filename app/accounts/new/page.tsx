@@ -11,7 +11,7 @@
  * pushed nothing yet.
  */
 import { redirect } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb, withElevatedCopyTraderXRead } from "@/lib/compound/db/client";
 import { getAccountOwnerUserId, getDailySnapshots, getLiveSnapshot } from "@/lib/compound/db/copytraderx";
 import { createAccount } from "@/lib/compound/db/write-account";
 import { requireManager } from "@/lib/compound/load/session";
@@ -34,7 +34,7 @@ async function commit(formData: FormData) {
   const user = await requireManager();
   const offsetRaw = String(formData.get("offset") ?? "").trim();
   try {
-    const { accountId } = await withDb((c) =>
+    const { accountId } = await withAuthenticatedDb(user.id, (c) =>
       createAccount(c, {
         mt5Account: Number(formData.get("mt5")),
         label: String(formData.get("label")),
@@ -62,6 +62,18 @@ async function commit(formData: FormData) {
 export default async function NewAccountPage({
   searchParams,
 }: { searchParams: Promise<Params> }) {
+  // Was missing before this task: every other read of CopyTraderX data in
+  // this codebase is reached only after requireAccount (which itself calls
+  // requireManager) has resolved an account the caller already owns. This
+  // page is the one exception — a brand-new account has no ResolvedAccount
+  // yet — and requireManager was never called on this GET path, only inside
+  // the commit() action below. That left the confirm step's CopyTraderX
+  // lookup (any mt5 account number, typed straight into the query string)
+  // reachable without a session at all. Unrelated to the RLS split this task
+  // exists for — withElevatedCopyTraderXRead ignores identity either way —
+  // but it is the same file, the same read, and a one-line fix; flagged
+  // separately in the report rather than folded silently into the split.
+  await requireManager();
   const p = await searchParams;
 
   if (p.step !== "confirm") {
@@ -107,7 +119,7 @@ export default async function NewAccountPage({
   }
 
   const mt5 = Number(p.mt5);
-  const [snapshots, live, ownerUserId] = await withDb(async (c) => [
+  const [snapshots, live, ownerUserId] = await withElevatedCopyTraderXRead(async (c) => [
     await getDailySnapshots(c, mt5),
     await getLiveSnapshot(c, mt5),
     await getAccountOwnerUserId(c, mt5),

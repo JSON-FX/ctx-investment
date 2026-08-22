@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { fold } from "@/lib/compound/engine/replay";
@@ -31,7 +31,7 @@ export default async function PayoutPage({
   const q = await searchParams;
 
   const [holders, entries, seeds, live, interlock] = await Promise.all([
-    withDb((c) => listHolders(c, account.id)),
+    withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
     loadLedger(account.id),
     loadSeeds(account.id),
     loadLive(account.mt5Account),

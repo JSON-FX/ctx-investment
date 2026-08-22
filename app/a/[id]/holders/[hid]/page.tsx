@@ -6,17 +6,19 @@
  * activeNavKey already treats a "holders" path segment as belonging to the
  * Desk tab.
  *
- * Decision D-F: the database gate is inert here (plan 3's connection carries
- * BYPASSRLS), so `requireAccount` — called by the layout and, cache()d,
- * again here — is what stops one manager's account id from being read by
- * another. It is not what stops a HOLDER id from crossing accounts: `hid` is
- * looked up only inside `listHolders(c, account.id)`, a query already scoped
- * to the resolved account, so a holder id that belongs to a different
- * account simply is not in that list and falls through to notFound() below.
+ * Decision D-F (updated): compound_holder's own RLS policy now runs for
+ * real (withAuthenticatedDb), scoped to account.managerUserId — the database
+ * itself refuses to return a holder row belonging to a different manager's
+ * account. `requireAccount` — called by the layout and, cache()d, again here
+ * — remains the defence-in-depth layer, and is still what stops a HOLDER id
+ * from crossing accounts WITHIN one manager's own rows: `hid` is looked up
+ * only inside `listHolders(c, account.id)`, a query already scoped to the
+ * resolved account, so a holder id that belongs to a different account
+ * simply is not in that list and falls through to notFound() below.
  */
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import { totalsOf } from "@/lib/compound/engine/replay";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -70,7 +72,7 @@ export default async function HolderPage({
     loadPoolState(account.id),
     loadLedger(account.id),
     loadSeeds(account.id),
-    withDb((c) => listHolders(c, account.id)),
+    withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
   ]);
 
   const holder = holders.find((h) => h.id === holderId);

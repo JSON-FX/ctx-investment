@@ -39,7 +39,7 @@
  * synchronised date-range logic to get wrong.
  */
 import { cache } from "react";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb, withElevatedCopyTraderXRead } from "@/lib/compound/db/client";
 import { getReconcileCursor, listCandidates } from "@/lib/compound/db/compound";
 import { getClosedDeals, getDailySnapshots } from "@/lib/compound/db/copytraderx";
 import type { DroppedDeal } from "@/lib/compound/reconcile/dedupe";
@@ -57,23 +57,36 @@ export type ReconcileOutcome =
 export const planFor = cache(async (account: ResolvedAccount): Promise<ReconcileOutcome> => {
   if (account.brokerOffsetHours === null) return { kind: "not-configured" };
 
-  const [cursor, snapshots, deals, candidates] = await withDb(async (c) => {
-    const cur = await getReconcileCursor(c, account.id);
-    // The window must INCLUDE the cursor date: the first day's balance move is
-    // reconciled against the balance at the cursor, and planReadings throws if
-    // that row is missing. `WHERE trade_date > cursor` is the natural query and
-    // the wrong one.
-    const from = cur.lastReadingDate ?? undefined;
-    return [
-      cur,
-      await getDailySnapshots(c, account.mt5Account, { from }),
-      await getClosedDeals(c, account.mt5Account, { from }),
-      // Unfiltered by status: every outcome classifyCandidate can reach
-      // ('classified' or 'ignored') resolves the day, and planReadings does
-      // its own filtering by date. See the module doc above.
-      await listCandidates(c, account.id),
-    ] as const;
-  });
+  // Two connections, not one, and that split is the point of this task's
+  // fix: the cursor and the candidates are compound_* rows, gated by this
+  // account's manager under RLS (withAuthenticatedDb); the snapshots and
+  // deals are CopyTraderX's own tables, which grant no role but service_role
+  // any access at all (withElevatedCopyTraderXRead) — see db/client.ts's
+  // module doc. A single connection cannot be both, so the cursor is read
+  // first, on its own round trip, and its lastReadingDate feeds the window
+  // for the second, elevated round trip. Both still run under READ
+  // COMMITTED regardless — Postgres gives each statement its own snapshot
+  // whether or not it shares a transaction with the one before it, so this
+  // split costs an extra connection checkout and changes no isolation
+  // guarantee this function had before it.
+  const cursor = await withAuthenticatedDb(account.managerUserId, (c) =>
+    getReconcileCursor(c, account.id),
+  );
+  // The window must INCLUDE the cursor date: the first day's balance move is
+  // reconciled against the balance at the cursor, and planReadings throws if
+  // that row is missing. `WHERE trade_date > cursor` is the natural query and
+  // the wrong one.
+  const from = cursor.lastReadingDate ?? undefined;
+  const [snapshots, deals] = await withElevatedCopyTraderXRead(async (c) => [
+    await getDailySnapshots(c, account.mt5Account, { from }),
+    await getClosedDeals(c, account.mt5Account, { from }),
+  ] as const);
+  // Unfiltered by status: every outcome classifyCandidate can reach
+  // ('classified' or 'ignored') resolves the day, and planReadings does its
+  // own filtering by date. See the module doc above.
+  const candidates = await withAuthenticatedDb(account.managerUserId, (c) =>
+    listCandidates(c, account.id),
+  );
 
   const classifiedDates = candidates
     .filter((k) => k.status !== "pending")

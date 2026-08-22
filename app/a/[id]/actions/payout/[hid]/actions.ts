@@ -26,7 +26,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitPayout } from "@/lib/compound/db/write-payout";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -78,7 +78,7 @@ export async function payOut(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitPayout(c, {
         accountId: account.id,
         holderId,

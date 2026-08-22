@@ -14,7 +14,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitReadingPlan } from "@/lib/compound/db/commit-plan";
 import { classifyCandidate } from "@/lib/compound/db/write-classify";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
@@ -66,7 +66,7 @@ export async function refreshReadings(formData: FormData) {
   const droppedParam = encodeDroppedDeals(outcome.plan.droppedDeals);
 
   try {
-    const result = await withDbTransaction((c) =>
+    const result = await withAuthenticatedDb(user.id, (c) =>
       commitReadingPlan(c, { accountId: account.id, plan: outcome.plan, actorUserId: user.id }),
     );
     revalidatePath(back, "layout");
@@ -127,7 +127,7 @@ export async function postReading(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitReadingPlan(c, {
         accountId: account.id,
         plan: {
@@ -192,7 +192,7 @@ export async function classify(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       classifyCandidate(c, {
         accountId: account.id,
         candidateId,

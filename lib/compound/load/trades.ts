@@ -11,7 +11,7 @@
  * a cache miss every time — three queries per page instead of one.
  */
 import { cache } from "react";
-import { withDb } from "@/lib/compound/db/client";
+import { withElevatedCopyTraderXRead } from "@/lib/compound/db/client";
 import {
   getClosedDeals,
   getDailySnapshots,
@@ -30,7 +30,7 @@ export const loadTradeHistory = cache(
     from: string | null = null,
     to: string | null = null,
   ): Promise<TradeHistory> => {
-    const deals = await withDb((c) =>
+    const deals = await withElevatedCopyTraderXRead((c) =>
       getClosedDeals(c, mt5Account, { from: from ?? undefined, to: to ?? undefined }),
     );
     return buildTradeHistory(deals, brokerOffsetHours);
@@ -39,7 +39,7 @@ export const loadTradeHistory = cache(
 
 export const loadOpenPositions = cache(
   async (mt5Account: number): Promise<OpenPosition[]> =>
-    withDb((c) => getOpenPositions(c, mt5Account)),
+    withElevatedCopyTraderXRead((c) => getOpenPositions(c, mt5Account)),
 );
 
 export const loadOrders = cache(
@@ -48,7 +48,9 @@ export const loadOrders = cache(
     from: string | null = null,
     to: string | null = null,
   ): Promise<OrderRow[]> =>
-    withDb((c) => getOrders(c, mt5Account, { from: from ?? undefined, to: to ?? undefined })),
+    withElevatedCopyTraderXRead((c) =>
+      getOrders(c, mt5Account, { from: from ?? undefined, to: to ?? undefined }),
+    ),
 );
 
 export const loadDailySnapshots = cache(
@@ -57,7 +59,7 @@ export const loadDailySnapshots = cache(
     from: string | null = null,
     to: string | null = null,
   ): Promise<DailySnapshot[]> =>
-    withDb((c) =>
+    withElevatedCopyTraderXRead((c) =>
       getDailySnapshots(c, mt5Account, { from: from ?? undefined, to: to ?? undefined }),
     ),
 );

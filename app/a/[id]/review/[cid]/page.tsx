@@ -9,7 +9,7 @@
  * they in another tab, already resolved.
  */
 import { notFound } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listCandidates } from "@/lib/compound/db/compound";
 import { listHolders } from "@/lib/compound/db/holders";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -33,8 +33,8 @@ export default async function ClassifyPage({
   const q = await searchParams;
 
   const [candidates, holders, entries, seeds, state] = await Promise.all([
-    withDb((c) => listCandidates(c, account.id, "pending")),
-    withDb((c) => listHolders(c, account.id)),
+    withAuthenticatedDb(account.managerUserId, (c) => listCandidates(c, account.id, "pending")),
+    withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
     loadLedger(account.id),
     loadSeeds(account.id),
     loadPoolState(account.id),

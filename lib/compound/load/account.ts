@@ -11,7 +11,7 @@
 import { cache } from "react";
 import { notFound } from "next/navigation";
 import type { Queryable } from "@/lib/compound/db/types";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { getAccountById, listAccountsForManager } from "@/lib/compound/db/compound";
 import { requireManager } from "./session";
 
@@ -30,7 +30,7 @@ export interface ResolvedAccount {
 
 export const listManagerAccounts = cache(async (): Promise<ResolvedAccount[]> => {
   const user = await requireManager();
-  return withDb((c) => listAccountsForManager(c, user.id));
+  return withAuthenticatedDb(user.id, (c) => listAccountsForManager(c, user.id));
 });
 
 /**
@@ -42,6 +42,15 @@ export const listManagerAccounts = cache(async (): Promise<ResolvedAccount[]> =>
  * This function only ever sees the ownership question — does THIS admin own
  * THIS account — which is the question a one-account fixture cannot put to
  * the test (see gate.db.test.ts).
+ *
+ * This is now the second check, not the only one: the connection callers open
+ * to run getAccountById (db/client.ts's withAuthenticatedDb) carries
+ * managerUserId's own claims, so compound_account_select has already
+ * filtered to this manager's rows before a row ever reaches this function.
+ * The explicit managerUserId comparison below stays anyway — it is what lets
+ * this function be tested against two managers without a live Supabase
+ * session (see gate.db.test.ts), and it is exactly the defence-in-depth
+ * posture D-F now describes rather than the whole boundary.
  */
 export async function resolveOwnedAccount(
   c: Queryable,
@@ -59,7 +68,9 @@ export async function resolveOwnedAccount(
 
 export const requireAccount = cache(async (idParam: string): Promise<ResolvedAccount> => {
   const user = await requireManager();
-  const account = await withDb((c) => resolveOwnedAccount(c, user.id, idParam));
+  const account = await withAuthenticatedDb(user.id, (c) =>
+    resolveOwnedAccount(c, user.id, idParam),
+  );
   if (account === null) notFound();
   return account;
 });

@@ -22,7 +22,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDb, withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { addHolder } from "@/lib/compound/db/write-holder";
 import { commitDeposit } from "@/lib/compound/db/write-deposit";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
@@ -37,7 +37,7 @@ export async function addInvestor(formData: FormData) {
   const user = await requireManager();
   const back = investorHref(account.id);
   try {
-    const holderId = await withDb((c) =>
+    const holderId = await withAuthenticatedDb(user.id, (c) =>
       addHolder(c, {
         accountId: account.id,
         name: String(formData.get("name") ?? ""),
@@ -72,7 +72,7 @@ export async function addCapital(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitDeposit(c, {
         accountId: account.id,
         holderId: Number(formData.get("holderId")),

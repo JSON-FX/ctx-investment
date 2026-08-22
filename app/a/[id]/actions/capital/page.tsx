@@ -1,4 +1,4 @@
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -20,7 +20,7 @@ export default async function CapitalPage({
   const account = await requireAccount((await params).id);
   const q = await searchParams;
   const [holders, entries, seeds, interlock] = await Promise.all([
-    withDb((c) => listHolders(c, account.id)),
+    withAuthenticatedDb(account.managerUserId, (c) => listHolders(c, account.id)),
     loadLedger(account.id),
     loadSeeds(account.id),
     loadInterlock(account.id),

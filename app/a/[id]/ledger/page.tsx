@@ -6,11 +6,13 @@
  * loadLedger/loadSeeds/loadHolderNames are already cache()d in
  * lib/compound/load/ledger.ts for the layout and this page to share; the
  * ledger-metadata read (recorded_at, note, created_by) is scoped to this page
- * alone, so it stays a direct withDb call here rather than adding a
- * single-caller export to that shared loader module.
+ * alone, so it stays a direct withAuthenticatedDb call here rather than
+ * adding a single-caller export to that shared loader module. compound_
+ * ledger_entry's own RLS policy scopes it to account.managerUserId, same as
+ * every other compound_* read on this page.
  */
 import type { Metadata } from "next";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listLedgerMeta } from "@/lib/compound/db/ledger-meta";
 import { requireAccount } from "@/lib/compound/load/account";
 import { loadHolderNames, loadLedger, loadSeeds } from "@/lib/compound/load/ledger";
@@ -34,7 +36,7 @@ export default async function LedgerPage({ params }: { params: Promise<{ id: str
     loadLedger(account.id),
     loadSeeds(account.id),
     loadHolderNames(account.id),
-    withDb((c) => listLedgerMeta(c, account.id)),
+    withAuthenticatedDb(account.managerUserId, (c) => listLedgerMeta(c, account.id)),
   ]);
 
   return (

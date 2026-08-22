@@ -19,7 +19,7 @@
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDbTransaction } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { commitWithdrawal } from "@/lib/compound/db/write-withdrawal";
 import { centsFromDecimal } from "@/lib/compound/engine/money";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -63,7 +63,7 @@ export async function withdraw(formData: FormData) {
   }
 
   try {
-    await withDbTransaction((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       commitWithdrawal(c, {
         accountId: account.id,
         holderId,

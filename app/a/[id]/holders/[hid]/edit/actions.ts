@@ -8,18 +8,20 @@
  * (see app/a/[id]/actions/payout/[hid]/actions.ts's header) — one route, one
  * action file, nothing to collide with.
  *
- * D-F: the database gate (compound_holder's RLS policies) is inert on this
- * page, because plan 3 connects as service_role, which carries BYPASSRLS.
- * requireAccount is what stops one manager's account id from being read by
- * another; it is not, by itself, what stops a HOLDER id from crossing
- * accounts. listHolders(c, account.id) is already scoped to the resolved
- * account, so a holder id belonging to a different account simply is not in
- * that list — checked here before anything is written, the same guard the
- * statement and edit pages both already apply before they render.
+ * D-F (updated): compound_holder's RLS policies now run for real — this
+ * connects as `authenticated` with the signed-in manager's own claims
+ * (withAuthenticatedDb), so the database itself refuses a holder row outside
+ * account.managerUserId's own accounts before requireAccount's application
+ * check ever runs. requireAccount remains the defence-in-depth layer, and it
+ * is still what stops a HOLDER id from crossing accounts WITHIN one
+ * manager's own rows: listHolders(c, account.id) is already scoped to the
+ * resolved account, so a holder id belonging to a different account simply
+ * is not in that list — checked here before anything is written, the same
+ * guard the statement and edit pages both already apply before they render.
  */
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { listHolders } from "@/lib/compound/db/holders";
 import { updateHolder } from "@/lib/compound/db/write-holder";
 import { requireAccount } from "@/lib/compound/load/account";
@@ -33,7 +35,7 @@ export async function saveHolder(formData: FormData) {
   const holderId = Number(formData.get("holderId"));
   const back = editHolderHref(account.id, holderId);
 
-  const holders = await withDb((c) => listHolders(c, account.id));
+  const holders = await withAuthenticatedDb(user.id, (c) => listHolders(c, account.id));
   const holder = holders.find((h) => h.id === holderId);
   if (holder === undefined) {
     redirect(`${back}?error=${encodeURIComponent(
@@ -52,7 +54,7 @@ export async function saveHolder(formData: FormData) {
   const splitBps = holder.isManager ? 0 : Math.round(Number(formData.get("split")) * 100);
 
   try {
-    await withDb((c) =>
+    await withAuthenticatedDb(user.id, (c) =>
       updateHolder(c, {
         accountId: account.id,
         holderId: holder.id,

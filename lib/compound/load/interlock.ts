@@ -5,8 +5,9 @@
  * notice all need this. Two loaders would be two answers.
  */
 import { cache } from "react";
-import { withDb } from "@/lib/compound/db/client";
+import { withAuthenticatedDb } from "@/lib/compound/db/client";
 import { getReconcileCursor, listCandidates } from "@/lib/compound/db/compound";
+import { requireManager } from "./session";
 
 export interface InterlockState {
   /** compound_reconcile_cursor.last_reading_date. Null before the first run. */
@@ -17,7 +18,8 @@ export interface InterlockState {
 }
 
 export const loadInterlock = cache(async (accountId: number): Promise<InterlockState> => {
-  const [cursor, pending] = await withDb(async (c) => [
+  const user = await requireManager();
+  const [cursor, pending] = await withAuthenticatedDb(user.id, async (c) => [
     await getReconcileCursor(c, accountId),
     await listCandidates(c, accountId, "pending"),
   ] as const);
